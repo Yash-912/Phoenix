@@ -1,0 +1,104 @@
+services:
+  checkout-service:
+    build: ./services/demo-checkout
+    container_name: checkout-service
+    ports:
+      - "8001:8000"
+    networks:
+      - phoenix-net
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    container_name: cadvisor
+    ports:
+      - "8080:8080"
+    volumes:
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+    networks:
+      - phoenix-net
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: prometheus
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/prometheus/alert.rules.yml:/etc/prometheus/alert.rules.yml:ro
+    ports:
+      - "9091:9090"
+    networks:
+      - phoenix-net
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    container_name: alertmanager
+    volumes:
+      - ./observability/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    ports:
+      - "9093:9093"
+    networks:
+      - phoenix-net
+
+  loki:
+    image: grafana/loki:3.1.1
+    container_name: loki
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./observability/loki/loki-config.yml:/etc/loki/local-config.yaml:ro
+    command: -config.file=/etc/loki/local-config.yaml
+    networks:
+      - phoenix-net
+
+  promtail:
+    image: grafana/promtail:3.1.1
+    container_name: promtail
+    volumes:
+      - ./observability/promtail/promtail-config.yml:/etc/promtail/config.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    command: -config.file=/etc/promtail/config.yml
+    networks:
+      - phoenix-net
+    depends_on:
+      - loki
+
+  postgres:
+    image: postgres:16.4
+    container_name: postgres
+    environment:
+      POSTGRES_USER: phoenix
+      POSTGRES_PASSWORD: phoenix_dev_only
+      POSTGRES_DB: phoenix
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./phoenix/db/init:/docker-entrypoint-initdb.d:ro
+    networks:
+      - phoenix-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U phoenix -d phoenix"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  phoenix-api:
+    build: ./phoenix/api
+    container_name: phoenix-api
+    environment:
+      DATABASE_URL: postgresql://phoenix:phoenix_dev_only@postgres:5432/phoenix
+    ports:
+      - "5000:8000"
+    networks:
+      - phoenix-net
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+networks:
+  phoenix-net:
+    driver: bridge
+
+volumes:
+  postgres-data:

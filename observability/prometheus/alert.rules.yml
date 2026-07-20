@@ -1,0 +1,39 @@
+groups:
+  - name: checkout-service-alerts
+    rules:
+      - alert: HighErrorRate
+        expr: |
+          sum(rate(http_requests_total{job="checkout-service", status=~"5.."}[1m]))
+          /
+          sum(rate(http_requests_total{job="checkout-service"}[1m]))
+          > 0.05
+        for: 30s
+        labels:
+          severity: high
+          service: checkout-service
+        annotations:
+          summary: "High error rate on checkout-service"
+          description: "More than 5% of requests to checkout-service are returning 5xx over the last minute."
+
+      - alert: HighLatency
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(http_request_duration_seconds_bucket{job="checkout-service"}[1m])) by (le)
+          ) > 1
+        for: 30s
+        labels:
+          severity: high
+          service: checkout-service
+        annotations:
+          summary: "High p95 latency on checkout-service"
+          description: "p95 request latency for checkout-service has exceeded 1s for 30s+."
+
+      - alert: ServiceDown
+        expr: up{job="checkout-service"} == 0
+        for: 15s
+        labels:
+          severity: critical
+          service: checkout-service
+        annotations:
+          summary: "checkout-service is down"
+          description: "Prometheus cannot scrape checkout-service — target has been down for 15s+."

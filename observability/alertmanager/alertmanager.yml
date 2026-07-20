@@ -1,0 +1,18 @@
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: phoenix-webhook
+  group_by: ["alertname", "service"]
+  group_wait: 10s
+  group_interval: 1m
+  repeat_interval: 3h
+
+receivers:
+  - name: phoenix-webhook
+    webhook_configs:
+      # Slice 1.5 will stand up phoenix-api with this route.
+      # Until then, Alertmanager will retry delivery and log failures — that's fine,
+      # this slice only needs to prove pending -> firing works.
+      - url: "http://phoenix-api:8000/webhooks/alertmanager"
+        send_resolved: true
