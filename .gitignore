@@ -1,1 +1,5 @@
 .learn
+.env
+agentic/
+__pycache__/
+*.pyc

@@ -1,0 +1,2 @@
+langgraph==0.2.39
+pydantic==2.9.2
