@@ -1,7 +1,9 @@
+import sys
+
 from langgraph.graph import END, StateGraph
 
-from nodes import diagnoser_node, observer_node
-from state import AgentState
+from phoenix.graph.nodes import diagnoser_node, observer_node
+from phoenix.graph.state import AgentState
 
 
 def should_continue(state: AgentState) -> str:
@@ -28,7 +30,10 @@ def build_graph():
 
 
 if __name__ == "__main__":
+    incident_id = int(sys.argv[1]) if len(sys.argv) > 1 else 1
+    service_name = sys.argv[2] if len(sys.argv) > 2 else "checkout-service"
+
     app = build_graph()
-    result = app.invoke(AgentState(incident_id=1))
+    result = app.invoke(AgentState(incident_id=incident_id, service_name=service_name))
     print("\nFinal state:")
     print(result)
