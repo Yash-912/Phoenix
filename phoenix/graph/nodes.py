@@ -1,6 +1,8 @@
 from datetime import datetime, timezone
 
-from phoenix.graph.llm_client import decide_tool_calls
+from phoenix.graph import scoring
+from phoenix.graph.llm_client import decide_hypotheses, decide_tool_calls
+from phoenix.graph.schemas import ScoredHypothesis
 from phoenix.graph.state import AgentState
 from phoenix.tools.deploy_tool import get_recent_deployments
 from phoenix.tools.docker_tool import get_container_state
@@ -57,12 +59,29 @@ def observer_node(state: AgentState) -> AgentState:
 
 
 def diagnoser_node(state: AgentState) -> AgentState:
-    """Stub for Slice 2.4 — will generate LLM hypotheses scored against real evidence.
-
-    Confidence is simulated here (grows with evidence count) purely so the
-    conditional edge below has something real to route on. This is NOT the
-    evidence-weighted scoring FR-4 requires — that's Slice 2.4's job.
+    """The LLM describes candidate root causes; scoring.py alone decides how much
+    to believe them. Confidence is the top ranked hypothesis' deterministic score,
+    so it moves with the evidence the observer collected, never with a count of
+    evidence items and never with anything the model asserted about itself.
     """
-    state.confidence = min(1.0, len(state.evidence) * 0.2)
+    proposed = decide_hypotheses(state.service_name, state.evidence).hypotheses
+
+    if not proposed:
+        print(f"[diagnoser] iteration {state.iteration}: LLM proposed no hypotheses")
+        state.hypotheses = []
+        state.confidence = 0.0
+        return state
+
+    state.hypotheses = [
+        ScoredHypothesis(hypothesis=hypothesis, score=score, score_breakdown=breakdown)
+        for hypothesis, score, breakdown in scoring.score_all(state.evidence, proposed)
+    ]
+    state.confidence = scoring.top_confidence(state.evidence, proposed)
+
+    for scored in state.hypotheses:
+        print(
+            f"[diagnoser] iteration {state.iteration}: {scored.hypothesis.category} "
+            f"scores {scored.score:.2f}: {scored.hypothesis.description}"
+        )
     print(f"[diagnoser] iteration {state.iteration}: confidence={state.confidence:.2f}")
     return state
