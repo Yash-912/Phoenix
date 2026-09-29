@@ -37,3 +37,42 @@ groups:
         annotations:
           summary: "checkout-service is down"
           description: "Prometheus cannot scrape checkout-service — target has been down for 15s+."
+
+  - name: multi-service-alerts
+    rules:
+      - alert: HighErrorRate
+        expr: |
+          sum by (job) (rate(http_requests_total{job=~"auth-service|payment-service|worker-service|api-gateway", status=~"5.."}[1m]))
+          /
+          sum by (job) (rate(http_requests_total{job=~"auth-service|payment-service|worker-service|api-gateway"}[1m]))
+          > 0.05
+        for: 30s
+        labels:
+          severity: high
+          service: "{{ $labels.job }}"
+        annotations:
+          summary: "High error rate on {{ $labels.job }}"
+          description: "More than 5% of requests are returning 5xx over the last minute."
+
+      - alert: HighLatency
+        expr: |
+          histogram_quantile(0.95,
+            sum by (job, le) (rate(http_request_duration_seconds_bucket{job=~"auth-service|payment-service|worker-service|api-gateway"}[1m]))
+          ) > 1
+        for: 30s
+        labels:
+          severity: high
+          service: "{{ $labels.job }}"
+        annotations:
+          summary: "High p95 latency on {{ $labels.job }}"
+          description: "p95 request latency has exceeded 1s for 30s+."
+
+      - alert: ServiceDown
+        expr: up{job=~"auth-service|payment-service|worker-service|api-gateway"} == 0
+        for: 15s
+        labels:
+          severity: critical
+          service: "{{ $labels.job }}"
+        annotations:
+          summary: "{{ $labels.job }} is down"
+          description: "Prometheus cannot scrape target — down for 15s+."

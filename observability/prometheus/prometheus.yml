@@ -22,3 +22,19 @@ scrape_configs:
   - job_name: checkout-service
     static_configs:
       - targets: ["checkout-service:8000"]
+
+  - job_name: auth-service
+    static_configs:
+      - targets: ["auth-service:8000"]
+
+  - job_name: payment-service
+    static_configs:
+      - targets: ["payment-service:8000"]
+
+  - job_name: worker-service
+    static_configs:
+      - targets: ["worker-service:8000"]
+
+  - job_name: api-gateway
+    static_configs:
+      - targets: ["api-gateway:8000"]

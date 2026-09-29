@@ -43,7 +43,7 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "get_container_state",
-            "description": "Inspect a container's current runtime state (running/restarting/exit code) via the read-only docker-socket-proxy.",
+            "description": "Inspect a container's current runtime state (running/restarting/exit code) via the docker-socket-proxy.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -53,15 +53,45 @@ TOOL_SCHEMAS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "inspect_health",
+            "description": "Combined container state + app /health endpoint for a service.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "service_name": {"type": "string", "description": "Service name, e.g. checkout-service."},
+                },
+                "required": ["service_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_recent_deployments",
+            "description": "Read recent JSON deployment markers for a service (image tag, commit, config, timestamp).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "service_name": {"type": "string", "description": "Service name, e.g. checkout-service."},
+                    "limit": {"type": "integer", "description": "Max markers, newest first. Defaults to 10."},
+                },
+                "required": ["service_name"],
+            },
+        },
+    },
 ]
 
 
 def decide_tool_calls(service_name: str, evidence_so_far: list[dict]) -> list[dict]:
-    """Ask the LLM which of the 3 allowlisted tools to call next, given evidence gathered so far.
+    """Ask the LLM which of the 5 allowlisted read-only tools to call next.
 
     Returns a list of {"name": str, "arguments": dict} — never executes anything itself.
-    The LLM is ONLY ever offered these three tools (TOOL_SCHEMAS) — least-privilege
-    allowlisting per FR-3. It cannot request anything outside this list.
+    The LLM is ONLY ever offered these five tools (TOOL_SCHEMAS) — least-privilege
+    allowlisting. It cannot request anything outside this list; remediation
+    actions are executor-only and never offered here.
     """
     summary = [
         {"source": e["source"], "iteration": e["iteration"], "summary": e["summary"]}

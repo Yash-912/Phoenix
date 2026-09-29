@@ -3,10 +3,11 @@ services:
     image: tecnativa/docker-socket-proxy:latest
     container_name: docker-socket-proxy
     environment:
-      # Deny-by-default allowlist (Question 4's answer, now real config).
-      # POST is unset -> defaults to 0/denied -> only GET/HEAD ever reach
-      # the real Docker daemon, regardless of what the Observer's LLM asks for.
+      # Tool-level allowlist: POST enabled at proxy, but remediation_tool.py
+      # enforces the semantic allowlist (restart/pause/unpause only).
+      # Raw exec, image build, network/create remain blocked by tool code.
       CONTAINERS: 1
+      POST: 1
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     ports:
@@ -17,10 +18,98 @@ services:
   checkout-service:
     build: ./services/demo-checkout
     container_name: checkout-service
+    environment:
+      - CHAOS_ENABLED=true
     ports:
       - "8001:8000"
     networks:
       - phoenix-net
+
+  auth-service:
+    build: ./services/auth-service
+    container_name: auth-service
+    environment:
+      - CHAOS_ENABLED=true
+      - DB_POOL_SIZE=10
+    ports:
+      - "8002:8000"
+    networks:
+      - phoenix-net
+    depends_on:
+      - postgres
+      - redis
+
+  payment-service:
+    build: ./services/payment-service
+    container_name: payment-service
+    environment:
+      - CHAOS_ENABLED=true
+    ports:
+      - "8003:8000"
+    networks:
+      - phoenix-net
+    depends_on:
+      - postgres
+      - redis
+
+  worker-service:
+    build: ./services/worker-service
+    container_name: worker-service
+    environment:
+      - CHAOS_ENABLED=true
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672
+      - REDIS_URL=redis://redis:6379
+    ports:
+      - "8004:8000"
+    networks:
+      - phoenix-net
+    depends_on:
+      - rabbitmq
+      - redis
+
+  api-gateway:
+    build: ./services/api-gateway
+    container_name: api-gateway
+    environment:
+      - CHAOS_ENABLED=true
+      - AUTH_URL=http://auth-service:8000
+      - PAYMENT_URL=http://payment-service:8000
+      - CHECKOUT_URL=http://checkout-service:8000
+    ports:
+      - "8005:8000"
+    networks:
+      - phoenix-net
+    depends_on:
+      - auth-service
+      - payment-service
+      - checkout-service
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+    networks:
+      - phoenix-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  rabbitmq:
+    image: rabbitmq:3.12-management
+    container_name: rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    networks:
+      - phoenix-net
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   cadvisor:
     image: gcr.io/cadvisor/cadvisor:v0.49.1
@@ -106,6 +195,8 @@ services:
       DATABASE_URL: postgresql://phoenix_app:${PHOENIX_APP_PASSWORD}@postgres:5432/phoenix
     ports:
       - "5000:8000"
+    volumes:
+      - ./deployments:/deployments:ro
     networks:
       - phoenix-net
     depends_on:

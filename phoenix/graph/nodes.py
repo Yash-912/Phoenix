@@ -2,19 +2,23 @@ from datetime import datetime, timezone
 
 from phoenix.graph.llm_client import decide_tool_calls
 from phoenix.graph.state import AgentState
+from phoenix.tools.deploy_tool import get_recent_deployments
 from phoenix.tools.docker_tool import get_container_state
+from phoenix.tools.health_tool import inspect_health
 from phoenix.tools.loki_tool import query_loki
 from phoenix.tools.prometheus_tool import query_prometheus
 
 # The ONLY tools the LLM's decisions can ever result in executing.
-# decide_tool_calls() offers the LLM exactly these three (TOOL_SCHEMAS in
-# llm_client.py) — this dict is the enforcement point: even if the LLM
-# somehow returned a name outside this set, .get() below would just find
-# nothing to call, not execute anything arbitrary.
+# Observer stays read-only: remediation actions (restart/pause/cache)
+# live in remediation_tool.py and are executor-only, never dispatched here.
 TOOL_DISPATCH = {
     "query_prometheus": lambda args: query_prometheus(args["promql"]),
     "query_loki": lambda args: query_loki(args["logql"], args.get("minutes", 15)),
     "get_container_state": lambda args: get_container_state(args["container_name"]),
+    "inspect_health": lambda args: inspect_health(args["service_name"]),
+    "get_recent_deployments": lambda args: get_recent_deployments(
+        args["service_name"], args.get("limit", 10)
+    ),
 }
 
 
