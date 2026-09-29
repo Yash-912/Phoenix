@@ -1,7 +1,15 @@
 import json
 import os
 
-from openai import OpenAI, OpenAIError
+from openai import (
+    BadRequestError,
+    ContentFilterFinishReasonError,
+    LengthFinishReasonError,
+    NotFoundError,
+    OpenAI,
+    OpenAIError,
+    UnprocessableEntityError,
+)
 from pydantic import ValidationError
 
 from phoenix.graph.schemas import DiagnoserOutput, Hypothesis
@@ -194,8 +202,18 @@ def decide_hypotheses(service_name: str, evidence_so_far: list[dict]) -> Diagnos
             messages=messages,
             response_format=DiagnoserOutput,
         )
-    except (OpenAIError, ValidationError) as exc:
+    except (
+        BadRequestError,
+        NotFoundError,
+        UnprocessableEntityError,
+        LengthFinishReasonError,
+        ContentFilterFinishReasonError,
+        ValidationError,
+    ) as exc:
         print(f"[llm_client] structured hypotheses rejected, falling back to prompt JSON: {exc}")
+    except OpenAIError as exc:
+        print(f"[llm_client] hypothesis generation failed, LLM call failed: {exc}")
+        return DiagnoserOutput.model_construct(hypotheses=[])
     else:
         parsed = completion.choices[0].message.parsed
         if parsed is not None:
