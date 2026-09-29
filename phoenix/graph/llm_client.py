@@ -11,6 +11,7 @@ from openai import (
     OpenAIError,
     UnprocessableEntityError,
 )
+from openai.types.chat import ChatCompletion
 from pydantic import ValidationError
 
 from phoenix.graph.schemas import DiagnoserOutput, Hypothesis
@@ -45,7 +46,7 @@ class HypothesisDecision(NamedTuple):
     tokens: int
 
 
-def _tokens(response) -> int:
+def _tokens(response: ChatCompletion) -> int:
     """The tokens one response was billed, or 0 when it reported no usage.
 
     Both call styles land on the same shape: ChatCompletion and its
@@ -201,8 +202,8 @@ def decide_tool_calls(
         tool_choice="auto",
     )
 
-    message = response.choices[0].message
     tokens = _tokens(response)
+    message = response.choices[0].message
     if not message.tool_calls:
         return ToolCallDecision([], tokens)
 

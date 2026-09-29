@@ -14,6 +14,7 @@ os.environ.setdefault("LLM_MODEL", "test-model")
 
 from types import SimpleNamespace
 
+import pytest
 from pydantic import ValidationError
 
 from phoenix.graph import llm_client, nodes
@@ -67,18 +68,21 @@ def _usage(total_tokens: int) -> SimpleNamespace:
     )
 
 
-def _stub_completions(monkeypatch, tool_calls=(), total_tokens: int | None = 0) -> list[dict]:
+def _stub_completions(
+    monkeypatch, tool_calls=(), total_tokens: int | None = 0, choices: int = 1
+) -> list[dict]:
     """Replace the OpenAI client with a recorder; no request ever leaves the process.
 
     total_tokens=None makes the stubbed provider omit usage from its response,
-    the way an OpenAI-compatible free tier can.
+    the way an OpenAI-compatible free tier can. choices=0 is a response that
+    came back with nothing in it.
     """
     recorded: list[dict] = []
 
     def fake_create(**kwargs):
         recorded.append(kwargs)
         return SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(tool_calls=list(tool_calls)))],
+            choices=[SimpleNamespace(message=SimpleNamespace(tool_calls=list(tool_calls)))] * choices,
             usage=None if total_tokens is None else _usage(total_tokens),
         )
 
@@ -290,6 +294,24 @@ def test_an_observers_response_with_no_usage_is_counted_as_zero_not_guessed(monk
 
     assert decision.calls != []
     assert decision.tokens == 0
+
+
+def test_the_observers_bill_is_read_before_an_empty_choices_can_crash(monkeypatch):
+    _stub_completions(monkeypatch, total_tokens=505, choices=0)
+    billed = []
+    counted = llm_client._tokens
+
+    def recording_tokens(response):
+        billed.append(response)
+        return counted(response)
+
+    monkeypatch.setattr(llm_client, "_tokens", recording_tokens)
+
+    with pytest.raises(IndexError):
+        llm_client.decide_tool_calls(SERVICE, EVIDENCE, NEEDS)
+
+    assert len(billed) == 1
+    assert billed[0].usage.total_tokens == 505
 
 
 def test_the_structured_hypothesis_path_reports_its_own_tokens(monkeypatch):
