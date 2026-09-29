@@ -1,6 +1,6 @@
 import os
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 
 from prometheus_fastapi_instrumentator import Instrumentator
 
@@ -23,7 +23,7 @@ def health():
 @app.get("/checkout")
 def checkout():
     if BROKEN:
-        return {"error": "bad deploy v18"}, 500
+        raise HTTPException(status_code=500, detail="bad deploy v18")
     return {"order_id": "demo-order-1", "status": "confirmed"}
 
 
