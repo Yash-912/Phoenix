@@ -1,7 +1,10 @@
 import json
 import os
 
-from openai import OpenAI
+from openai import OpenAI, OpenAIError
+from pydantic import ValidationError
+
+from phoenix.graph.schemas import DiagnoserOutput, Hypothesis
 
 LLM_BASE_URL = os.environ["LLM_BASE_URL"]
 LLM_API_KEY = os.environ["LLM_API_KEY"]
@@ -139,3 +142,109 @@ def decide_tool_calls(service_name: str, evidence_so_far: list[dict]) -> list[di
         decided_calls.append({"name": tc.function.name, "arguments": arguments})
 
     return decided_calls
+
+
+def decide_hypotheses(service_name: str, evidence_so_far: list[dict]) -> DiagnoserOutput:
+    """Ask the LLM for ranked root-cause hypotheses: descriptions only.
+
+    Never executes anything and never calls a tool: the Observer's read-only
+    allowlist stays the only thing in this system that can run anything.
+
+    The preferred path is structured output: client.beta.chat.completions.parse
+    with the DiagnoserOutput schema. Support for a json_schema response_format
+    varies between OpenAI-compatible free-tier providers, so a rejected
+    structured request falls back to asking for JSON in the prompt and
+    validating it here with DiagnoserOutput.model_validate_json.
+
+    The model is asked only to describe what might be wrong. It never states a
+    score, a confidence, or a likelihood. Instead, phoenix/graph/scoring.py
+    decides how much to believe a hypothesis, in pure code, from the evidence.
+
+    Never raises: an unrecoverable LLM response yields an empty DiagnoserOutput.
+    """
+    summary = [
+        {"source": e["source"], "iteration": e["iteration"], "summary": e["summary"]}
+        for e in evidence_so_far
+    ]
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are the Diagnoser in an incident response system investigating "
+                f"service '{service_name}'. Read-only evidence has been gathered; "
+                "propose the root causes that evidence most plausibly supports, best "
+                "first, at most 4 of them. For each one give a one-sentence "
+                "description, the failure category (crash, overload, deploy, config, "
+                "network, or unknown), and the signals that would confirm or refute "
+                "it. Describe only, never state a score, a confidence, or a "
+                "likelihood; those are computed in code from the evidence. You cannot "
+                "take any remediation action."
+            ),
+        },
+        {
+            "role": "user",
+            "content": f"Evidence collected so far: {summary}\n\nWhat are the most likely root causes?",
+        },
+    ]
+
+    try:
+        completion = client.beta.chat.completions.parse(
+            model=LLM_MODEL,
+            messages=messages,
+            response_format=DiagnoserOutput,
+        )
+    except (OpenAIError, ValidationError) as exc:
+        print(f"[llm_client] structured hypotheses rejected, falling back to prompt JSON: {exc}")
+    else:
+        parsed = completion.choices[0].message.parsed
+        if parsed is not None:
+            return parsed
+        print("[llm_client] structured hypotheses came back unparsed, falling back to prompt JSON")
+
+    try:
+        fallback = client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[
+                *messages,
+                {
+                    "role": "user",
+                    "content": (
+                        "Reply with a single JSON object and nothing else, shaped as "
+                        '{"hypotheses": [{"description": "<one sentence>", "category": '
+                        '"crash|overload|deploy|config|network|unknown", '
+                        '"needs_evidence": ["<signal>"]}]} holding 1 to 4 entries, best '
+                        "first."
+                    ),
+                },
+            ],
+        )
+    except OpenAIError as exc:
+        print(f"[llm_client] discarding hypothesis generation, LLM call failed: {exc}")
+        return DiagnoserOutput.model_construct(hypotheses=[])
+
+    content = fallback.choices[0].message.content or ""
+
+    try:
+        return DiagnoserOutput.model_validate_json(content)
+    except ValidationError as exc:
+        print(f"[llm_client] hypothesis batch failed validation: {exc}")
+
+    try:
+        payload = json.loads(content)
+    except json.JSONDecodeError as exc:
+        payload = None
+        print(f"[llm_client] discarding unparsable hypothesis response: {exc}")
+
+    hypotheses: list[Hypothesis] = []
+    if isinstance(payload, dict) and isinstance(payload.get("hypotheses"), list):
+        for item in payload["hypotheses"]:
+            try:
+                hypotheses.append(Hypothesis.model_validate(item))
+            except ValidationError as exc:
+                print(f"[llm_client] discarding malformed hypothesis: {exc}")
+    if not hypotheses:
+        print("[llm_client] no usable hypotheses in LLM response")
+        return DiagnoserOutput.model_construct(hypotheses=[])
+
+    return DiagnoserOutput(hypotheses=hypotheses[:4])
