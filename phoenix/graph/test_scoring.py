@@ -80,6 +80,37 @@ def test_unknown_category_never_matches_and_never_penalized():
     assert bd["contradiction_penalty"] == 0.0
 
 
+def test_health_source_alone_scores_non_zero_for_matching_category():
+    ev = [_ev("inspect_health", "readiness probe failing, container dead")]
+    h = Hypothesis(description="shop crashed", category="crash")
+    score, bd = score_hypothesis(ev, h)
+    assert score == 0.15
+    assert bd["has_health_signal"] == 1
+    assert bd["has_deploy_signal"] == 0
+    assert bd["sources_supporting"] == 1
+    assert bd["weights"]["health"] == 0.15
+
+
+def test_deployments_source_alone_scores_non_zero_for_deploy_hypothesis():
+    ev = [_ev("get_recent_deployments", "deployed image shop:v18 at 09:14, rollout complete")]
+    h = Hypothesis(description="bad deploy v18", category="deploy")
+    score, bd = score_hypothesis(ev, h)
+    assert score == 0.15
+    assert bd["has_deploy_signal"] == 1
+    assert bd["sources_supporting"] == 1
+    assert bd["weights"]["deploy"] == 0.15
+
+
+def test_contradiction_penalty_counts_secondary_sources():
+    ev = [_ev("inspect_health", "all systems healthy"),
+          _ev("get_recent_deployments", "no recent changes")]
+    h = Hypothesis(description="shop crashed", category="crash")
+    score, bd = score_hypothesis(ev, h)
+    assert bd["sources_supporting"] == 0
+    assert bd["contradiction_penalty"] == 0.3
+    assert score == 0.0
+
+
 def test_score_all_sorts_best_first_and_confidence():
     ev = [_ev("query_prometheus", "HighLatency p95 slow")]
     h_wrong = Hypothesis(description="bad deploy", category="deploy")
