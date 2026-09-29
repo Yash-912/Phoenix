@@ -96,8 +96,14 @@ TOOL_SCHEMAS = [
 ]
 
 
-def decide_tool_calls(service_name: str, evidence_so_far: list[dict]) -> list[dict]:
+def decide_tool_calls(
+    service_name: str, evidence_so_far: list[dict], evidence_requests: list[str]
+) -> list[dict]:
     """Ask the LLM which of the 5 allowlisted read-only tools to call next.
+
+    evidence_requests are the outstanding confirm/refute signals the diagnoser named
+    on its surviving hypotheses. They only steer which of the same five tools to
+    reach for next — a request is a hint about what to observe, never a new tool.
 
     Returns a list of {"name": str, "arguments": dict} — never executes anything itself.
     The LLM is ONLY ever offered these five tools (TOOL_SCHEMAS) — least-privilege
@@ -108,6 +114,14 @@ def decide_tool_calls(service_name: str, evidence_so_far: list[dict]) -> list[di
         {"source": e["source"], "iteration": e["iteration"], "summary": e["summary"]}
         for e in evidence_so_far
     ]
+
+    outstanding = ""
+    if evidence_requests:
+        outstanding = (
+            "The Diagnoser has proposed root causes and named the signals that would "
+            "confirm or refute them. Prefer a tool that can collect one of them: "
+            f"{evidence_requests}\n\n"
+        )
 
     response = client.chat.completions.create(
         model=LLM_MODEL,
@@ -125,7 +139,10 @@ def decide_tool_calls(service_name: str, evidence_so_far: list[dict]) -> list[di
             },
             {
                 "role": "user",
-                "content": f"Evidence collected so far: {summary}\n\nWhich tool(s) do you want to call next?",
+                "content": (
+                    f"Evidence collected so far: {summary}\n\n"
+                    f"{outstanding}Which tool(s) do you want to call next?"
+                ),
             },
         ],
         tools=TOOL_SCHEMAS,

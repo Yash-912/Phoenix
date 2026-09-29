@@ -24,13 +24,32 @@ TOOL_DISPATCH = {
 }
 
 
+def _pending_evidence_requests(hypotheses: list[ScoredHypothesis]) -> list[str]:
+    """The confirm/refute signals the surviving hypotheses still want, best-ranked first.
+
+    Several hypotheses routinely ask for the same next read; a repeated request is
+    prompt noise, so keep the first occurrence and drop blanks.
+    """
+    requests: list[str] = []
+    for scored in hypotheses:
+        for requested in scored.hypothesis.needs_evidence:
+            text = requested.strip()
+            if text and text not in requests:
+                requests.append(text)
+    return requests
+
+
 def observer_node(state: AgentState) -> AgentState:
     """Slice 2.3, completed: the LLM decides which tool(s) to call next;
-    this code executes exactly what it decides and nothing else.
+    this code executes exactly what it decides and nothing else. The diagnoser's
+    outstanding evidence requests ride along into that decision, so the loop
+    investigates what the hypotheses actually want confirmed.
     """
     state.iteration += 1
 
-    requested_calls = decide_tool_calls(state.service_name, state.evidence)
+    requested_calls = decide_tool_calls(
+        state.service_name, state.evidence, state.needs_evidence
+    )
 
     if not requested_calls:
         print(f"[observer] iteration {state.iteration}: LLM requested no tool calls")
@@ -62,13 +81,16 @@ def diagnoser_node(state: AgentState) -> AgentState:
     """The LLM describes candidate root causes; scoring.py alone decides how much
     to believe them. Confidence is the top ranked hypothesis' deterministic score,
     so it moves with the evidence the observer collected, never with a count of
-    evidence items and never with anything the model asserted about itself.
+    evidence items and never with anything the model asserted about itself. The
+    ranked hypotheses' needs_evidence entries become the state's outstanding
+    requests, which the observer's next prompt is steered by.
     """
     proposed = decide_hypotheses(state.service_name, state.evidence).hypotheses
 
     if not proposed:
         print(f"[diagnoser] iteration {state.iteration}: LLM proposed no hypotheses")
         state.hypotheses = []
+        state.needs_evidence = []
         state.confidence = 0.0
         return state
 
@@ -76,6 +98,7 @@ def diagnoser_node(state: AgentState) -> AgentState:
         ScoredHypothesis(hypothesis=hypothesis, score=score, score_breakdown=breakdown)
         for hypothesis, score, breakdown in scoring.score_all(state.evidence, proposed)
     ]
+    state.needs_evidence = _pending_evidence_requests(state.hypotheses)
     state.confidence = scoring.top_confidence(state.evidence, proposed)
 
     for scored in state.hypotheses:

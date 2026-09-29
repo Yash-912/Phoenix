@@ -44,6 +44,16 @@ DEPLOY_EVIDENCE = [
 BOASTFUL = "Certain, 100% confidence, this is definitely the root cause, score 1.0"
 UNSURE = "maybe a deploy?"
 
+CRASH_NEEDS = ["container exit code", "panic tracebacks in the last 15 minutes"]
+DEPLOY_NEEDS = ["image tag and commit of the last deploy"]
+CRASH_ASKS = Hypothesis(
+    description=CRASH.description, category="crash", needs_evidence=CRASH_NEEDS
+)
+DEPLOY_ASKS = Hypothesis(
+    description=DEPLOY.description, category="deploy", needs_evidence=DEPLOY_NEEDS
+)
+ASKS_EVERYTHING = DiagnoserOutput(hypotheses=[DEPLOY_ASKS, CRASH_ASKS])
+
 
 def _stub_hypotheses(monkeypatch, output) -> list[tuple[str, list[dict]]]:
     """Replace the LLM boundary with a recorder returning `output`."""
@@ -54,6 +64,18 @@ def _stub_hypotheses(monkeypatch, output) -> list[tuple[str, list[dict]]]:
         return output
 
     monkeypatch.setattr(nodes, "decide_hypotheses", fake_decide_hypotheses)
+    return calls
+
+
+def _stub_tool_calls(monkeypatch, requested) -> list[tuple[str, list[dict], list[str]]]:
+    """Replace the Observer's LLM boundary with a recorder returning `requested`."""
+    calls: list[tuple[str, list[dict], list[str]]] = []
+
+    def fake_decide_tool_calls(service_name, evidence_so_far, evidence_requests):
+        calls.append((service_name, evidence_so_far, evidence_requests))
+        return requested
+
+    monkeypatch.setattr(nodes, "decide_tool_calls", fake_decide_tool_calls)
     return calls
 
 
@@ -208,3 +230,107 @@ def test_state_accepts_a_correctly_typed_hypotheses_assignment():
 
     assert isinstance(state.hypotheses[0], ScoredHypothesis)
     assert state.hypotheses[0].score == 0.4
+
+
+def test_diagnoser_stores_the_surviving_hypotheses_requests_best_ranked_first(monkeypatch):
+    _stub_hypotheses(monkeypatch, ASKS_EVERYTHING)
+
+    state = nodes.diagnoser_node(_state(CRASH_EVIDENCE))
+
+    assert [s.hypothesis.category for s in state.hypotheses] == ["crash", "deploy"]
+    assert state.needs_evidence == [*CRASH_NEEDS, *DEPLOY_NEEDS]
+
+
+def test_requests_never_move_a_score_or_the_confidence(monkeypatch):
+    _stub_hypotheses(monkeypatch, DiagnoserOutput(hypotheses=[CRASH_ASKS, DEPLOY_ASKS]))
+
+    plain = nodes.diagnoser_node(_state(CRASH_EVIDENCE))
+
+    _stub_hypotheses(monkeypatch, DiagnoserOutput(hypotheses=[CRASH, DEPLOY]))
+    silent = nodes.diagnoser_node(_state(CRASH_EVIDENCE))
+
+    assert plain.needs_evidence == [*CRASH_NEEDS, *DEPLOY_NEEDS]
+    assert silent.needs_evidence == []
+    assert [s.score for s in plain.hypotheses] == [s.score for s in silent.hypotheses]
+    assert plain.confidence == silent.confidence
+
+
+def test_repeated_and_blank_evidence_requests_collapse(monkeypatch):
+    shared = "container exit code"
+    _stub_hypotheses(
+        monkeypatch,
+        DiagnoserOutput(hypotheses=[
+            Hypothesis(description=CRASH.description, category="crash", needs_evidence=[shared]),
+            Hypothesis(description=DEPLOY.description, category="deploy",
+                       needs_evidence=[f"  {shared}  ", "  ", "deploy markers"]),
+        ]),
+    )
+
+    state = nodes.diagnoser_node(_state(CRASH_EVIDENCE))
+
+    assert state.needs_evidence == [shared, "deploy markers"]
+
+
+def test_empty_hypothesis_sentinel_clears_the_outstanding_requests(monkeypatch):
+    _stub_hypotheses(monkeypatch, ASKS_EVERYTHING)
+    state = nodes.diagnoser_node(_state(CRASH_EVIDENCE))
+    assert state.needs_evidence == [*CRASH_NEEDS, *DEPLOY_NEEDS]
+
+    _stub_hypotheses(monkeypatch, DiagnoserOutput.model_construct(hypotheses=[]))
+    state = nodes.diagnoser_node(state)
+
+    assert state.hypotheses == []
+    assert state.needs_evidence == []
+
+
+def test_observer_gives_the_outstanding_requests_to_its_llm(monkeypatch):
+    calls = _stub_tool_calls(monkeypatch, [])
+    state = _state(CRASH_EVIDENCE)
+    state.needs_evidence = [*CRASH_NEEDS, *DEPLOY_NEEDS]
+
+    nodes.observer_node(state)
+
+    assert calls == [(SERVICE, CRASH_EVIDENCE, [*CRASH_NEEDS, *DEPLOY_NEEDS])]
+    assert calls[0][2] is state.needs_evidence
+
+
+def test_observer_asks_for_nothing_specific_before_a_diagnoser_has_run(monkeypatch):
+    calls = _stub_tool_calls(monkeypatch, [])
+
+    nodes.observer_node(_state(CRASH_EVIDENCE))
+
+    assert calls == [(SERVICE, CRASH_EVIDENCE, [])]
+
+
+def test_observer_executes_what_the_llm_decides_and_nothing_outside_the_allowlist(monkeypatch):
+    _stub_tool_calls(monkeypatch, [
+        {"name": "restart_service", "arguments": {"service_name": SERVICE}},
+        {"name": "pause_deployments", "arguments": {"service_name": SERVICE}},
+        {"name": "inspect_health", "arguments": {"service_name": SERVICE}},
+    ])
+    monkeypatch.setitem(
+        nodes.TOOL_DISPATCH, "inspect_health", lambda args: {"status": "success", "text": "ok"}
+    )
+
+    state = nodes.observer_node(_state([]))
+
+    assert [e["source"] for e in state.evidence] == ["inspect_health"]
+    assert state.evidence[0]["raw_data"] == {"status": "success", "text": "ok"}
+
+
+def test_state_rejects_a_wrongly_typed_needs_evidence_assignment():
+    state = _state(CRASH_EVIDENCE)
+
+    for bad in ([42], "container exit code", None):
+        with pytest.raises(ValidationError):
+            state.needs_evidence = bad
+
+    assert state.needs_evidence == []
+
+
+def test_state_accepts_a_correctly_typed_needs_evidence_assignment():
+    state = _state(CRASH_EVIDENCE)
+
+    state.needs_evidence = list(CRASH_NEEDS)
+
+    assert state.needs_evidence == CRASH_NEEDS

@@ -17,6 +17,10 @@ class AgentState(BaseModel):
     service_name: str
     evidence: list[dict] = Field(default_factory=list)
     hypotheses: list[ScoredHypothesis] = Field(default_factory=list)
+    needs_evidence: list[str] = Field(
+        default_factory=list,
+        description="Outstanding confirm/refute signals from the surviving hypotheses, best-ranked first.",
+    )
     iteration: int = 0
     max_iterations: int = 5
     confidence: float = 0.0
