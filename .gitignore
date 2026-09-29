@@ -3,3 +3,5 @@
 agentic/
 __pycache__/
 *.pyc
+.superpowers
+.pytest_cache
