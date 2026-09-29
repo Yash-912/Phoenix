@@ -129,12 +129,17 @@ def observer_node(state: AgentState) -> AgentState:
     this code executes exactly what it decides and nothing else. The diagnoser's
     outstanding evidence requests ride along into that decision, so the loop
     investigates what the hypotheses actually want confirmed.
+
+    Whatever the LLM spent asking is added to state.tokens_spent, including on
+    the turn it asks for nothing: the call was made and billed either way.
     """
     state.iteration += 1
 
-    requested_calls = decide_tool_calls(
+    decision = decide_tool_calls(
         state.service_name, state.evidence, state.needs_evidence
     )
+    state.tokens_spent += decision.tokens
+    requested_calls = decision.calls
 
     if not requested_calls:
         print(f"[observer] iteration {state.iteration}: LLM requested no tool calls")
@@ -170,8 +175,13 @@ def diagnoser_node(state: AgentState) -> AgentState:
     ranked hypotheses' needs_evidence entries become the state's outstanding
     requests, minus any the evidence already answers: empty means there is nothing
     left to go and look at.
+
+    The LLM's own tokens land on state.tokens_spent here too, covering both
+    calls when a structured attempt fell back to prompt JSON.
     """
-    proposed = decide_hypotheses(state.service_name, state.evidence).hypotheses
+    decision = decide_hypotheses(state.service_name, state.evidence)
+    state.tokens_spent += decision.tokens
+    proposed = decision.output.hypotheses
 
     if not proposed:
         print(f"[diagnoser] iteration {state.iteration}: LLM proposed no hypotheses")

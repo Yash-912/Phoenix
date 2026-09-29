@@ -13,7 +13,7 @@ os.environ.setdefault("LLM_MODEL", "test-model")
 import pytest
 from pydantic import ValidationError
 
-from phoenix.graph import nodes, scoring
+from phoenix.graph import llm_client, nodes, scoring
 from phoenix.graph.schemas import DiagnoserOutput, Hypothesis, ScoredHypothesis
 from phoenix.graph.state import AgentState
 
@@ -61,25 +61,27 @@ DEPLOY_ASKS = Hypothesis(
 ASKS_EVERYTHING = DiagnoserOutput(hypotheses=[DEPLOY_ASKS, CRASH_ASKS])
 
 
-def _stub_hypotheses(monkeypatch, output) -> list[tuple[str, list[dict]]]:
+def _stub_hypotheses(monkeypatch, output, tokens: int = 0) -> list[tuple[str, list[dict]]]:
     """Replace the LLM boundary with a recorder returning `output`."""
     calls: list[tuple[str, list[dict]]] = []
 
     def fake_decide_hypotheses(service_name, evidence_so_far):
         calls.append((service_name, evidence_so_far))
-        return output
+        return llm_client.HypothesisDecision(output, tokens)
 
     monkeypatch.setattr(nodes, "decide_hypotheses", fake_decide_hypotheses)
     return calls
 
 
-def _stub_tool_calls(monkeypatch, requested) -> list[tuple[str, list[dict], list[str]]]:
+def _stub_tool_calls(
+    monkeypatch, requested, tokens: int = 0
+) -> list[tuple[str, list[dict], list[str]]]:
     """Replace the Observer's LLM boundary with a recorder returning `requested`."""
     calls: list[tuple[str, list[dict], list[str]]] = []
 
     def fake_decide_tool_calls(service_name, evidence_so_far, evidence_requests):
         calls.append((service_name, evidence_so_far, evidence_requests))
-        return requested
+        return llm_client.ToolCallDecision(requested, tokens)
 
     monkeypatch.setattr(nodes, "decide_tool_calls", fake_decide_tool_calls)
     return calls
@@ -458,3 +460,117 @@ def test_state_accepts_a_correctly_typed_needs_evidence_assignment():
     state.needs_evidence = list(CRASH_NEEDS)
 
     assert state.needs_evidence == CRASH_NEEDS
+
+
+def test_the_token_budget_is_an_int_defaulting_to_twenty_thousand():
+    state = _state(CRASH_EVIDENCE)
+
+    assert state.token_budget == 20000
+    assert isinstance(state.token_budget, int)
+    assert state.tokens_spent == 0
+    assert isinstance(state.tokens_spent, int)
+
+
+def test_the_observer_adds_its_llm_tokens_to_the_state(monkeypatch):
+    _stub_tool_calls(monkeypatch, [], tokens=940)
+    state = _state(CRASH_EVIDENCE)
+
+    nodes.observer_node(state)
+
+    assert state.tokens_spent == 940
+
+
+def test_the_observer_bills_its_tokens_even_when_no_tool_was_requested(monkeypatch):
+    _stub_tool_calls(monkeypatch, [], tokens=940)
+    state = _state([])
+    state.tokens_spent = 60
+
+    nodes.observer_node(state)
+
+    assert state.evidence == []
+    assert state.tokens_spent == 1000
+
+
+def test_the_observer_adds_to_the_spend_already_on_the_state(monkeypatch):
+    _stub_tool_calls(monkeypatch, [], tokens=940)
+    state = _state(CRASH_EVIDENCE)
+    state.tokens_spent = 19100
+
+    nodes.observer_node(state)
+
+    assert state.tokens_spent == 20040
+    assert state.tokens_spent > state.token_budget
+
+
+def test_the_diagnoser_adds_its_llm_tokens_to_the_state(monkeypatch):
+    _stub_hypotheses(monkeypatch, DiagnoserOutput(hypotheses=[CRASH]), tokens=1350)
+
+    state = nodes.diagnoser_node(_state(CRASH_EVIDENCE))
+
+    assert state.tokens_spent == 1350
+    assert state.confidence == 0.9
+
+
+def test_the_diagnoser_bills_its_tokens_even_when_it_proposed_nothing(monkeypatch):
+    _stub_hypotheses(monkeypatch, DiagnoserOutput.model_construct(hypotheses=[]), tokens=760)
+
+    state = nodes.diagnoser_node(_state(CRASH_EVIDENCE))
+
+    assert state.hypotheses == []
+    assert state.tokens_spent == 760
+
+
+def test_both_nodes_accumulate_into_the_same_running_total(monkeypatch):
+    _stub_hypotheses(monkeypatch, DiagnoserOutput(hypotheses=[CRASH]), tokens=1350)
+    _stub_tool_calls(monkeypatch, [], tokens=940)
+    state = _state(CRASH_EVIDENCE)
+
+    nodes.observer_node(state)
+    nodes.diagnoser_node(state)
+    nodes.observer_node(state)
+
+    assert state.tokens_spent == 940 + 1350 + 940
+
+
+def test_a_call_with_no_usage_leaves_the_total_where_it_was(monkeypatch):
+    _stub_hypotheses(monkeypatch, DiagnoserOutput(hypotheses=[CRASH]), tokens=0)
+    _stub_tool_calls(monkeypatch, [], tokens=0)
+    state = _state(CRASH_EVIDENCE)
+    state.tokens_spent = 4242
+
+    nodes.observer_node(state)
+    nodes.diagnoser_node(state)
+
+    assert state.tokens_spent == 4242
+
+
+def test_state_rejects_a_wrongly_typed_tokens_spent_assignment():
+    state = _state(CRASH_EVIDENCE)
+
+    for bad in (None, [940], {"tokens": 940}, 940.5):
+        with pytest.raises(ValidationError):
+            state.tokens_spent = bad
+
+    assert state.tokens_spent == 0
+
+
+def test_the_int_field_tolerates_a_whole_float_and_refuses_a_fractional_one():
+    state = _state(CRASH_EVIDENCE)
+
+    state.tokens_spent = 940.0
+
+    assert state.tokens_spent == 940
+    assert isinstance(state.tokens_spent, int)
+
+    with pytest.raises(ValidationError):
+        state.tokens_spent = 940.5
+
+
+def test_state_rejects_a_wrongly_typed_token_budget_assignment():
+    state = _state(CRASH_EVIDENCE)
+
+    for bad in (None, [20000], {"tokens": 20000}, 20000.5):
+        with pytest.raises(ValidationError):
+            state.token_budget = bad
+
+    assert state.token_budget == 20000

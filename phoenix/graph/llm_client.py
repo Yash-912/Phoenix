@@ -1,5 +1,6 @@
 import json
 import os
+from typing import NamedTuple
 
 from openai import (
     BadRequestError,
@@ -19,6 +20,47 @@ LLM_API_KEY = os.environ["LLM_API_KEY"]
 LLM_MODEL = os.environ["LLM_MODEL"]
 
 client = OpenAI(base_url=LLM_BASE_URL, api_key=LLM_API_KEY)
+
+
+class ToolCallDecision(NamedTuple):
+    """What the Observer's LLM call produced, and what that call cost.
+
+    tokens is the provider's own usage.total_tokens. It is 0 when the response
+    carried no usage: a missing count is reported as missing, never guessed.
+    """
+
+    calls: list[dict]
+    tokens: int
+
+
+class HypothesisDecision(NamedTuple):
+    """What the Diagnoser's LLM call produced, and what those calls cost.
+
+    A diagnosis can cost two calls — the structured attempt and the prompt-JSON
+    fallback — and tokens is the sum of every response that was billed. A call
+    that never produced a response contributes nothing to either field.
+    """
+
+    output: DiagnoserOutput
+    tokens: int
+
+
+def _tokens(response) -> int:
+    """The tokens one response was billed, or 0 when it reported no usage.
+
+    Both call styles land on the same shape: ChatCompletion and its
+    ParsedChatCompletion subclass both carry an optional usage whose
+    total_tokens is the number the provider issued. When a provider omits it the
+    SDK leaves usage None, and there is nothing here to count — an estimate would
+    be a number the provider never sent. The omission is logged so a run whose
+    spend is invisible is visible rather than silently free.
+    """
+    usage = response.usage
+    if usage is None:
+        print("[llm_client] response carried no usage, counting it as zero tokens")
+        return 0
+    return int(usage.total_tokens or 0)
+
 
 TOOL_SCHEMAS = [
     {
@@ -98,7 +140,7 @@ TOOL_SCHEMAS = [
 
 def decide_tool_calls(
     service_name: str, evidence_so_far: list[dict], evidence_requests: list[str]
-) -> list[dict]:
+) -> ToolCallDecision:
     """Ask the LLM which of the 5 allowlisted read-only tools to call next.
 
     evidence_requests are the outstanding confirm/refute signals the diagnoser named
@@ -108,7 +150,11 @@ def decide_tool_calls(
     quoted into a JSON list and labelled data, and the tool allowlist is the
     backstop that does not depend on the model behaving.
 
-    Returns a list of {"name": str, "arguments": dict} — never executes anything itself.
+    Returns the {"name": str, "arguments": dict} calls the LLM decided on —
+    never executes anything itself — plus the tokens the call was billed. The
+    tokens are counted even when the model asked for nothing: the call happened
+    and was charged whether or not it named a tool.
+
     The LLM is ONLY ever offered these five tools (TOOL_SCHEMAS) — least-privilege
     allowlisting. It cannot request anything outside this list; remediation
     actions are executor-only and never offered here.
@@ -156,8 +202,9 @@ def decide_tool_calls(
     )
 
     message = response.choices[0].message
+    tokens = _tokens(response)
     if not message.tool_calls:
-        return []
+        return ToolCallDecision([], tokens)
 
     decided_calls = []
     for tc in message.tool_calls:
@@ -172,10 +219,12 @@ def decide_tool_calls(
             continue
         decided_calls.append({"name": tc.function.name, "arguments": arguments})
 
-    return decided_calls
+    return ToolCallDecision(decided_calls, tokens)
 
 
-def decide_hypotheses(service_name: str, evidence_so_far: list[dict]) -> DiagnoserOutput:
+def decide_hypotheses(
+    service_name: str, evidence_so_far: list[dict]
+) -> HypothesisDecision:
     """Ask the LLM for ranked root-cause hypotheses: descriptions only.
 
     Never executes anything and never calls a tool: the Observer's read-only
@@ -191,7 +240,11 @@ def decide_hypotheses(service_name: str, evidence_so_far: list[dict]) -> Diagnos
     score, a confidence, or a likelihood. Instead, phoenix/graph/scoring.py
     decides how much to believe a hypothesis, in pure code, from the evidence.
 
-    Never raises: an unrecoverable LLM response yields an empty DiagnoserOutput.
+    Every response that came back is counted, including the structured attempt
+    when the fallback is the one that answered: both calls were billed.
+
+    Never raises: an unrecoverable LLM response yields an empty DiagnoserOutput,
+    and a call that produced no response at all costs nothing to count.
     """
     summary = [
         {"source": e["source"], "iteration": e["iteration"], "summary": e["summary"]}
@@ -219,6 +272,8 @@ def decide_hypotheses(service_name: str, evidence_so_far: list[dict]) -> Diagnos
         },
     ]
 
+    tokens = 0
+
     try:
         completion = client.beta.chat.completions.parse(
             model=LLM_MODEL,
@@ -236,11 +291,12 @@ def decide_hypotheses(service_name: str, evidence_so_far: list[dict]) -> Diagnos
         print(f"[llm_client] structured hypotheses rejected, falling back to prompt JSON: {exc}")
     except OpenAIError as exc:
         print(f"[llm_client] hypothesis generation failed, LLM call failed: {exc}")
-        return DiagnoserOutput.model_construct(hypotheses=[])
+        return HypothesisDecision(DiagnoserOutput.model_construct(hypotheses=[]), tokens)
     else:
+        tokens = _tokens(completion)
         parsed = completion.choices[0].message.parsed
         if parsed is not None:
-            return parsed
+            return HypothesisDecision(parsed, tokens)
         print("[llm_client] structured hypotheses came back unparsed, falling back to prompt JSON")
 
     try:
@@ -262,12 +318,13 @@ def decide_hypotheses(service_name: str, evidence_so_far: list[dict]) -> Diagnos
         )
     except OpenAIError as exc:
         print(f"[llm_client] discarding hypothesis generation, LLM call failed: {exc}")
-        return DiagnoserOutput.model_construct(hypotheses=[])
+        return HypothesisDecision(DiagnoserOutput.model_construct(hypotheses=[]), tokens)
 
+    tokens += _tokens(fallback)
     content = fallback.choices[0].message.content or ""
 
     try:
-        return DiagnoserOutput.model_validate_json(content)
+        return HypothesisDecision(DiagnoserOutput.model_validate_json(content), tokens)
     except ValidationError as exc:
         print(f"[llm_client] hypothesis batch failed validation: {exc}")
 
@@ -286,6 +343,6 @@ def decide_hypotheses(service_name: str, evidence_so_far: list[dict]) -> Diagnos
                 print(f"[llm_client] discarding malformed hypothesis: {exc}")
     if not hypotheses:
         print("[llm_client] no usable hypotheses in LLM response")
-        return DiagnoserOutput.model_construct(hypotheses=[])
+        return HypothesisDecision(DiagnoserOutput.model_construct(hypotheses=[]), tokens)
 
-    return DiagnoserOutput(hypotheses=hypotheses[:4])
+    return HypothesisDecision(DiagnoserOutput(hypotheses=hypotheses[:4]), tokens)
