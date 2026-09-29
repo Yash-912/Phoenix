@@ -36,6 +36,7 @@ from phoenix.graph.schemas import ScoredHypothesis
 DATABASE_URL_ENV = "DATABASE_URL"
 POOL_MIN_SIZE = 1
 POOL_MAX_SIZE = 5
+POOL_WAIT_SECONDS = 2.0
 
 INSERT_EVIDENCE = """
 INSERT INTO evidence (incident_id, source, iteration, collected_at, summary, raw_data)
@@ -78,6 +79,12 @@ def _get_pool():
     without the driver installed, still imports and still reaches a diagnosis.
     Opened the way the API opens its own: constructed closed, opened once, then
     shared by every write for the life of the process.
+
+    The wait for a connection is capped at POOL_WAIT_SECONDS rather than left at
+    the driver's thirty seconds. A server that is up but refusing connections is
+    discovered at checkout, not at open(), and a run writes a row per tool call;
+    at the default it would spend half a minute on each one before printing the
+    same line, which is the opposite of finishing on time.
     """
     global _pool, _pool_error
     if _pool is not None or _pool_error is not None:
@@ -93,7 +100,11 @@ def _get_pool():
         from psycopg_pool import ConnectionPool
 
         pool = ConnectionPool(
-            url, min_size=POOL_MIN_SIZE, max_size=POOL_MAX_SIZE, open=False
+            url,
+            min_size=POOL_MIN_SIZE,
+            max_size=POOL_MAX_SIZE,
+            open=False,
+            timeout=POOL_WAIT_SECONDS,
         )
         pool.open()
     except Exception as exc:
@@ -120,6 +131,10 @@ def _jsonb(value: dict):
 def _execute(sql: str, params: dict) -> None:
     """Run one INSERT, committed, or do nothing if there is no pool to run it.
 
+    The writers ask for the pool before they build their parameters, so a run
+    with nowhere to write never reaches for the driver at all. The check is
+    repeated here because a pool closed in between is still no pool.
+
     Raises whatever the driver raised. The three writers below are the ones that
     decide what a failed write costs, and they all decide it the same way.
     """
@@ -143,9 +158,16 @@ def record_evidence(incident_id: int, evidence_item: dict) -> None:
     datetime, so the timestamptz column receives a timestamp rather than a
     string the server has to interpret.
 
+    The pool is asked for before the parameters are built, so a run with no
+    database reports the one true cause -- an unset URL, or no driver -- rather
+    than a missing import raised while wrapping raw_data for a write that had
+    nowhere to go.
+
     Never raises.
     """
     try:
+        if _get_pool() is None:
+            return
         _execute(
             INSERT_EVIDENCE,
             {
@@ -184,9 +206,16 @@ def record_hypotheses(
     timestamps rows -- a fourth pass recorded as the first is a trail that reads
     as if nothing happened before it.
 
+    One failed row does not abandon the rest of the ranking, for the same reason
+    a malformed tool call does not take down the observer's batch: a batch is
+    worth more than any one of its entries.
+
     Never raises.
     """
     if not scored_hypotheses:
+        return
+
+    if _get_pool() is None:
         return
 
     for scored in scored_hypotheses:
@@ -214,17 +243,20 @@ def record_audit(
 ) -> None:
     """Append one audit row: which node decided what, and the state it saw.
 
-    detail is stored exactly as it was handed over. Nothing here reads a
-    confidence, recomputes one, or adjusts one: a value in this row is here
-    because deterministic code produced it upstream, and this module's only
-    opinion is that the row is worth keeping.
-
     created_at is left to the column default, so the row records when the
     database wrote it rather than when the graph believed it did.
+
+    detail is handed over unchanged, which is what makes this the place a
+    routing decision belongs: nothing here reads a confidence, recomputes one,
+    or adjusts one. The value in a row is there because deterministic code
+    produced it upstream, and this module's only opinion is that the row is
+    worth keeping.
 
     Never raises.
     """
     try:
+        if _get_pool() is None:
+            return
         _execute(
             INSERT_AUDIT,
             {
@@ -247,6 +279,10 @@ def close_persistence() -> None:
     The graph is a one-shot process that builds the pool lazily on its first
     write, so the pool is the only thing here that outlives a function call and
     the only thing a caller has to hand back.
+
+    Closing is not permanent: the module treats the database as reachable for as
+    long as the process lives, so a write after this opens a fresh pool. Call it
+    when the run is over, not to disable persistence.
     """
     global _pool
     pool, _pool = _pool, None
