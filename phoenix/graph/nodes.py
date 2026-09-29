@@ -1,3 +1,4 @@
+import re
 from datetime import datetime, timezone
 
 from phoenix.graph import scoring
@@ -23,19 +24,90 @@ TOOL_DISPATCH = {
     ),
 }
 
+# needs_evidence entries are LLM-authored free text bound for another model's prompt.
+MAX_EVIDENCE_REQUESTS = 6
+MAX_REQUEST_LENGTH = 120
+MIN_REQUEST_WORD = 4
+REQUEST_STOP_WORDS = {
+    "about", "after", "also", "and", "any", "are", "been", "being", "but", "check",
+    "confirm", "could", "did", "does", "evidence", "for", "from", "had", "has", "have",
+    "into", "its", "just", "look", "looking", "more", "most", "must", "need", "needs",
+    "only", "our", "refute", "see", "should", "show", "signal", "some", "such", "than",
+    "that", "their", "them", "then", "there", "these", "they", "this", "those", "very",
+    "want", "wants", "were", "what", "when", "where", "which", "while", "will",
+    "with", "would", "you", "your",
+}
 
-def _pending_evidence_requests(hypotheses: list[ScoredHypothesis]) -> list[str]:
-    """The confirm/refute signals the surviving hypotheses still want, best-ranked first.
+_WORD = re.compile(r"[a-z0-9]+")
 
-    Several hypotheses routinely ask for the same next read; a repeated request is
-    prompt noise, so keep the first occurrence and drop blanks.
+
+def _evidence_words(evidence: list[dict]) -> set[str]:
+    """Every word the observer has already read, as a set.
+
+    Matched as whole words, never as substrings: "exit" must not be satisfied by
+    "exits", or a request retires against text nobody wrote.
+
+    The "tool(args)" label is cut off the summary first: a tool's name is not a
+    signal. scoring.py draws the same line when it refuses to let a label satisfy
+    a category keyword, and without it a request retires for the wrong reason.
     """
+    words: set[str] = set()
+    for item in evidence:
+        source = str(item.get("source", ""))
+        summary = str(item.get("summary", ""))
+        label = f"{source}("
+        if source and summary.startswith(label) and summary.endswith(")"):
+            summary = summary[len(label) : -1]
+        words.update(_WORD.findall(f"{summary} {item.get('raw_data', '')}".lower()))
+    return words
+
+
+def _content_words(text: str) -> set[str]:
+    """The words in a request that actually name a signal: long enough to mean
+    something, and not a connector, not the instruction verb the model wrapped the
+    request in, and not the meta-vocabulary it wrapped it in.
+    """
+    return {word for word in _WORD.findall(text.lower())
+            if len(word) >= MIN_REQUEST_WORD and word not in REQUEST_STOP_WORDS}
+
+
+def _is_answered(request: str, read: set[str]) -> bool:
+    """True when the evidence already read says everything this request asks for.
+
+    Deliberately literal, and therefore deliberately conservative: a request is
+    retired only when every content word in it is already in the evidence. Keeping
+    one the observer has in fact satisfied costs a redundant read at worst, and the
+    prompt tells it to discount a request the evidence already covers. Retiring one
+    nobody answered costs evidence nobody can get back.
+    """
+    words = _content_words(request)
+    return bool(words) and words <= read
+
+
+def _pending_evidence_requests(
+    hypotheses: list[ScoredHypothesis], evidence: list[dict]
+) -> list[str]:
+    """The confirm/refute signals the surviving hypotheses still want, best-ranked
+    first, with the ones the evidence has already answered retired.
+
+    Also where the list is bounded: LLM-authored free text is trimmed to
+    MAX_REQUEST_LENGTH and the list stops at MAX_EVIDENCE_REQUESTS, so neither the
+    prompt nor the state a later router reads can be swollen by it.
+    """
+    read = _evidence_words(evidence)
     requests: list[str] = []
+
     for scored in hypotheses:
         for requested in scored.hypothesis.needs_evidence:
             text = requested.strip()
-            if text and text not in requests:
+            if not text or _is_answered(text, read):
+                continue
+            text = text[:MAX_REQUEST_LENGTH]
+            if text not in requests:
                 requests.append(text)
+            if len(requests) == MAX_EVIDENCE_REQUESTS:
+                return requests
+
     return requests
 
 
@@ -83,7 +155,8 @@ def diagnoser_node(state: AgentState) -> AgentState:
     so it moves with the evidence the observer collected, never with a count of
     evidence items and never with anything the model asserted about itself. The
     ranked hypotheses' needs_evidence entries become the state's outstanding
-    requests, which the observer's next prompt is steered by.
+    requests, minus any the evidence already answers: empty means there is nothing
+    left to go and look at.
     """
     proposed = decide_hypotheses(state.service_name, state.evidence).hypotheses
 
@@ -98,7 +171,7 @@ def diagnoser_node(state: AgentState) -> AgentState:
         ScoredHypothesis(hypothesis=hypothesis, score=score, score_breakdown=breakdown)
         for hypothesis, score, breakdown in scoring.score_all(state.evidence, proposed)
     ]
-    state.needs_evidence = _pending_evidence_requests(state.hypotheses)
+    state.needs_evidence = _pending_evidence_requests(state.hypotheses, state.evidence)
     state.confidence = scoring.top_confidence(state.evidence, proposed)
 
     for scored in state.hypotheses:

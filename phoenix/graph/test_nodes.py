@@ -271,6 +271,82 @@ def test_repeated_and_blank_evidence_requests_collapse(monkeypatch):
     assert state.needs_evidence == [shared, "deploy markers"]
 
 
+def test_a_request_the_evidence_already_answers_is_retired_and_never_re_issued(monkeypatch):
+    answered = "panic index out of range"
+    still_open = "an unasked signal nobody read"
+    output = DiagnoserOutput(hypotheses=[
+        Hypothesis(description=CRASH.description, category="crash",
+                   needs_evidence=[answered, still_open]),
+    ])
+    _stub_hypotheses(monkeypatch, output)
+
+    state = nodes.diagnoser_node(_state(CRASH_EVIDENCE))
+    assert state.needs_evidence == [still_open]
+
+    state = nodes.diagnoser_node(state)
+
+    assert state.needs_evidence == [still_open]
+    assert answered not in state.needs_evidence
+
+
+def test_a_tool_name_alone_never_retires_a_request(monkeypatch):
+    _stub_hypotheses(
+        monkeypatch,
+        DiagnoserOutput(hypotheses=[
+            Hypothesis(description=DEPLOY.description, category="deploy",
+                       needs_evidence=["recent deployments"]),
+        ]),
+    )
+    deployments = [
+        {"iteration": 1, "source": "get_recent_deployments",
+         "collected_at": "2026-01-01T00:00:00+00:00",
+         "summary": "get_recent_deployments({'service_name': 'checkout-service'})",
+         "raw_data": {"status": "success", "text": "no deployment markers found"}},
+    ]
+
+    state = nodes.diagnoser_node(_state(deployments))
+
+    assert state.needs_evidence == ["recent deployments"]
+
+
+def test_a_request_retires_only_against_whole_words(monkeypatch):
+    _stub_hypotheses(
+        monkeypatch,
+        DiagnoserOutput(hypotheses=[
+            Hypothesis(description=CRASH.description, category="crash",
+                       needs_evidence=["exit code"]),
+        ]),
+    )
+    container = [
+        {"iteration": 1, "source": "get_container_state",
+         "collected_at": "2026-01-01T00:00:00+00:00",
+         "summary": "get_container_state({'container_name': 'checkout-service'})",
+         "raw_data": {"status": "success", "text": "exited normally, code 0"}},
+    ]
+
+    state = nodes.diagnoser_node(_state(container))
+
+    assert state.needs_evidence == ["exit code"]
+
+
+def test_the_request_list_is_capped_in_count_and_in_length(monkeypatch):
+    requests = [f"signal-{i} " + "detail " * 40 for i in range(nodes.MAX_EVIDENCE_REQUESTS + 4)]
+    _stub_hypotheses(
+        monkeypatch,
+        DiagnoserOutput(hypotheses=[
+            Hypothesis(description=CRASH.description, category="crash", needs_evidence=requests),
+        ]),
+    )
+
+    state = nodes.diagnoser_node(_state([]))
+
+    assert len(state.needs_evidence) == nodes.MAX_EVIDENCE_REQUESTS
+    assert all(len(text) == nodes.MAX_REQUEST_LENGTH for text in state.needs_evidence)
+    assert state.needs_evidence == [
+        text[: nodes.MAX_REQUEST_LENGTH] for text in requests[: nodes.MAX_EVIDENCE_REQUESTS]
+    ]
+
+
 def test_empty_hypothesis_sentinel_clears_the_outstanding_requests(monkeypatch):
     _stub_hypotheses(monkeypatch, ASKS_EVERYTHING)
     state = nodes.diagnoser_node(_state(CRASH_EVIDENCE))
