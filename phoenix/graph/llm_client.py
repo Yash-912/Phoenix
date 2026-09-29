@@ -300,6 +300,8 @@ def decide_hypotheses(
         return HypothesisDecision(DiagnoserOutput.model_construct(hypotheses=[]), tokens)
     else:
         tokens = _tokens(completion)
+        if not completion.choices:
+            print("[llm_client] structured response carried no choices, falling back to prompt JSON")
         parsed = completion.choices[0].message.parsed if completion.choices else None
         if parsed is not None:
             return HypothesisDecision(parsed, tokens)

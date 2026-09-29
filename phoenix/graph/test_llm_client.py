@@ -372,7 +372,9 @@ def test_a_refused_structured_call_contributes_nothing_but_the_fallback_does(mon
     assert decision.tokens == 260
 
 
-def test_a_billed_structured_hypothesis_response_with_no_choices_falls_back(monkeypatch):
+def test_a_billed_structured_hypothesis_response_with_no_choices_falls_back(
+    monkeypatch, capsys
+):
     calls = _stub_hypotheses_client(
         monkeypatch, parse_choices=0, parse_usage=900, fallback_usage=150
     )
@@ -382,6 +384,7 @@ def test_a_billed_structured_hypothesis_response_with_no_choices_falls_back(monk
     assert calls == ["parse", "create"]
     assert decision.output.hypotheses == [CRASH]
     assert decision.tokens == 1050
+    assert "no choices" in capsys.readouterr().out
 
 
 def test_a_billed_fallback_with_no_choices_yields_no_hypotheses_and_keeps_the_bill(

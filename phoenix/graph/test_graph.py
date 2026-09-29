@@ -4,10 +4,12 @@ should_continue is pure code over AgentState, so these drive it directly and
 assert both halves of the Command it returns: the destination it routes to and
 the state update it hands back. The two exits that existed before the budget
 guard — the confidence threshold and the iteration cap — are regression-proofed
-here, and the last three tests run the compiled graph, because a router that
-returns the right Command is worth nothing if the run's final state cannot
-prove it. Those are the tests that would have caught the string-returning router
-of the previous round, whose escalation was computed and then thrown away.
+here. The last four tests drive the compiled graph instead, because a router
+that returns the right Command is worth nothing if the run's final state cannot
+prove it: those are the tests that catch a dropped escalation, and the one that
+catches a loop-back which never comes home. A router that only ever ends a run
+can be perfectly wrong about looping, so the loop-back is proved by the node
+order a real run produces, not by the value the router returned in isolation.
 """
 
 import os
@@ -193,3 +195,42 @@ def test_the_compiled_graph_ends_a_confident_run_with_no_escalation(monkeypatch)
     assert final["confidence"] == 0.9
     assert final["status"] == "investigating"
     assert final.get("escalation_reason") is None
+
+
+def test_the_compiled_graph_returns_to_the_observer_when_the_router_loops_back(monkeypatch):
+    calls = []
+    observer_passes = 0
+
+    def fake_tool_calls(service_name, evidence_so_far, evidence_requests):
+        nonlocal observer_passes
+        calls.append("observer")
+        observer_passes += 1
+        if observer_passes == 1:
+            return ToolCallDecision([], 1)
+        return ToolCallDecision(
+            [
+                {"name": "query_prometheus", "arguments": {"promql": "up == 0"}},
+                {"name": "query_loki", "arguments": {"logql": '{container="checkout-service"}'}},
+            ],
+            1,
+        )
+
+    def fake_hypotheses(service_name, evidence_so_far):
+        calls.append("diagnoser")
+        return HypothesisDecision(
+            DiagnoserOutput(hypotheses=[Hypothesis(description="it crashed", category="crash")]),
+            1,
+        )
+
+    monkeypatch.setattr(nodes, "decide_tool_calls", fake_tool_calls)
+    monkeypatch.setattr(nodes, "decide_hypotheses", fake_hypotheses)
+    monkeypatch.setitem(nodes.TOOL_DISPATCH, "query_prometheus", lambda args: SERVICE_DOWN)
+    monkeypatch.setitem(nodes.TOOL_DISPATCH, "query_loki", lambda args: PANIC)
+
+    final = _final(graph.build_graph().invoke(_state(token_budget=100000, max_iterations=5)))
+
+    assert calls == ["observer", "diagnoser", "observer", "diagnoser"]
+    assert final["iteration"] == 2
+    assert final["confidence"] == 0.9
+    assert final["status"] == "investigating"
+    assert len(final["evidence"]) == 2
