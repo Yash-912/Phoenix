@@ -2,3 +2,4 @@ langgraph==0.2.39
 pydantic==2.9.2
 requests==2.32.3
 openai==1.51.0
+psycopg[binary,pool]==3.2.3

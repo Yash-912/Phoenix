@@ -4,9 +4,56 @@ from langgraph.graph import END, StateGraph
 from langgraph.types import Command
 
 from phoenix.graph.nodes import diagnoser_node, observer_node
+from phoenix.graph.persist import close_persistence, record_audit
 from phoenix.graph.state import AgentState
 
 ROUTER_DESTINATIONS: tuple[str, ...] = ("observer", END)
+
+
+def _record_route(
+    state: AgentState,
+    event_type: str,
+    destination: str,
+    reasoning_text: str,
+    escalation_reason: str | None = None,
+) -> None:
+    """Append this router pass's decision to the trail, then let it route.
+
+    One row per pass, not one per run: a trail that only holds the last decision
+    cannot show what an investigation did to reach it, and the passes in between
+    are the whole of the investigation.
+
+    The row is written here, inside the router, because the router is the last
+    thing a run passes through and every exit path it can take goes straight to
+    END -- there is no node downstream that could see the end of a run, and
+    adding one would mean changing the destinations this function returns.
+    Recording a row is not a routing decision: the Command comes back exactly as
+    it would have, and the state the row describes is the copy the router decided
+    on, which is the state the decision was actually made against.
+
+    The escalation is a separate field from the destination because the two are
+    different facts. Reaching the confidence threshold is a successful end and
+    records no escalation, however much the run spent; a row that called it
+    escalated would file a finding as a failure. escalation_reason is the same
+    string the Command carries into the final state, so the row and the state
+    cannot disagree about why a run stopped.
+    """
+    record_audit(
+        state.incident_id,
+        "router",
+        event_type,
+        {
+            "iteration": state.iteration,
+            "max_iterations": state.max_iterations,
+            "confidence": state.confidence,
+            "confidence_threshold": state.confidence_threshold,
+            "tokens_spent": state.tokens_spent,
+            "token_budget": state.token_budget,
+            "destination": destination,
+            "escalation_reason": escalation_reason,
+        },
+        reasoning_text,
+    )
 
 
 def should_continue(state: AgentState) -> Command:
@@ -48,19 +95,32 @@ def should_continue(state: AgentState) -> Command:
     ceiling, and naming it is more useful than naming the iteration cap it
     happens to be sitting under. Looping back is the last resort, so no run
     that has spent its budget can return to the observer.
+
+    Each of the four decisions is written to audit_log on its way out. That is
+    the same audit table the observer and the diagnoser append to, so a run's
+    end reads as one trail in order rather than a state field nobody queried.
     """
     if state.confidence >= state.confidence_threshold:
         print(f"[router] confidence threshold met ({state.confidence:.2f} >= {state.confidence_threshold}) -> end")
+        _record_route(
+            state,
+            "threshold_reached",
+            END,
+            f"confidence threshold met ({state.confidence:.2f} >= {state.confidence_threshold})",
+        )
         return Command(goto=END)
     if state.tokens_spent >= state.token_budget:
         reason = f"token budget exhausted ({state.tokens_spent}/{state.token_budget} tokens)"
         print(f"[router] {reason} -> end (escalate)")
+        _record_route(state, "escalated", END, reason, reason)
         return Command(
             goto=END,
             update={"status": "escalated", "escalation_reason": reason},
         )
     if state.iteration >= state.max_iterations:
         print(f"[router] iteration cap hit ({state.iteration}/{state.max_iterations}) -> end (escalate)")
+        reason = f"iteration cap reached ({state.iteration}/{state.max_iterations})"
+        _record_route(state, "escalated", END, reason, reason)
         return Command(
             goto=END,
             update={
@@ -71,6 +131,12 @@ def should_continue(state: AgentState) -> Command:
             },
         )
     print(f"[router] confidence too low ({state.confidence:.2f}) -> loop back to observer")
+    _record_route(
+        state,
+        "continuing",
+        "observer",
+        f"confidence too low ({state.confidence:.2f})",
+    )
     return Command(goto="observer")
 
 
@@ -92,6 +158,9 @@ if __name__ == "__main__":
     service_name = sys.argv[2] if len(sys.argv) > 2 else "checkout-service"
 
     app = build_graph()
-    result = app.invoke(AgentState(incident_id=incident_id, service_name=service_name))
+    try:
+        result = app.invoke(AgentState(incident_id=incident_id, service_name=service_name))
+    finally:
+        close_persistence()
     print("\nFinal state:")
     print(result)

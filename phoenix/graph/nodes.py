@@ -125,6 +125,19 @@ def _pending_evidence_requests(
     return requests
 
 
+def _diagnosis_line(scored: ScoredHypothesis) -> str:
+    """One scored hypothesis as a single line of prose.
+
+    The family the LLM named, the score code gave it, and the LLM's own
+    description of it. Printed for the operator and stored as the diagnoser's
+    reasoning_text, so the audit row and the console say the same thing.
+    """
+    return (
+        f"{scored.hypothesis.category} scores {scored.score:.2f}: "
+        f"{scored.hypothesis.description}"
+    )
+
+
 def observer_node(state: AgentState) -> AgentState:
     """Slice 2.3, completed: the LLM decides which tool(s) to call next;
     this code executes exactly what it decides and nothing else. The diagnoser's
@@ -133,6 +146,11 @@ def observer_node(state: AgentState) -> AgentState:
 
     Whatever the LLM spent asking is added to state.tokens_spent, including on
     the turn it asks for nothing: the call was made and billed either way.
+
+    Every tool call that ran leaves an evidence row, and the pass leaves one
+    audit row naming what the LLM asked for, what the allowlist actually let
+    run, and what the pass cost. The evidence row is written from the item that
+    went onto the state, so the row and the state are the same fact.
     """
     state.iteration += 1
 
@@ -141,10 +159,10 @@ def observer_node(state: AgentState) -> AgentState:
     )
     state.tokens_spent += decision.tokens
     requested_calls = decision.calls
+    dispatched: list[str] = []
 
     if not requested_calls:
         print(f"[observer] iteration {state.iteration}: LLM requested no tool calls")
-        return state
 
     for call in requested_calls:
         tool_name = call["name"]
@@ -154,16 +172,31 @@ def observer_node(state: AgentState) -> AgentState:
             continue
 
         result = tool_fn(call["arguments"])
-        state.evidence.append(
-            {
-                "iteration": state.iteration,
-                "source": tool_name,
-                "collected_at": datetime.now(timezone.utc).isoformat(),
-                "summary": f"{tool_name}({call['arguments']})",
-                "raw_data": result,
-            }
-        )
+        item = {
+            "iteration": state.iteration,
+            "source": tool_name,
+            "collected_at": datetime.now(timezone.utc).isoformat(),
+            "summary": f"{tool_name}({call['arguments']})",
+            "raw_data": result,
+        }
+        state.evidence.append(item)
+        record_evidence(state.incident_id, item)
+        dispatched.append(tool_name)
         print(f"[observer] iteration {state.iteration}: called {tool_name}({call['arguments']})")
+
+    record_audit(
+        state.incident_id,
+        "observer",
+        "observer_pass",
+        {
+            "iteration": state.iteration,
+            "requested_tools": [call["name"] for call in requested_calls],
+            "dispatched_tools": dispatched,
+            "evidence_collected": len(state.evidence),
+            "tokens_spent": state.tokens_spent,
+        },
+        None,
+    )
 
     return state
 
@@ -179,6 +212,12 @@ def diagnoser_node(state: AgentState) -> AgentState:
 
     The LLM's own tokens land on state.tokens_spent here too, covering both
     calls when a structured attempt fell back to prompt JSON.
+
+    The whole ranking is written to the hypotheses table, one row per entry and
+    stamped with the pass that produced it, and the pass leaves an audit row
+    carrying the confidence and every hypothesis' category -- the table has no
+    category column, so this is where a family survives. Nothing here recomputes
+    a score: the row is the scorer's answer written down, not a second opinion.
     """
     decision = decide_hypotheses(state.service_name, state.evidence)
     state.tokens_spent += decision.tokens
@@ -189,19 +228,38 @@ def diagnoser_node(state: AgentState) -> AgentState:
         state.hypotheses = []
         state.needs_evidence = []
         state.confidence = 0.0
-        return state
+    else:
+        state.hypotheses = [
+            ScoredHypothesis(hypothesis=hypothesis, score=score, score_breakdown=breakdown)
+            for hypothesis, score, breakdown in scoring.score_all(state.evidence, proposed)
+        ]
+        state.needs_evidence = _pending_evidence_requests(state.hypotheses, state.evidence)
+        state.confidence = scoring.top_confidence(state.evidence, proposed)
 
-    state.hypotheses = [
-        ScoredHypothesis(hypothesis=hypothesis, score=score, score_breakdown=breakdown)
-        for hypothesis, score, breakdown in scoring.score_all(state.evidence, proposed)
-    ]
-    state.needs_evidence = _pending_evidence_requests(state.hypotheses, state.evidence)
-    state.confidence = scoring.top_confidence(state.evidence, proposed)
+        for scored in state.hypotheses:
+            print(f"[diagnoser] iteration {state.iteration}: {_diagnosis_line(scored)}")
+        print(f"[diagnoser] iteration {state.iteration}: confidence={state.confidence:.2f}")
 
-    for scored in state.hypotheses:
-        print(
-            f"[diagnoser] iteration {state.iteration}: {scored.hypothesis.category} "
-            f"scores {scored.score:.2f}: {scored.hypothesis.description}"
-        )
-    print(f"[diagnoser] iteration {state.iteration}: confidence={state.confidence:.2f}")
+    record_hypotheses(state.incident_id, state.hypotheses, iteration=state.iteration)
+    record_audit(
+        state.incident_id,
+        "diagnoser",
+        "diagnosis",
+        {
+            "iteration": state.iteration,
+            "confidence": state.confidence,
+            "confidence_threshold": state.confidence_threshold,
+            "tokens_spent": state.tokens_spent,
+            "hypotheses": [
+                {
+                    "description": scored.hypothesis.description,
+                    "category": scored.hypothesis.category,
+                    "score": scored.score,
+                }
+                for scored in state.hypotheses
+            ],
+        },
+        "\n".join(_diagnosis_line(scored) for scored in state.hypotheses) or None,
+    )
+
     return state
