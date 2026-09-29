@@ -18,3 +18,11 @@ class DiagnoserOutput(BaseModel):
     hypotheses: list[Hypothesis] = Field(
         min_length=1, max_length=4, description="Ranked guesses, best first (descriptions only; scores are computed in code)."
     )
+
+
+class ScoredHypothesis(BaseModel):
+    hypothesis: Hypothesis = Field(
+        description="The LLM's proposal, carried verbatim. It has no score of its own."
+    )
+    score: float = Field(description="Deterministic score from scoring.py. Never stated by the LLM.")
+    score_breakdown: dict = Field(description="Per-source signal audit trail explaining this score.")

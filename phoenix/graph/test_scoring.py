@@ -80,6 +80,93 @@ def test_unknown_category_never_matches_and_never_penalized():
     assert bd["contradiction_penalty"] == 0.0
 
 
+def test_health_source_alone_scores_non_zero_for_matching_category():
+    ev = [_ev("inspect_health", "readiness probe failing, container dead")]
+    h = Hypothesis(description="shop crashed", category="crash")
+    score, bd = score_hypothesis(ev, h)
+    assert score == 0.15
+    assert bd["has_health_signal"] == 1
+    assert bd["has_deploy_signal"] == 0
+    assert bd["sources_supporting"] == 1
+    assert bd["weights"]["health"] == 0.15
+
+
+def test_deployments_source_alone_scores_non_zero_for_deploy_hypothesis():
+    ev = [_ev("get_recent_deployments", "deployed image shop:v18 at 09:14, rollout complete")]
+    h = Hypothesis(description="bad deploy v18", category="deploy")
+    score, bd = score_hypothesis(ev, h)
+    assert score == 0.15
+    assert bd["has_deploy_signal"] == 1
+    assert bd["sources_supporting"] == 1
+    assert bd["weights"]["deploy"] == 0.15
+
+
+def test_contradiction_penalty_counts_secondary_sources():
+    ev = [_ev("inspect_health", "all systems healthy"),
+          _ev("get_recent_deployments", "no recent changes")]
+    h = Hypothesis(description="shop crashed", category="crash")
+    score, bd = score_hypothesis(ev, h)
+    assert bd["sources_supporting"] == 0
+    assert bd["contradiction_penalty"] == 0.3
+    assert score == 0.0
+
+
+def _deploy_ev(raw_data: dict) -> dict:
+    return {"iteration": 1, "source": "get_recent_deployments",
+            "collected_at": "2026-01-01T00:00:00+00:00",
+            "summary": "get_recent_deployments({'service_name': 'checkout-service', 'limit': 10})",
+            "raw_data": raw_data}
+
+
+def test_tool_name_alone_never_satisfies_a_keyword():
+    categories = ("crash", "overload", "deploy", "config", "network")
+    sources = ("query_prometheus", "query_loki", "get_container_state",
+               "inspect_health", "get_recent_deployments")
+    for source in sources:
+        ev = [_ev(source, "")]
+        for category in categories:
+            score, bd = score_hypothesis(ev, Hypothesis(description="x", category=category))
+            assert score == 0.0, f"empty {source} auto-matched {category}"
+            assert bd["sources_supporting"] == 0, f"empty {source} auto-matched {category}"
+
+
+def test_deployments_source_without_deploy_content_has_no_signal():
+    ev = [_ev("get_recent_deployments", "")]
+    h = Hypothesis(description="bad deploy v18", category="deploy")
+    score, bd = score_hypothesis(ev, h)
+    assert bd["has_deploy_signal"] == 0
+    assert bd["sources_supporting"] == 0
+    assert score == 0.0
+
+
+def test_deployments_source_with_deploy_content_has_signal():
+    ev = [_ev("get_recent_deployments", "image_tag checkout:v18, rollout complete")]
+    h = Hypothesis(description="bad deploy v18", category="deploy")
+    score, bd = score_hypothesis(ev, h)
+    assert bd["has_deploy_signal"] == 1
+    assert score == 0.15
+
+
+def test_empty_deployment_marker_list_is_not_deploy_evidence():
+    ev = [_deploy_ev({"status": "ok", "service": "checkout-service", "deployments": []})]
+    h = Hypothesis(description="bad deploy v18", category="deploy")
+    score, bd = score_hypothesis(ev, h)
+    assert bd["has_deploy_signal"] == 0
+    assert bd["sources_supporting"] == 0
+    assert score == 0.0
+
+
+def test_deployment_marker_content_is_deploy_evidence():
+    ev = [_deploy_ev({"status": "ok", "service": "checkout-service",
+                      "deployments": [{"service": "checkout-service", "timestamp": "2026-01-01T09:14:00+00:00",
+                                       "git_commit": "abc123", "image_tag": "checkout:v18",
+                                       "deployed_by": "chaos script"}]})]
+    h = Hypothesis(description="bad deploy v18", category="deploy")
+    score, bd = score_hypothesis(ev, h)
+    assert bd["has_deploy_signal"] == 1
+    assert score == 0.15
+
+
 def test_score_all_sorts_best_first_and_confidence():
     ev = [_ev("query_prometheus", "HighLatency p95 slow")]
     h_wrong = Hypothesis(description="bad deploy", category="deploy")
