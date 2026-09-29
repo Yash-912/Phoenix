@@ -14,7 +14,6 @@ os.environ.setdefault("LLM_MODEL", "test-model")
 
 from types import SimpleNamespace
 
-import pytest
 from pydantic import ValidationError
 
 from phoenix.graph import llm_client, nodes
@@ -103,15 +102,18 @@ def _stub_hypotheses_client(
     parsed=None,
     parse_error: Exception | None = None,
     parse_usage: int | None = 0,
+    parse_choices: int = 1,
     content: str = PROMPT_JSON,
     fallback_usage: int | None = 0,
+    fallback_choices: int = 1,
 ) -> list[str]:
     """Stub both Diagnoser call styles on one client; nothing leaves the process.
 
     parsed=None with no error is a structured response the SDK could not read, so
     decide_hypotheses falls back to prompt JSON. parse_error is a structured
     attempt the provider rejected outright, which yields no response to bill.
-    Either usage of None means that path reported no usage.
+    Either usage of None means that path reported no usage. A choices count of 0
+    is a response that was billed but came back carrying nothing.
     """
     calls: list[str] = []
 
@@ -120,14 +122,14 @@ def _stub_hypotheses_client(
         if parse_error is not None:
             raise parse_error
         return SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(parsed=parsed))],
+            choices=[SimpleNamespace(message=SimpleNamespace(parsed=parsed))] * parse_choices,
             usage=None if parse_usage is None else _usage(parse_usage),
         )
 
     def fake_create(**kwargs):
         calls.append("create")
         return SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content=content))],
+            choices=[SimpleNamespace(message=SimpleNamespace(content=content))] * fallback_choices,
             usage=None if fallback_usage is None else _usage(fallback_usage),
         )
 
@@ -296,22 +298,14 @@ def test_an_observers_response_with_no_usage_is_counted_as_zero_not_guessed(monk
     assert decision.tokens == 0
 
 
-def test_the_observers_bill_is_read_before_an_empty_choices_can_crash(monkeypatch):
+def test_an_observers_response_with_no_choices_is_billed_and_discarded(monkeypatch, capsys):
     _stub_completions(monkeypatch, total_tokens=505, choices=0)
-    billed = []
-    counted = llm_client._tokens
 
-    def recording_tokens(response):
-        billed.append(response)
-        return counted(response)
+    decision = llm_client.decide_tool_calls(SERVICE, EVIDENCE, NEEDS)
 
-    monkeypatch.setattr(llm_client, "_tokens", recording_tokens)
-
-    with pytest.raises(IndexError):
-        llm_client.decide_tool_calls(SERVICE, EVIDENCE, NEEDS)
-
-    assert len(billed) == 1
-    assert billed[0].usage.total_tokens == 505
+    assert decision.calls == []
+    assert decision.tokens == 505
+    assert "no choices" in capsys.readouterr().out
 
 
 def test_the_structured_hypothesis_path_reports_its_own_tokens(monkeypatch):
@@ -376,3 +370,33 @@ def test_a_refused_structured_call_contributes_nothing_but_the_fallback_does(mon
     assert calls == ["parse", "create"]
     assert decision.output.hypotheses == []
     assert decision.tokens == 260
+
+
+def test_a_billed_structured_hypothesis_response_with_no_choices_falls_back(monkeypatch):
+    calls = _stub_hypotheses_client(
+        monkeypatch, parse_choices=0, parse_usage=900, fallback_usage=150
+    )
+
+    decision = llm_client.decide_hypotheses(SERVICE, EVIDENCE)
+
+    assert calls == ["parse", "create"]
+    assert decision.output.hypotheses == [CRASH]
+    assert decision.tokens == 1050
+
+
+def test_a_billed_fallback_with_no_choices_yields_no_hypotheses_and_keeps_the_bill(
+    monkeypatch, capsys
+):
+    calls = _stub_hypotheses_client(
+        monkeypatch,
+        parse_error=ValidationError.from_exception_data("DiagnoserOutput", []),
+        fallback_choices=0,
+        fallback_usage=260,
+    )
+
+    decision = llm_client.decide_hypotheses(SERVICE, EVIDENCE)
+
+    assert calls == ["parse", "create"]
+    assert decision.output.hypotheses == []
+    assert decision.tokens == 260
+    assert "no choices" in capsys.readouterr().out

@@ -153,8 +153,9 @@ def decide_tool_calls(
 
     Returns the {"name": str, "arguments": dict} calls the LLM decided on —
     never executes anything itself — plus the tokens the call was billed. The
-    tokens are counted even when the model asked for nothing: the call happened
-    and was charged whether or not it named a tool.
+    tokens are counted even when the response names no tool, and even when it
+    carries no choice at all: the call happened and was charged either way, so
+    an unusable response is billed and discarded rather than raising.
 
     The LLM is ONLY ever offered these five tools (TOOL_SCHEMAS) — least-privilege
     allowlisting. It cannot request anything outside this list; remediation
@@ -203,6 +204,10 @@ def decide_tool_calls(
     )
 
     tokens = _tokens(response)
+    if not response.choices:
+        print("[llm_client] response carried no choices, discarding the observer turn")
+        return ToolCallDecision([], tokens)
+
     message = response.choices[0].message
     if not message.tool_calls:
         return ToolCallDecision([], tokens)
@@ -295,7 +300,7 @@ def decide_hypotheses(
         return HypothesisDecision(DiagnoserOutput.model_construct(hypotheses=[]), tokens)
     else:
         tokens = _tokens(completion)
-        parsed = completion.choices[0].message.parsed
+        parsed = completion.choices[0].message.parsed if completion.choices else None
         if parsed is not None:
             return HypothesisDecision(parsed, tokens)
         print("[llm_client] structured hypotheses came back unparsed, falling back to prompt JSON")
@@ -322,6 +327,10 @@ def decide_hypotheses(
         return HypothesisDecision(DiagnoserOutput.model_construct(hypotheses=[]), tokens)
 
     tokens += _tokens(fallback)
+    if not fallback.choices:
+        print("[llm_client] prompt-JSON fallback carried no choices, discarding the hypothesis batch")
+        return HypothesisDecision(DiagnoserOutput.model_construct(hypotheses=[]), tokens)
+
     content = fallback.choices[0].message.content or ""
 
     try:
