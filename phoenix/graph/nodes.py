@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 
 from phoenix.graph import scoring
 from phoenix.graph.llm_client import decide_hypotheses, decide_tool_calls
+from phoenix.graph.persist import record_audit, record_evidence, record_hypotheses
 from phoenix.graph.schemas import ScoredHypothesis
 from phoenix.graph.state import AgentState
 from phoenix.tools.deploy_tool import get_recent_deployments
