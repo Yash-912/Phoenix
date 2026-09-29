@@ -11,8 +11,6 @@ Rule (V1, deliberately simple):
 
 from __future__ import annotations
 
-import json
-
 from phoenix.graph.schemas import Hypothesis
 
 PROM_WEIGHT = 0.4
@@ -63,15 +61,40 @@ def _is_usable(evidence_item: dict) -> bool:
     return raw.get("status") != "error"
 
 
+def _content_summary(evidence_item: dict) -> str:
+    """summary with its leading ``source(arguments)`` label removed."""
+    summary = str(evidence_item.get("summary", ""))
+    source = str(evidence_item.get("source", ""))
+    label = f"{source}("
+    if source and summary.startswith(label) and summary.endswith(")"):
+        return summary[len(label) : -1]
+    return summary
+
+
+def _content_values(payload) -> list[str]:
+    """Scalar leaf values of a payload, field names discarded."""
+    if isinstance(payload, dict):
+        return [text for value in payload.values() for text in _content_values(value)]
+    if isinstance(payload, (list, tuple)):
+        return [text for value in payload for text in _content_values(value)]
+    return [str(payload)]
+
+
 def _blob(evidence_item: dict) -> str:
-    """Lowercased JSON text of summary + raw_data for keyword matching."""
+    """Lowercased content of one evidence item for keyword matching: the
+    tool-name-stripped summary plus raw_data's leaf values.
+
+    Labels are excluded on purpose — the tool name and raw_data's field names
+    appear whether or not the tool found anything, so letting them match would
+    score an observer ACTION as evidence. A label must never satisfy a category
+    keyword on its own; only returned data can.
+    """
+    summary = _content_summary(evidence_item)
     try:
-        return json.dumps(
-            {"summary": evidence_item.get("summary", ""), "raw_data": evidence_item.get("raw_data", {})},
-            default=str,
-        ).lower()
-    except (TypeError, ValueError):
-        return str(evidence_item.get("summary", "")).lower()
+        values = _content_values(evidence_item.get("raw_data", {}))
+    except RecursionError:
+        values = []
+    return "\n".join([summary, *values]).lower()
 
 
 def _supports(blob: str, category: str) -> bool:
