@@ -41,24 +41,36 @@ REQUEST_STOP_WORDS = {
 _WORD = re.compile(r"[a-z0-9]+")
 
 
+def _returned_text(payload) -> str:
+    """A tool's payload flattened to text, field names left out.
+
+    Every payload is a shape before it is a finding: docker's State, Loki's
+    result, the status/text envelope the lab tools share. A field name describes
+    the shape, which is why scoring._content_values drops them too, and a request
+    must not retire against one.
+    """
+    if isinstance(payload, dict):
+        return " ".join(_returned_text(value) for value in payload.values())
+    if isinstance(payload, (list, tuple)):
+        return " ".join(_returned_text(value) for value in payload)
+    return "" if payload is None else str(payload)
+
+
 def _evidence_words(evidence: list[dict]) -> set[str]:
-    """Every word the observer has already read, as a set.
+    """Every word a tool has actually returned, as a set.
 
     Matched as whole words, never as substrings: "exit" must not be satisfied by
     "exits", or a request retires against text nobody wrote.
 
-    The "tool(args)" label is cut off the summary first: a tool's name is not a
-    signal. scoring.py draws the same line when it refuses to let a label satisfy
-    a category keyword, and without it a request retires for the wrong reason.
+    The summary is excluded outright. It is "tool(arguments)", and the arguments
+    repeat verbatim every iteration — inspect_health is called with
+    {'service_name': 'checkout-service'} on nearly every one of them — so a
+    request naming "service name" would retire against the call rather than the
+    result. What was asked is not what was learned; only raw_data counts.
     """
     words: set[str] = set()
     for item in evidence:
-        source = str(item.get("source", ""))
-        summary = str(item.get("summary", ""))
-        label = f"{source}("
-        if source and summary.startswith(label) and summary.endswith(")"):
-            summary = summary[len(label) : -1]
-        words.update(_WORD.findall(f"{summary} {item.get('raw_data', '')}".lower()))
+        words.update(_WORD.findall(_returned_text(item.get("raw_data")).lower()))
     return words
 
 
@@ -72,13 +84,14 @@ def _content_words(text: str) -> set[str]:
 
 
 def _is_answered(request: str, read: set[str]) -> bool:
-    """True when the evidence already read says everything this request asks for.
+    """True when what the tools returned already says everything this request asks for.
 
     Deliberately literal, and therefore deliberately conservative: a request is
-    retired only when every content word in it is already in the evidence. Keeping
-    one the observer has in fact satisfied costs a redundant read at worst, and the
-    prompt tells it to discount a request the evidence already covers. Retiring one
-    nobody answered costs evidence nobody can get back.
+    retired only when every content word in it is already in the returned data.
+    Keeping one the observer has in fact satisfied costs a redundant read at
+    worst, and the prompt tells it to discount a request the evidence already
+    covers. Retiring one nobody answered costs evidence nobody can get back, and
+    once the router gates on an empty list it ends the investigation outright.
     """
     words = _content_words(request)
     return bool(words) and words <= read
@@ -88,7 +101,7 @@ def _pending_evidence_requests(
     hypotheses: list[ScoredHypothesis], evidence: list[dict]
 ) -> list[str]:
     """The confirm/refute signals the surviving hypotheses still want, best-ranked
-    first, with the ones the evidence has already answered retired.
+    first, with the ones the returned results already answer retired.
 
     Also where the list is bounded: LLM-authored free text is trimmed to
     MAX_REQUEST_LENGTH and the list stops at MAX_EVIDENCE_REQUESTS, so neither the

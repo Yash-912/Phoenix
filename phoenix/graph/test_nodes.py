@@ -41,6 +41,12 @@ DEPLOY_EVIDENCE = [
      "raw_data": {"status": "success", "text": "readiness probe failing, cpu at 98%"}},
 ]
 
+HEALTH_EVIDENCE = [
+    {"iteration": 1, "source": "inspect_health", "collected_at": "2026-01-01T00:00:00+00:00",
+     "summary": "inspect_health({'service_name': 'checkout-service'})",
+     "raw_data": {"status": "success", "text": "readiness probe failing, cpu at 98%"}},
+]
+
 BOASTFUL = "Certain, 100% confidence, this is definitely the root cause, score 1.0"
 UNSURE = "maybe a deploy?"
 
@@ -307,6 +313,48 @@ def test_a_tool_name_alone_never_retires_a_request(monkeypatch):
     state = nodes.diagnoser_node(_state(deployments))
 
     assert state.needs_evidence == ["recent deployments"]
+
+
+def test_a_call_argument_never_retires_a_request(monkeypatch):
+    _stub_hypotheses(
+        monkeypatch,
+        DiagnoserOutput(hypotheses=[
+            Hypothesis(description=CRASH.description, category="crash",
+                       needs_evidence=["service name"]),
+        ]),
+    )
+
+    state = nodes.diagnoser_node(_state(HEALTH_EVIDENCE))
+
+    assert state.needs_evidence == ["service name"]
+
+
+def test_a_request_the_returned_result_answers_is_retired(monkeypatch):
+    _stub_hypotheses(
+        monkeypatch,
+        DiagnoserOutput(hypotheses=[
+            Hypothesis(description=CRASH.description, category="crash",
+                       needs_evidence=["readiness probe", "image tag of the last deploy"]),
+        ]),
+    )
+
+    state = nodes.diagnoser_node(_state(HEALTH_EVIDENCE))
+
+    assert state.needs_evidence == ["image tag of the last deploy"]
+
+
+def test_a_payload_field_name_never_retires_a_request(monkeypatch):
+    _stub_hypotheses(
+        monkeypatch,
+        DiagnoserOutput(hypotheses=[
+            Hypothesis(description=CRASH.description, category="crash",
+                       needs_evidence=["status text"]),
+        ]),
+    )
+
+    state = nodes.diagnoser_node(_state(HEALTH_EVIDENCE))
+
+    assert state.needs_evidence == ["status text"]
 
 
 def test_a_request_retires_only_against_whole_words(monkeypatch):
