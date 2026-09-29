@@ -11,6 +11,7 @@ os.environ.setdefault("LLM_API_KEY", "test-key")
 os.environ.setdefault("LLM_MODEL", "test-model")
 
 import pytest
+from pydantic import ValidationError
 
 from phoenix.graph import nodes, scoring
 from phoenix.graph.schemas import DiagnoserOutput, Hypothesis, ScoredHypothesis
@@ -179,3 +180,31 @@ def test_observer_tool_allowlist_is_unchanged():
         "inspect_health",
         "get_recent_deployments",
     }
+
+
+def test_state_rejects_a_wrongly_typed_hypotheses_assignment():
+    state = _state(CRASH_EVIDENCE)
+
+    for bad in ([{"nope": 1}], [42], "not a list", None):
+        with pytest.raises(ValidationError):
+            state.hypotheses = bad
+
+    assert state.hypotheses == []
+
+
+def test_state_accepts_a_correctly_typed_hypotheses_assignment():
+    state = _state(CRASH_EVIDENCE)
+    scored = ScoredHypothesis(
+        hypothesis=CRASH, score=0.9, score_breakdown={"sources_supporting": 2}
+    )
+
+    state.hypotheses = [scored]
+
+    assert state.hypotheses[0] is scored
+    assert state.hypotheses[0].score == 0.9
+    assert state.hypotheses[0].hypothesis.category == "crash"
+
+    state.hypotheses = [{"hypothesis": CRASH, "score": 0.4, "score_breakdown": {}}]
+
+    assert isinstance(state.hypotheses[0], ScoredHypothesis)
+    assert state.hypotheses[0].score == 0.4
