@@ -570,7 +570,32 @@ def test_memory_that_did_not_drop_fails(monkeypatch):
     assert outcome == "fail"
 ```
 
-`_series` is a local helper that builds the instant-vector JSON shape `query_prometheus` actually returns — the joined leaf values, **not** a `{"status", "text"}` envelope. Take the real shape from `phoenix/tools/prometheus_tool.py`. Getting this wrong is the Step C defect the final review caught: tests that pin 0.9 for `crash` feed a shape the tool never returns, so they pass while the real path cannot.
+`_series` is a local helper building the **exact** shape `query_prometheus` returns — Prometheus's raw instant-vector response, value as a **string**:
+
+```python
+def _series(bytes_value: int) -> dict:
+    """The shape query_prometheus actually returns: a raw instant vector whose
+    sample value is a string, because that is what Prometheus's JSON encodes."""
+    return {
+        "status": "success",
+        "data": {
+            "resultType": "vector",
+            "result": [
+                {
+                    "metric": {
+                        "__name__": "container_memory_working_set_bytes",
+                        "name": SERVICE,
+                    },
+                    "value": [1759000000.123, str(bytes_value)],
+                }
+            ],
+        },
+    }
+```
+
+`prometheus_tool.py` returns `response.json()` unchanged, so this is not a shape this project invented — it is Prometheus's `/api/v1/query` response. The value is a **string** and must be parsed with `float()`.
+
+Getting this wrong is the Step C defect the final review caught: tests that pin 0.9 for `crash` feed a `{"status", "text"}` envelope that `query_prometheus` never returns, so they pass while the real path cannot. A test whose fixture the tool cannot produce is a test of the fixture.
 
 Then the crash category, using the `action_at` comparison:
 
@@ -605,7 +630,9 @@ def test_a_healthy_container_whose_app_health_probe_fails_does_not_verify(monkey
     assert outcome == "fail"
 ```
 
-**Open implementation detail from the spec, resolved here.** No existing read-only tool returns container start time — `inspect_health` reports `State.Status`, not `StartedAt`. Resolve it by reading `GET /containers/{name}/json` through the proxy's existing GET route, in a new private helper `_container_started_at(name: str) -> str | None`, and add it to the `monkeypatch.setattr` targets in the crash tests above. It stays read-only. Do **not** add a `POST` path to `remediation_tool.py` for it and do not widen `ALLOWED_DOCKER_ACTIONS`. The `started_at` returned must come from the real Docker inspect response field `State.StartedAt`.
+**The spec's "open implementation detail" — resolved with no new code.** The spec flagged that no read-only tool returns container start time, and left two acceptable resolutions. One already exists: `get_container_state` (`docker_tool.py:18`) fetches `GET /containers/{name}/json` through the proxy and returns `response.json()` **unchanged**, so the whole docker inspect payload is already in hand — `State.Status` and `State.StartedAt` both. Read `State.StartedAt` off the payload `read_signal` already collected.
+
+So: no new proxy route, no new tool, no edit to `ALLOWED_DOCKER_ACTIONS`, and nothing added to `TOOL_DISPATCH`. The tests above stub `get_container_state` with a docker-inspect payload whose `State` carries both fields. Note this in the phase summary — the spec's open question is closed by a read that was already being made.
 
 - [ ] **Step 2: Run it to verify it fails**
 
@@ -1016,6 +1043,45 @@ Tasks 6–8 test the nodes in isolation. A node can be correct while the run it 
 - Consumes: everything from Tasks 1–8.
 - Produces: no new interfaces. This task is the phase's proof.
 
+**Read this before writing any test in this task.** `diagnoser_node` sets `state.confidence = scoring.top_confidence(...)` on every pass, so a `confidence` value injected into the initial state is **clobbered before the router ever sees it**. A test that injects `confidence=0.9` and stubs the observer to make no tool calls will collect no evidence, score 0.0, loop back to the observer, and end `escalated` at the iteration cap without ever reaching the remediator.
+
+Confidence has to be earned by the run, exactly as the existing `SERVICE_DOWN` / `PANIC` test does. Add these two module-level fixtures beside `SERVICE_DOWN` and `PANIC`, both in the exact shapes their tools return:
+
+```python
+# query_prometheus returns Prometheus's raw instant vector; the sample value is a
+# string. "container_memory_working_set_bytes" yields the word "memory", which is
+# an overload keyword.
+MEMORY_VECTOR = {
+    "status": "success",
+    "data": {
+        "resultType": "vector",
+        "result": [
+            {
+                "metric": {"__name__": "container_memory_working_set_bytes", "name": SERVICE},
+                "value": [1759000000.123, "9663676416"],
+            }
+        ],
+    },
+}
+
+# query_loki returns Loki's raw query_range response. The log line carries
+# "latency", "p95", and "memory" -- all overload keywords.
+LOKI_PRESSURE = {
+    "status": "success",
+    "data": {
+        "resultType": "streams",
+        "result": [
+            {
+                "stream": {"container": SERVICE},
+                "values": [["1759000000000000000", "p95 latency climbing, memory near limit"]],
+            }
+        ],
+    },
+}
+```
+
+`MEMORY_VECTOR` scores 0.4 (prometheus) and `LOKI_PRESSURE` scores 0.3 (loki); both support `overload`, so the 0.2 agreement bonus lands the hypothesis at **0.9**, comfortably over the 0.75 default. The observer must therefore be stubbed to *call* both tools, and both `TOOL_DISPATCH` entries replaced — an unused fixture is not evidence.
+
 - [ ] **Step 1: Write the full-loop test**
 
 The whole lifecycle in one compiled run, with the LLM and every tool stubbed:
@@ -1023,16 +1089,19 @@ The whole lifecycle in one compiled run, with the LLM and every tool stubbed:
 ```python
 def test_a_run_verifies_its_own_restart_end_to_end(monkeypatch):
     order = []
-    monkeypatch.setattr(nodes, "decide_tool_calls", lambda *a: (order.append("observer"), ToolCallDecision([], 1))[1])
+    monkeypatch.setattr(nodes, "decide_tool_calls", lambda *a: (order.append("observer"), ToolCallDecision([
+        {"name": "query_prometheus", "arguments": {"promql": "container_memory_working_set_bytes"}},
+        {"name": "query_loki", "arguments": {"logql": '{container="checkout-service"}'}},
+    ], 1))[1])
     monkeypatch.setattr(nodes, "decide_hypotheses", lambda *a: (order.append("diagnoser"), HypothesisDecision(
         DiagnoserOutput(hypotheses=[Hypothesis(description="memory is climbing", category="overload")]), 1))[1])
+    monkeypatch.setitem(nodes.TOOL_DISPATCH, "query_prometheus", lambda args: MEMORY_VECTOR)
+    monkeypatch.setitem(nodes.TOOL_DISPATCH, "query_loki", lambda args: LOKI_PRESSURE)
     monkeypatch.setattr(verification, "read_signal", lambda category, service: {"bytes": 900_000_000})
-    monkeypatch.setattr(verification, "run_check", lambda *a: (order.append("verifier"), ("pass", {"reason": "memory fell to 400MB"}))[1])
+    monkeypatch.setattr(verification, "run_check", lambda *a: (order.append("verifier"), ("pass", {"reason": "memory fell"}))[1])
     monkeypatch.setitem(dispatch.REMEDIATION_DISPATCH, "restart_service", lambda name: {"status": "ok"})
 
-    final = _final(graph.build_graph().invoke(_state(
-        token_budget=100000, max_iterations=5, confidence_threshold=0.5, confidence=0.9,
-    )))
+    final = _final(graph.build_graph().invoke(_state(token_budget=100000, max_iterations=5)))
 
     assert final["status"] == "resolved"
     assert final["remediation_attempts"] == 1
@@ -1056,16 +1125,19 @@ Nothing to change in production code unless Step 2 found a real defect. If it pa
 ```python
 def test_a_repeatedly_failing_action_stops_at_the_cap_and_escalates(monkeypatch):
     attempts = []
-    monkeypatch.setattr(nodes, "decide_tool_calls", lambda *a: ToolCallDecision([], 1))
+    monkeypatch.setattr(nodes, "decide_tool_calls", lambda *a: ToolCallDecision([
+        {"name": "query_prometheus", "arguments": {"promql": "container_memory_working_set_bytes"}},
+        {"name": "query_loki", "arguments": {"logql": '{container="checkout-service"}'}},
+    ], 1))
     monkeypatch.setattr(nodes, "decide_hypotheses", lambda *a: HypothesisDecision(
         DiagnoserOutput(hypotheses=[Hypothesis(description="memory is climbing", category="overload")]), 1))
+    monkeypatch.setitem(nodes.TOOL_DISPATCH, "query_prometheus", lambda args: MEMORY_VECTOR)
+    monkeypatch.setitem(nodes.TOOL_DISPATCH, "query_loki", lambda args: LOKI_PRESSURE)
     monkeypatch.setattr(verification, "read_signal", lambda category, service: {"bytes": 900_000_000})
     monkeypatch.setattr(verification, "run_check", lambda *a: ("fail", {"reason": "memory did not drop"}))
     monkeypatch.setitem(dispatch.REMEDIATION_DISPATCH, "restart_service", lambda name: (attempts.append(name), {"status": "ok"})[1])
 
-    final = _final(graph.build_graph().invoke(_state(
-        token_budget=100000, max_iterations=50, confidence_threshold=0.5, confidence=0.9,
-    )))
+    final = _final(graph.build_graph().invoke(_state(token_budget=100000, max_iterations=50)))
 
     assert len(attempts) == 2
     assert final["status"] == "escalated"
@@ -1084,7 +1156,7 @@ def test_a_deploy_finding_ends_as_action_unavailable_without_acting(monkeypatch)
         DiagnoserOutput(hypotheses=[Hypothesis(description="a bad deploy", category="deploy")]), 1))
     monkeypatch.setitem(dispatch.REMEDIATION_DISPATCH, "restart_service", lambda name: called.append(name))
 
-    final = _final(graph.build_graph().invoke(_state(token_budget=100000, max_iterations=5, confidence=0.9)))
+    final = _final(graph.build_graph().invoke(_state(token_budget=100000, max_iterations=5)))
 
     assert called == []
     assert final["status"] == "action_unavailable"
@@ -1098,7 +1170,7 @@ def test_a_guarded_run_never_restarts_anything(monkeypatch):
         DiagnoserOutput(hypotheses=[Hypothesis(description="it crashed", category="crash")]), 1))
     monkeypatch.setitem(dispatch.REMEDIATION_DISPATCH, "restart_service", lambda name: called.append(name))
 
-    final = _final(graph.build_graph().invoke(_state(token_budget=100000, max_iterations=5, confidence=0.9, policy_mode="guarded")))
+    final = _final(graph.build_graph().invoke(_state(token_budget=100000, max_iterations=5, policy_mode="guarded")))
 
     assert called == []
     assert final["status"] == "escalated"
