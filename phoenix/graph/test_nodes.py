@@ -1035,3 +1035,139 @@ def test_the_action_is_recorded_on_the_trail_with_its_reasoning(monkeypatch):
     assert executed[0]["node"] == "remediator"
     assert executed[0]["detail"]["action"] == "restart_service"
     assert executed[0]["reasoning_text"]
+
+
+# --- verifier_node ------------------------------------------------------------
+
+ACTION_AT = "2026-09-30T10:00:00Z"
+PRE_ACTION_SIGNAL = {"bytes": 900_000_000, "slope": 3000.0}
+
+
+def _verifier_state(**overrides) -> AgentState:
+    """A state the remediator would hand on: an action taken, with the snapshot
+    and the time it was taken still attached."""
+    fields = {
+        "incident_id": 1,
+        "service_name": SERVICE,
+        "status": "confident",
+        "planned_action": {
+            "action": "restart_service",
+            "container": SERVICE,
+            "check": "crash",
+            "pre_action_signal": PRE_ACTION_SIGNAL,
+            "action_at": ACTION_AT,
+        },
+        "verification_delay_seconds": 0,
+    }
+    fields.update(overrides)
+    return AgentState(**fields)
+
+
+def _verdict(monkeypatch, outcome: str, **detail):
+    monkeypatch.setattr(
+        verification, "run_check", lambda *a: (outcome, {"reason": "stubbed", **detail})
+    )
+
+
+def test_a_passing_check_ends_the_run_as_resolved(monkeypatch):
+    _verdict(monkeypatch, "pass")
+    state = _verifier_state()
+
+    command = nodes.verifier_node(state)
+    update = _update(command)
+
+    assert command.goto == END
+    assert update["status"] == "resolved"
+    assert update.get("escalation_reason") is None
+    assert update["verification_result"]["outcome"] == "pass"
+
+
+def test_a_failed_check_loops_back_to_the_observer_while_attempts_remain(monkeypatch):
+    _verdict(monkeypatch, "fail")
+    state = _verifier_state(remediation_attempts=1, max_remediation_attempts=2)
+
+    command = nodes.verifier_node(state)
+    update = _update(command)
+
+    assert command.goto == "observer"
+    assert update["status"] == "investigating"
+    assert update.get("escalation_reason") is None
+
+
+def test_a_failed_check_that_has_run_out_of_attempts_escalates(monkeypatch):
+    _verdict(monkeypatch, "fail")
+    state = _verifier_state(remediation_attempts=2, max_remediation_attempts=2)
+
+    command = nodes.verifier_node(state)
+    update = _update(command)
+
+    assert command.goto == END
+    assert update["status"] == "escalated"
+    assert update["escalation_reason"]
+
+
+def test_a_check_that_could_not_be_made_escalates_rather_than_claiming_success(monkeypatch):
+    _verdict(monkeypatch, "inconclusive")
+    state = _verifier_state(remediation_attempts=1, max_remediation_attempts=2)
+
+    command = nodes.verifier_node(state)
+    update = _update(command)
+
+    assert command.goto == END
+    assert update["status"] == "escalated"
+    assert update["status"] != "resolved"
+    assert update["escalation_reason"]
+
+
+def test_the_verifier_waits_for_the_restart_to_settle_before_measuring(monkeypatch):
+    """A container measured in the first moments after a restart is still coming
+    up, and reading it then would grade the action on its own footprint."""
+    slept: list[float] = []
+    monkeypatch.setattr(nodes.time, "sleep", slept.append)
+    _verdict(monkeypatch, "pass")
+
+    nodes.verifier_node(_verifier_state(verification_delay_seconds=15))
+
+    assert slept == [15]
+
+
+def test_the_check_runs_against_the_pre_action_snapshot_and_the_action_time(monkeypatch):
+    seen: list[tuple] = []
+    monkeypatch.setattr(
+        verification, "run_check", lambda *a: (seen.append(a), ("pass", {}))[1]
+    )
+
+    nodes.verifier_node(_verifier_state())
+
+    assert seen == [("crash", SERVICE, PRE_ACTION_SIGNAL, ACTION_AT)]
+
+
+def test_the_verdict_is_recorded_on_the_trail_and_kept_on_the_state(monkeypatch):
+    rows = _audit_rows(monkeypatch)
+    _verdict(monkeypatch, "fail", after=880_000_000)
+
+    nodes.verifier_node(_verifier_state(remediation_attempts=1, max_remediation_attempts=2))
+
+    verdicts = [r for r in rows if r["event_type"] == "verification"]
+    assert verdicts, [(r["node"], r["event_type"]) for r in rows]
+    assert verdicts[0]["node"] == "verifier"
+    assert verdicts[0]["detail"]["outcome"] == "fail"
+    assert verdicts[0]["detail"]["detail"]["after"] == 880_000_000
+    assert verdicts[0]["detail"]["remediation_attempts"] == 1
+    assert verdicts[0]["reasoning_text"]
+
+
+def test_a_verifier_with_no_action_to_verify_does_not_claim_the_service_is_fine(monkeypatch):
+    """The state should never arrive here unplanned, but if it does the honest
+    answer is that there is nothing to check, not that the service recovered."""
+    def boom(*a):
+        raise AssertionError("run_check must not be called without a planned action")
+
+    monkeypatch.setattr(verification, "run_check", boom)
+    state = _verifier_state(planned_action=None)
+
+    command = nodes.verifier_node(state)
+    update = _update(command)
+
+    assert command.goto == END
+    assert update["status"] == "escalated"

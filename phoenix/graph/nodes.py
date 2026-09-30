@@ -1,4 +1,5 @@
 import re
+import time
 from datetime import datetime, timezone
 
 from langgraph.graph import END
@@ -470,3 +471,104 @@ def remediator_node(state: AgentState) -> Command:
             "remediation_attempts": state.remediation_attempts + 1,
         },
     )
+
+
+def verifier_node(state: AgentState) -> Command:
+    """Did the action work? Then either finish the run or hand it back to look again.
+
+    The delay before measuring is not politeness. A container in the first
+    moments after a restart is still coming up: its working set is climbing
+    toward steady state and its readiness probe has not necessarily run yet.
+    Measuring immediately would grade the action on its own startup footprint,
+    and for a memory category that means a fresh process's baseline being
+    compared against the pre-restart snapshot -- which is the same reading the
+    check is trying to make, arrived at for free.
+
+    Three outcomes, and the middle one is the point of the module. A pass ends
+    the run as resolved. A fail goes back to the observer for another look, but
+    only while attempts remain; once the cap is spent there is nothing left to
+    try and the run escalates. An inconclusive ends the run as escalated without
+    waiting for the cap, because "could not check" is not a reason to spend the
+    operator's next two attempts -- and crucially it is never a pass. A run that
+    reports recovery it did not observe is worse than a run that reports nothing,
+    because a human stops looking at the one that says everything is fine.
+
+    The check is run against the snapshot the remediator took and the moment it
+    took the action. Passing anything else would verify a different thing than
+    the one that happened: the snapshot is what "before" means here, and
+    action_at is what separates a restart this run caused from a container that
+    happened to be up already.
+
+    Arriving here with no planned action means the state was built wrong. It is
+    escalated rather than passed, on the same reasoning as an inconclusive check:
+    the absence of a check is not evidence that the service is fine.
+    """
+    planned = state.planned_action
+    if not planned:
+        return _escalate(
+            state,
+            "verification_failed",
+            "the verifier was reached with no planned action, so there is "
+            "nothing to check and no basis for calling the service recovered",
+            "reached with no planned action to verify",
+        )
+
+    time.sleep(state.verification_delay_seconds)
+
+    category = planned.get("check")
+    outcome, detail = verification.run_check(
+        category,
+        state.service_name,
+        planned.get("pre_action_signal") or {},
+        planned.get("action_at"),
+    )
+
+    verification_result = {
+        "outcome": outcome,
+        "check": category,
+        "action": planned.get("action"),
+        "detail": detail,
+        "remediation_attempts": state.remediation_attempts,
+        "max_remediation_attempts": state.max_remediation_attempts,
+    }
+    record_audit(
+        state.incident_id,
+        "verifier",
+        "verification",
+        verification_result,
+        detail.get("reason") if isinstance(detail, dict) else None,
+    )
+
+    if outcome == verification.OUTCOME_PASS:
+        print(f"[verifier] {category} check passed -> end (resolved)")
+        return Command(
+            goto=END,
+            update={"status": "resolved", "verification_result": verification_result},
+        )
+
+    if outcome == verification.OUTCOME_FAIL:
+        if state.remediation_attempts < state.max_remediation_attempts:
+            print(
+                f"[verifier] {category} check failed "
+                f"(attempt {state.remediation_attempts}/{state.max_remediation_attempts}) "
+                f"-> back to observer"
+            )
+            return Command(
+                goto="observer",
+                update={
+                    "status": "investigating",
+                    "verification_result": verification_result,
+                },
+            )
+        reason = (
+            f"the {category} check still fails after "
+            f"{state.remediation_attempts}/{state.max_remediation_attempts} "
+            f"attempts"
+        )
+        return _escalate(state, "verification_failed", reason, reason)
+
+    reason = (
+        f"the {category} check could not confirm recovery: "
+        f"{detail.get('reason') if isinstance(detail, dict) else detail}"
+    )
+    return _escalate(state, "verification_failed", reason, reason)
