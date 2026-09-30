@@ -125,6 +125,19 @@ def _loki_wanting_an_int(monkeypatch, received: list[tuple]) -> None:
     monkeypatch.setattr(nodes, "query_loki", query_loki)
 
 
+def _tool_failing_with(monkeypatch, exc: BaseException) -> None:
+    """Stand in for a tool that reached nothing and said so in the raised error.
+
+    A refused connection is the shape that matters: its text names the network,
+    so a failure that was mistaken for a reading would corroborate a network
+    hypothesis instead of being discarded.
+    """
+    def query_loki(logql, minutes=15):
+        raise exc
+
+    monkeypatch.setattr(nodes, "query_loki", query_loki)
+
+
 def test_node_feeds_service_name_and_evidence_to_the_hypothesis_llm(monkeypatch):
     calls = _stub_hypotheses(monkeypatch, DiagnoserOutput.model_construct(hypotheses=[]))
     state = _state(CRASH_EVIDENCE)
@@ -589,6 +602,73 @@ def test_a_failed_call_is_not_something_the_scorer_can_score(monkeypatch):
     )
     assert breakdown["sources_supporting"] == 0
     assert score == 0.0
+
+
+def test_a_failure_whose_text_names_the_category_is_still_not_evidence(monkeypatch):
+    """A failed read must not score, even when its error text matches the category.
+
+    A refused connection reads "Connection refused", which is a network keyword.
+    If the failure envelope were ever treated as usable, this exact text would
+    satisfy a network hypothesis, raise sources_supporting, and suppress the
+    contradiction penalty -- so a read that reached nothing would look like
+    better evidence than no read at all. The text is chosen to make that
+    specific wrong answer reachable.
+    """
+    _trail_spy(monkeypatch)
+    _tool_failing_with(monkeypatch, ConnectionError("Connection refused by peer"))
+    _stub_tool_calls(monkeypatch, [
+        {"name": "query_loki", "arguments": {"logql": '{container="x"}', "minutes": 15}},
+    ])
+
+    state = nodes.observer_node(_state([]))
+
+    assert state.evidence[0]["raw_data"]["error"] == "ConnectionError: Connection refused by peer"
+
+    score, breakdown = scoring.score_hypothesis(
+        state.evidence, Hypothesis(description="the network dropped", category="network")
+    )
+    assert breakdown["sources_supporting"] == 0
+    assert score == 0.0
+
+
+def test_a_failure_cannot_suppress_the_contradiction_penalty(monkeypatch):
+    """A failure must not rescue a guess that the real reads all contradict.
+
+    The penalty only bites at two or more distinct sources that support nothing,
+    so a test with a single failure cannot see it. Two real reads that match
+    nothing, plus a failure whose text would match if it were counted, is the
+    shape that matters: counting the failure lifts sources_supporting to one and
+    the penalty vanishes, turning a contradicted guess into a corroborated one.
+    """
+    _trail_spy(monkeypatch)
+    _tool_failing_with(monkeypatch, ConnectionError("Connection refused by peer"))
+    _stub_tool_calls(monkeypatch, [
+        {"name": "query_loki", "arguments": {"logql": '{container="x"}', "minutes": 15}},
+    ])
+
+    def _clean_read(source: str, text: str) -> dict:
+        return {
+            "iteration": 1,
+            "source": source,
+            "collected_at": "2026-01-01T00:00:00+00:00",
+            "summary": f"{source}()",
+            "raw_data": {"status": "success", "text": text},
+        }
+
+    contradicted = [
+        _clean_read("get_container_state", "container up, restart count 0"),
+        _clean_read("get_recent_deployments", "no releases in the last 24 hours"),
+    ]
+    network = Hypothesis(description="the network dropped", category="network")
+
+    without = scoring.score_hypothesis(contradicted, network)
+    with_failure = nodes.observer_node(_state(contradicted))
+    after = scoring.score_hypothesis(with_failure.evidence, network)
+
+    assert without[1]["contradiction_penalty"] > 0.0
+    assert after[1]["contradiction_penalty"] == without[1]["contradiction_penalty"]
+    assert after[1]["sources_supporting"] == 0
+    assert after[0] == without[0]
 
 
 def test_state_rejects_a_wrongly_typed_needs_evidence_assignment():

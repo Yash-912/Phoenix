@@ -56,9 +56,10 @@ and create it with:
     docker compose exec -T postgres psql -U phoenix -d phoenix -c "INSERT INTO incidents (id, service_name, alertname, severity, raw_payload) VALUES (1, 'checkout-service', 'ServiceDown', 'critical', '{}'); SELECT setval('incidents_id_seq', (SELECT MAX(id) FROM incidents))"
 
 001 gives every other column a default -- status, first_seen_at, last_seen_at,
-alert_count -- so those four NOT NULL columns are all an INSERT has to name, and
-timestamps are the server's to keep. The id is pinned so the graph's default
-reaches this row, and the setval beside it is not optional next to a pinned id:
+alert_count -- so an INSERT has to name only the four that are NOT NULL with no
+default behind them, and timestamps are the server's to keep. The id is pinned so
+the graph's default reaches this row, and the setval beside it is not optional
+next to a pinned id:
 incidents_id_seq is where the API's own INSERT takes its id from, so a pinned 1
 that never reached the sequence would be handed out again and fail its own
 primary key. If checkout-service already has an active ServiceDown incident,

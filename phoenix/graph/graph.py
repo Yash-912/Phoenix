@@ -66,7 +66,8 @@ def should_continue(state: AgentState) -> Command:
     read. The update is the part that reaches the run's final state.
 
     Registered as a node rather than as add_conditional_edges, measured on
-    langgraph 1.1.10 -- the version installed here, against a 0.2.39 pin -- where
+    langgraph 1.1.10 -- the version this module is pinned to, so this is a
+    statement about the dependency rather than a note on a local skew -- where
     attach_branch writes every packet as a branch:<destination> channel and
     understands only str or Send. With a path_map a Command raises TypeError:
     unhashable type: 'dict' while the branch indexes its ends; without one the
