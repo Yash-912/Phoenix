@@ -6,7 +6,7 @@
 
 **Architecture:** One graph, extended. The router's confidence exit changes meaning from "end" to "we have a finding worth acting on" and routes to a new `remediator_node`, which checks a policy gate, snapshots the signal, and dispatches through a remediation table disjoint from `TOOL_DISPATCH`. A new `verifier_node` re-reads the signal against that snapshot and routes to `END` (resolved), back to `observer` (failed, attempts left), or `END` (exhausted / inconclusive). Category→action and category→check live in two pure deterministic modules that never import the LLM client.
 
-**Tech Stack:** Python 3.13, langgraph 1.1.10 (pinned), pydantic v2, requests, pytest. No new dependencies.
+**Tech Stack:** Python 3.12.4, langgraph 1.1.10 (pinned), pydantic v2, requests, pytest. No new dependencies.
 
 **Spec:** `docs/superpowers/specs/2026-09-30-phase3-tier1-mitigation-design.md` — read it before Task 1; the plan argues from it, so the spec travels with this document.
 
@@ -154,8 +154,8 @@ for item in evidence:
 
 - [ ] **Step 8: Run the full graph suite to verify nothing regressed**
 
-Run: `python -m pytest phoenix/graph -q`
-Expected: PASS. The 157 from Step C, plus 8 new.
+Run: `python -m pytest phoenix -q`
+Expected: PASS. 165 total: the 157 from Step C, plus 8 new. Note the suite is `phoenix`, not `phoenix/graph` — Task 1 adds the first test under `phoenix/tools`, and a `phoenix/graph` run would silently skip it.
 
 - [ ] **Step 9: Commit**
 
@@ -252,7 +252,7 @@ Expected: PASS, 4 tests.
 
 - [ ] **Step 5: Run the graph suite, because `status` is validated on every node write**
 
-Run: `python -m pytest phoenix/graph -q`
+Run: `python -m pytest phoenix -q`
 Expected: PASS. If a node writes a status outside the five, this is where it surfaces.
 
 - [ ] **Step 6: Commit**
@@ -665,7 +665,7 @@ Expected: PASS, 8 tests.
 
 - [ ] **Step 5: Run the full graph suite**
 
-Run: `python -m pytest phoenix/graph -q`
+Run: `python -m pytest phoenix -q`
 Expected: PASS.
 
 - [ ] **Step 6: Commit**
@@ -930,7 +930,7 @@ Expected: PASS.
 
 - [ ] **Step 5: Run the full graph suite**
 
-Run: `python -m pytest phoenix/graph -q`
+Run: `python -m pytest phoenix -q`
 Expected: PASS.
 
 - [ ] **Step 6: Commit**
@@ -1020,7 +1020,7 @@ Expected: PASS.
 
 - [ ] **Step 6: Run the full suite**
 
-Run: `python -m pytest phoenix/graph -q`
+Run: `python -m pytest phoenix -q`
 Expected: PASS.
 
 - [ ] **Step 7: Commit**
@@ -1179,7 +1179,7 @@ def test_a_guarded_run_never_restarts_anything(monkeypatch):
 
 - [ ] **Step 6: Run the full suite**
 
-Run: `python -m pytest phoenix/graph -q`
+Run: `python -m pytest phoenix -q`
 Expected: PASS. Count the total and record it in the phase summary alongside Step C's 157.
 
 - [ ] **Step 7: Commit**
@@ -1191,7 +1191,7 @@ git commit -m "test: prove the remediation loop on the compiled graph"
 
 - [ ] **Step 8: Verify the phase's safety properties still hold, as one command**
 
-Run: `python -m pytest phoenix/graph -q -k "read_only or llm or budget or tokens_spent or threshold or schema"`
+Run: `python -m pytest phoenix -q -k "read_only or llm or budget or tokens_spent or threshold or schema"`
 
 Expected: PASS. These are Step C's four properties, still passing with the mutating path in the same graph. If any fails, Phase 3 has broken an invariant Step C established and that outranks every other finding in this phase.
 
