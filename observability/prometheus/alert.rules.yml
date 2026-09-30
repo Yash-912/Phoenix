@@ -76,3 +76,16 @@ groups:
         annotations:
           summary: "{{ $labels.job }} is down"
           description: "Prometheus cannot scrape target — down for 15s+."
+
+  - name: container-resource-alerts
+    rules:
+      - alert: WorkerServiceMemoryGrowth
+        expr: |
+          deriv(container_memory_working_set_bytes{name="worker-service"}[30m]) > 1024
+        for: 10m
+        labels:
+          severity: high
+          service: worker-service
+        annotations:
+          summary: "worker-service memory is growing steadily"
+          description: "The worker-service container's memory working set has grown by more than 1 KiB per second averaged over 30m, sustained for 10m+."
