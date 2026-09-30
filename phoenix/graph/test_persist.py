@@ -38,7 +38,8 @@ os.environ.setdefault("LLM_MODEL", "test-model")
 import pytest
 from langgraph.graph import END
 
-from phoenix.graph import graph, nodes, persist
+from phoenix.graph import graph, nodes, persist, verification
+from phoenix.graph import remediation_dispatch as dispatch
 from phoenix.graph.llm_client import HypothesisDecision, ToolCallDecision
 from phoenix.graph.schemas import DiagnoserOutput, Hypothesis, ScoredHypothesis
 from phoenix.graph.state import AgentState
@@ -341,6 +342,27 @@ def _hypotheses(proposed, tokens: int = 0):
 
 def _state(**overrides) -> AgentState:
     return AgentState(incident_id=INCIDENT, service_name=SERVICE, **overrides)
+
+
+def _settled_remediation(monkeypatch, outcome: str = "pass") -> None:
+    """Keep a confident run from leaving the persistence path in these tests.
+
+    The router sends a confident run to the remediator now, so a test that only
+    means to prove something about writing rows would otherwise reach a real
+    restart and the real verification delay. Both are replaced here, which also
+    makes the trail these tests count the trail a completed run leaves rather
+    than one that stops at a refused action.
+    """
+    monkeypatch.setitem(
+        dispatch.REMEDIATION_DISPATCH, "restart_service", lambda name: {"status": "ok"}
+    )
+    monkeypatch.setattr(
+        verification, "read_signal", lambda category, service: {"bytes": 1, "slope": 0.0}
+    )
+    monkeypatch.setattr(
+        verification, "run_check", lambda *a: (outcome, {"reason": "stubbed"})
+    )
+    monkeypatch.setattr(nodes.time, "sleep", lambda seconds: None)
 
 
 def test_the_module_never_imports_the_api_and_shares_nothing_with_it():
@@ -1012,11 +1034,11 @@ def test_the_router_audits_reaching_the_threshold_as_a_finding_not_an_escalation
         _state(confidence=0.9, tokens_spent=25000, iteration=5, max_iterations=5)
     )
 
-    assert command.goto == END
-    assert not command.update
+    assert command.goto == "remediator"
+    assert "escalation_reason" not in (command.update or {})
     assert audit[0]["node"] == "router"
     assert audit[0]["event_type"] == "threshold_reached"
-    assert audit[0]["detail"]["destination"] == END
+    assert audit[0]["detail"]["destination"] == "remediator"
     assert audit[0]["detail"]["escalation_reason"] is None
     assert audit[0]["detail"]["confidence"] == 0.9
     assert audit[0]["detail"]["tokens_spent"] == 25000
@@ -1114,6 +1136,7 @@ def test_a_whole_run_writes_its_trail_in_the_order_the_nodes_happened(monkeypatc
     monkeypatch.setattr(nodes, "decide_hypotheses", _hypotheses([CRASH], 1350))
     monkeypatch.setitem(nodes.TOOL_DISPATCH, "query_prometheus", lambda args: SERVICE_DOWN)
     monkeypatch.setitem(nodes.TOOL_DISPATCH, "query_loki", lambda args: PANIC)
+    _settled_remediation(monkeypatch)
 
     graph.build_graph().invoke(_state())
 
@@ -1126,11 +1149,14 @@ def test_a_whole_run_writes_its_trail_in_the_order_the_nodes_happened(monkeypatc
         ("hypotheses", None),
         ("audit_log", "diagnosis"),
         ("audit_log", "threshold_reached"),
+        ("audit_log", "action_executed"),
+        ("audit_log", "verification"),
     ]
     assert {params["incident_id"] for params in recorder.params} == {INCIDENT}
-    assert recorder.params[-1]["detail"].obj["destination"] == END
-    assert recorder.params[-1]["detail"].obj["escalation_reason"] is None
-    assert recorder.commits == 6
+    threshold_row = recorder.params[5]["detail"].obj
+    assert threshold_row["destination"] == "remediator"
+    assert threshold_row["escalation_reason"] is None
+    assert recorder.commits == 8
 
 
 def test_a_run_with_no_database_still_produces_its_diagnosis(monkeypatch):
@@ -1149,11 +1175,12 @@ def test_a_run_with_no_database_still_produces_its_diagnosis(monkeypatch):
     monkeypatch.setattr(nodes, "decide_hypotheses", _hypotheses([CRASH], 1350))
     monkeypatch.setitem(nodes.TOOL_DISPATCH, "query_prometheus", lambda args: SERVICE_DOWN)
     monkeypatch.setitem(nodes.TOOL_DISPATCH, "query_loki", lambda args: PANIC)
+    _settled_remediation(monkeypatch)
 
     final = graph.build_graph().invoke(_state())
 
     assert final["confidence"] == 0.9
-    assert final["status"] == "investigating"
+    assert final["status"] == "resolved"
     assert final.get("escalation_reason") is None
     assert len(final["evidence"]) == 2
     assert recorder.pools == []
@@ -1186,6 +1213,7 @@ def test_a_database_that_refuses_every_row_costs_a_run_nothing_but_its_trail(mon
         monkeypatch.setattr(nodes, "decide_hypotheses", _hypotheses([CRASH], 1350))
         monkeypatch.setitem(nodes.TOOL_DISPATCH, "query_prometheus", lambda args: SERVICE_DOWN)
         monkeypatch.setitem(nodes.TOOL_DISPATCH, "query_loki", lambda args: PANIC)
+        _settled_remediation(monkeypatch)
 
         final = graph.build_graph().invoke(_state())
         outcomes.append((len(recorder.statements), final))
@@ -1193,9 +1221,9 @@ def test_a_database_that_refuses_every_row_costs_a_run_nothing_but_its_trail(mon
     refused_count, refused = outcomes[0]
     written_count, written = outcomes[1]
 
-    assert refused_count == written_count == 6
+    assert refused_count == written_count == 8
     assert refused["confidence"] == written["confidence"] == 0.9
-    assert refused["status"] == written["status"] == "investigating"
+    assert refused["status"] == written["status"] == "resolved"
     assert refused["hypotheses"] == written["hypotheses"]
     assert len(refused["evidence"]) == len(written["evidence"]) == 2
 
@@ -1234,6 +1262,7 @@ def test_a_second_iteration_is_recorded_under_its_own_number(monkeypatch):
     monkeypatch.setattr(nodes, "decide_hypotheses", _hypotheses([CRASH], 1350))
     monkeypatch.setitem(nodes.TOOL_DISPATCH, "query_prometheus", lambda args: SERVICE_DOWN)
     monkeypatch.setitem(nodes.TOOL_DISPATCH, "query_loki", lambda args: PANIC)
+    _settled_remediation(monkeypatch)
 
     graph.build_graph().invoke(_state(token_budget=100000, max_iterations=5))
 
@@ -1241,7 +1270,17 @@ def test_a_second_iteration_is_recorded_under_its_own_number(monkeypatch):
     assert [params["iteration"] for params in hypothesis_rows] == [1, 2]
     assert [params["score"] for params in hypothesis_rows] == [0.0, 0.9]
     assert {params["iteration"] for params in recorder.params if "source" in params} == {2}
-    assert recorder.params[-1]["event_type"] == "threshold_reached"
+    events = [params["event_type"] for params in recorder.params if "event_type" in params]
+    assert events == [
+        "observer_pass",
+        "diagnosis",
+        "continuing",
+        "observer_pass",
+        "diagnosis",
+        "threshold_reached",
+        "action_executed",
+        "verification",
+    ]
 
 
 def test_the_router_row_names_the_state_it_decided_on_and_nothing_else(monkeypatch):

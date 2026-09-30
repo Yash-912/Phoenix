@@ -3,11 +3,16 @@ import sys
 from langgraph.graph import END, StateGraph
 from langgraph.types import Command
 
-from phoenix.graph.nodes import diagnoser_node, observer_node
+from phoenix.graph.nodes import (
+    diagnoser_node,
+    observer_node,
+    remediator_node,
+    verifier_node,
+)
 from phoenix.graph.persist import close_persistence, record_audit
 from phoenix.graph.state import AgentState
 
-ROUTER_DESTINATIONS: tuple[str, ...] = ("observer", END)
+ROUTER_DESTINATIONS: tuple[str, ...] = ("observer", "remediator", END)
 
 
 def _record_route(
@@ -91,25 +96,29 @@ def should_continue(state: AgentState) -> Command:
     "__end__" into the type instead of the name the code uses.
 
     Three ways out, in this order. A run that reached the confidence threshold
-    has a finding, so it is not an escalation however much it spent. Of the two
-    reasons an inconclusive run stops, the budget comes first: it is the harder
-    ceiling, and naming it is more useful than naming the iteration cap it
-    happens to be sitting under. Looping back is the last resort, so no run
-    that has spent its budget can return to the observer.
+    has a finding, so it is not an escalation however much it spent -- but a
+    finding is not the end of the run either. It is the one state that means
+    something can be done about it, so it routes to the remediator rather than
+    to END, and the remediator decides whether the policy allows an action and
+    then hands off to the verifier. Of the two reasons an inconclusive run
+    stops, the budget comes first: it is the harder ceiling, and naming it is
+    more useful than naming the iteration cap it happens to be sitting under.
+    Looping back is the last resort, so no run that has spent its budget can
+    return to the observer.
 
     Each of the four decisions is written to audit_log on its way out. That is
     the same audit table the observer and the diagnoser append to, so a run's
     end reads as one trail in order rather than a state field nobody queried.
     """
     if state.confidence >= state.confidence_threshold:
-        print(f"[router] confidence threshold met ({state.confidence:.2f} >= {state.confidence_threshold}) -> end")
+        print(f"[router] confidence threshold met ({state.confidence:.2f} >= {state.confidence_threshold}) -> remediator")
         _record_route(
             state,
             "threshold_reached",
-            END,
+            "remediator",
             f"confidence threshold met ({state.confidence:.2f} >= {state.confidence_threshold})",
         )
-        return Command(goto=END)
+        return Command(goto="remediator", update={"status": "confident"})
     if state.tokens_spent >= state.token_budget:
         reason = f"token budget exhausted ({state.tokens_spent}/{state.token_budget} tokens)"
         print(f"[router] {reason} -> end (escalate)")
@@ -146,10 +155,17 @@ def build_graph():
     graph.add_node("observer", observer_node)
     graph.add_node("diagnoser", diagnoser_node)
     graph.add_node("router", should_continue, destinations=ROUTER_DESTINATIONS)
+    graph.add_node("remediator", remediator_node)
+    graph.add_node("verifier", verifier_node)
 
     graph.set_entry_point("observer")
     graph.add_edge("observer", "diagnoser")
     graph.add_edge("diagnoser", "router")
+    # No static edge out of remediator or verifier. Both return a Command that
+    # names its own destination -- the remediator either hands on to the
+    # verifier or refuses and ends, the verifier either ends or loops back to
+    # the observer -- and a static edge alongside a Command would be a second,
+    # competing claim about where the run goes next.
 
     return graph.compile()
 
