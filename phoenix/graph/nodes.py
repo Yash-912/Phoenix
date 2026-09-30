@@ -1,9 +1,14 @@
 import re
 from datetime import datetime, timezone
 
-from phoenix.graph import scoring
+from langgraph.graph import END
+from langgraph.types import Command
+
+from phoenix.graph import scoring, verification
 from phoenix.graph.llm_client import decide_hypotheses, decide_tool_calls
 from phoenix.graph.persist import record_audit, record_evidence, record_hypotheses
+from phoenix.graph.remediation_dispatch import REMEDIATION_DISPATCH
+from phoenix.graph.remediation_policy import plan_action
 from phoenix.graph.schemas import ScoredHypothesis
 from phoenix.graph.state import AgentState
 from phoenix.tools.deploy_tool import get_recent_deployments
@@ -306,3 +311,162 @@ def diagnoser_node(state: AgentState) -> AgentState:
     )
 
     return state
+
+
+def _escalate(
+    state: AgentState,
+    event_type: str,
+    reason: str,
+    print_line: str,
+) -> Command:
+    """Stop the run with a named reason, on the audit trail before it stops.
+
+    A mutating step that fails is the one place a run must not try again on its
+    own, so every refusal here ends the run rather than routing back to the
+    observer. The reason is written both to the trail and into the final state:
+    the row is what an operator reads afterwards and the field is what the
+    caller reads immediately, and two different strings for one event is how a
+    postmortem ends up arguing with itself.
+    """
+    print(f"[remediator] {print_line} -> end (escalate)")
+    record_audit(
+        state.incident_id,
+        "remediator",
+        event_type,
+        {
+            "iteration": state.iteration,
+            "remediation_attempts": state.remediation_attempts,
+            "max_remediation_attempts": state.max_remediation_attempts,
+            "policy_mode": state.policy_mode,
+            "reason": reason,
+        },
+        reason,
+    )
+    return Command(goto=END, update={"status": "escalated", "escalation_reason": reason})
+
+
+def remediator_node(state: AgentState) -> Command:
+    """Take the one Tier 1 action this diagnosis allows, then hand off to verify.
+
+    The order of the gates below is the design, not a convenience. The attempt
+    cap is checked first, before the policy mode and before the snapshot, so
+    that a state which arrives here already over budget -- by a misrouted edge or
+    a hand-built state -- costs no tool call and no signal read. A cap enforced
+    after the snapshot would still be bounded in what it does to the world, but it
+    would not be bounded in what it spends doing nothing, and the failure this
+    guards against is a loop that keeps restarting a service that cannot be
+    restarted.
+
+    guarded mode refuses rather than asks. There is no approval step in this
+    phase: a run that stops here has taken no action and a human has been told
+    why, which is the safe reading of "guarded" even though it is not yet the
+    useful one.
+
+    A category with no Tier 1 action ends the run as action_unavailable with no
+    escalation reason. The diagnosis succeeded, the correct response was that a
+    human should look, and filing that as an escalation would put a successful
+    diagnostic in the same column as a failed one.
+
+    The pre-action snapshot is read immediately before the dispatch, never after.
+    That ordering is the whole basis of the comparison the verifier makes: a
+    reading taken after a restart is a post-restart reading, and comparing it to
+    a pre-restart snapshot would confirm that memory is where a fresh process
+    always puts it. When the snapshot cannot be read the action still runs and
+    the unreadable envelope is stored with it, because refusing to restart a
+    crash-looping container when metrics happen to be down would abandon the
+    service precisely when it is least likely to be healthy. The cost of that
+    choice is that verification later reports inconclusive, which is the honest
+    answer rather than a false pass.
+
+    A dispatch that returns an error envelope or raises is not an attempt. The
+    container was never restarted, so counting it would spend the cap on failures
+    that changed nothing, and routing to the verifier would ask it to confirm a
+    restart that did not happen.
+    """
+    if state.remediation_attempts >= state.max_remediation_attempts:
+        reason = (
+            f"remediation attempts exhausted "
+            f"({state.remediation_attempts}/{state.max_remediation_attempts})"
+        )
+        return _escalate(state, "action_attempts_exhausted", reason, reason)
+
+    if state.policy_mode == "guarded":
+        category = state.hypotheses[0].hypothesis.category if state.hypotheses else "unknown"
+        return _escalate(
+            state,
+            "action_blocked_by_policy",
+            f"policy_mode is guarded, so no action was taken for the {category} finding",
+            f"policy_mode is guarded, so no action taken",
+        )
+
+    plan = plan_action(state)
+    if not plan.available:
+        print(f"[remediator] {plan.reasoning} -> end (action_unavailable)")
+        record_audit(
+            state.incident_id,
+            "remediator",
+            "action_unavailable",
+            {
+                "iteration": state.iteration,
+                "category": state.hypotheses[0].hypothesis.category if state.hypotheses else None,
+                "remediation_attempts": state.remediation_attempts,
+            },
+            plan.reasoning,
+        )
+        return Command(goto=END, update={"status": "action_unavailable"})
+
+    pre_action_signal = verification.read_signal(plan.check, plan.container)
+    action_at = datetime.now(timezone.utc).isoformat()
+
+    print(f"[remediator] taking {plan.action} on {plan.container} ({plan.reasoning})")
+    try:
+        result = REMEDIATION_DISPATCH[plan.action](plan.container)
+    except Exception as exc:
+        reason = f"{plan.action} on {plan.container} raised {type(exc).__name__}: {exc}"
+        return _escalate(state, "action_failed", reason, reason)
+
+    if not isinstance(result, dict) or result.get("status") == "error":
+        detail = (
+            result.get("error")
+            if isinstance(result, dict)
+            else f"returned {type(result).__name__} rather than a result"
+        )
+        reason = f"{plan.action} on {plan.container} failed: {detail}"
+        return _escalate(state, "action_failed", reason, reason)
+
+    planned_action = {
+        "action": plan.action,
+        "container": plan.container,
+        "check": plan.check,
+        "pre_action_signal": pre_action_signal,
+        "action_at": action_at,
+    }
+    record_audit(
+        state.incident_id,
+        "remediator",
+        "action_executed",
+        {
+            "iteration": state.iteration,
+            "action": plan.action,
+            "container": plan.container,
+            "check": plan.check,
+            "action_at": action_at,
+            "remediation_attempts": state.remediation_attempts + 1,
+            "snapshot_usable": scoring._is_usable({"raw_data": pre_action_signal}),
+            "result": result,
+        },
+        f"{plan.reasoning}; snapshot taken at {action_at}",
+    )
+    print(
+        f"[remediator] {plan.action} completed "
+        f"(attempt {state.remediation_attempts + 1}/{state.max_remediation_attempts}) "
+        f"-> verifier"
+    )
+    return Command(
+        goto="verifier",
+        update={
+            "status": "confident",
+            "planned_action": planned_action,
+            "remediation_attempts": state.remediation_attempts + 1,
+        },
+    )

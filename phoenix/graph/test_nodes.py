@@ -13,7 +13,10 @@ os.environ.setdefault("LLM_MODEL", "test-model")
 import pytest
 from pydantic import ValidationError
 
-from phoenix.graph import llm_client, nodes, scoring
+from langgraph.graph import END
+
+from phoenix.graph import llm_client, nodes, scoring, verification
+from phoenix.graph import remediation_dispatch as dispatch
 from phoenix.graph.schemas import DiagnoserOutput, Hypothesis, ScoredHypothesis
 from phoenix.graph.state import AgentState
 
@@ -823,3 +826,212 @@ def test_state_rejects_a_wrongly_typed_token_budget_assignment():
             state.token_budget = bad
 
     assert state.token_budget == 20000
+
+
+# --- remediator_node ----------------------------------------------------------
+
+SNAPSHOT = {"bytes": 900_000_000, "slope": 3000.0}
+
+
+def _remediator_state(category: str | None, **overrides) -> AgentState:
+    """A state the router would only send to the remediator: a top-scoring
+    hypothesis of the given category and a cleared confidence threshold."""
+    hypotheses = (
+        [
+            ScoredHypothesis(
+                hypothesis=Hypothesis(description="something is wrong", category=category),
+                score=0.9,
+                score_breakdown={},
+            )
+        ]
+        if category
+        else []
+    )
+    return AgentState(incident_id=1, service_name=SERVICE, hypotheses=hypotheses, **overrides)
+
+
+def _no_action(monkeypatch) -> list[str]:
+    """A dispatch table whose only action records being called and does nothing."""
+    called: list[str] = []
+    monkeypatch.setitem(
+        dispatch.REMEDIATION_DISPATCH, "restart_service", lambda name: called.append(name)
+    )
+    return called
+
+
+def _audit_rows(monkeypatch) -> list[dict]:
+    """Every audit write with all its parts, which the shared _trail_spy drops."""
+    rows: list[dict] = []
+
+    def record_audit(incident_id, node, event_type, detail, reasoning_text):
+        rows.append(
+            {
+                "node": node,
+                "event_type": event_type,
+                "detail": detail,
+                "reasoning_text": reasoning_text,
+            }
+        )
+
+    monkeypatch.setattr(nodes, "record_audit", record_audit)
+    return rows
+
+
+def _update(command) -> dict:
+    """What the node hands back for the run's state.
+
+    Read from the Command rather than from a mutated AgentState on purpose.
+    langgraph copies the state into each node, so a field written in place is a
+    field the graph never sees -- a node that mutates and returns a bare
+    Command(goto=...) passes every test in this file and loses its whole
+    effect in the compiled graph. The router's docstring in graph.py is the
+    same point made about routing, and every assertion below goes through this
+    helper so a node that stops returning an update fails loudly.
+    """
+    assert command.update is not None, (
+        "the node returned a Command with no update, so its state changes would "
+        "never reach the run"
+    )
+    return command.update
+
+
+def test_guarded_mode_does_not_reach_the_action(monkeypatch):
+    called = _no_action(monkeypatch)
+    state = _remediator_state("crash", policy_mode="guarded")
+
+    command = nodes.remediator_node(state)
+    update = _update(command)
+
+    assert called == []
+    assert command.goto == END
+    assert update.get("remediation_attempts") is None
+    assert update["status"] == "escalated"
+
+
+def test_the_attempt_cap_stops_a_misrouted_remediator_before_it_dispatches(monkeypatch):
+    called = _no_action(monkeypatch)
+    state = _remediator_state(
+        "crash", remediation_attempts=2, max_remediation_attempts=2
+    )
+
+    command = nodes.remediator_node(state)
+    update = _update(command)
+
+    assert called == []
+    assert command.goto == END
+    assert update["status"] == "escalated"
+    assert "attempt" in update["escalation_reason"]
+
+
+def test_a_deploy_finding_calls_no_tool_at_all(monkeypatch):
+    called = _no_action(monkeypatch)
+    state = _remediator_state("deploy")
+
+    command = nodes.remediator_node(state)
+    update = _update(command)
+
+    assert called == []
+    assert command.goto == END
+    assert update["status"] == "action_unavailable"
+    assert update.get("escalation_reason") is None
+
+
+def test_a_run_with_no_surviving_hypothesis_acts_on_nothing(monkeypatch):
+    called = _no_action(monkeypatch)
+    state = _remediator_state(None)
+
+    command = nodes.remediator_node(state)
+    update = _update(command)
+
+    assert called == []
+    assert command.goto == END
+    assert update["status"] == "action_unavailable"
+
+
+def test_a_successful_action_snapshots_the_signal_and_counts_the_attempt(monkeypatch):
+    monkeypatch.setattr(verification, "read_signal", lambda category, service: SNAPSHOT)
+    monkeypatch.setitem(
+        dispatch.REMEDIATION_DISPATCH, "restart_service", lambda name: {"status": "ok"}
+    )
+    state = _remediator_state("overload")
+
+    command = nodes.remediator_node(state)
+    update = _update(command)
+    planned = update["planned_action"]
+
+    assert command.goto == "verifier"
+    assert update["remediation_attempts"] == 1
+    assert update["status"] == "confident"
+    assert planned["action"] == "restart_service"
+    assert planned["container"] == SERVICE
+    assert planned["check"] == "overload"
+    assert planned["pre_action_signal"] == SNAPSHOT
+    assert planned["action_at"]
+
+
+def test_the_snapshot_is_taken_before_the_action_not_after(monkeypatch):
+    """The comparison is only meaningful against a reading from seconds ago, and
+    an ordering bug here would quietly compare against a post-action value."""
+    order: list[str] = []
+    monkeypatch.setattr(
+        verification, "read_signal", lambda c, s: (order.append("snapshot"), SNAPSHOT)[1]
+    )
+    monkeypatch.setitem(
+        dispatch.REMEDIATION_DISPATCH,
+        "restart_service",
+        lambda name: (order.append("dispatch"), {"status": "ok"})[1],
+    )
+
+    nodes.remediator_node(_remediator_state("overload"))
+
+    assert order == ["snapshot", "dispatch"]
+
+
+def test_a_dispatch_that_reports_an_error_never_counts_as_an_attempt_and_never_verifies(
+    monkeypatch,
+):
+    monkeypatch.setitem(
+        dispatch.REMEDIATION_DISPATCH,
+        "restart_service",
+        lambda name: {"status": "error", "error": "404 Client Error: no such container"},
+    )
+    state = _remediator_state("crash")
+
+    command = nodes.remediator_node(state)
+    update = _update(command)
+
+    assert command.goto == END
+    assert update.get("remediation_attempts") is None
+    assert update["status"] == "escalated"
+    assert update.get("verification_result") is None
+
+
+def test_a_dispatch_that_raises_is_recorded_as_a_failure_and_not_a_crash(monkeypatch):
+    def boom(name: str) -> dict:
+        raise ConnectionResetError("connection reset by peer")
+
+    monkeypatch.setitem(dispatch.REMEDIATION_DISPATCH, "restart_service", boom)
+    state = _remediator_state("crash")
+
+    command = nodes.remediator_node(state)
+    update = _update(command)
+
+    assert command.goto == END
+    assert update["status"] == "escalated"
+    assert update.get("remediation_attempts") is None
+
+
+def test_the_action_is_recorded_on_the_trail_with_its_reasoning(monkeypatch):
+    rows = _audit_rows(monkeypatch)
+    monkeypatch.setattr(verification, "read_signal", lambda c, s: SNAPSHOT)
+    monkeypatch.setitem(
+        dispatch.REMEDIATION_DISPATCH, "restart_service", lambda name: {"status": "ok"}
+    )
+
+    nodes.remediator_node(_remediator_state("crash"))
+
+    executed = [r for r in rows if r["event_type"] == "action_executed"]
+    assert executed, [(r["node"], r["event_type"]) for r in rows]
+    assert executed[0]["node"] == "remediator"
+    assert executed[0]["detail"]["action"] == "restart_service"
+    assert executed[0]["reasoning_text"]
