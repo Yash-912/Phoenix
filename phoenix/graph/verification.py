@@ -1,0 +1,277 @@
+"""Whether the action Phoenix just took actually worked.
+
+Two rules shape this module, and both come from the failure mode the whole
+verification engine exists to avoid: an agent that reports recovery it did not
+observe. The run that reports "recovered" on a container it could not check is
+worse than the run that reports nothing, because a human stops looking.
+
+**"Could not check" is a third answer, not a failed check.** Every path that
+cannot obtain a signal returns INCONCLUSIVE, never pass. That is the same
+direction scoring._is_usable errs in, and for the same reason: a failed
+measurement making a guess look better-supported than no measurement at all is
+the one direction an agent must never be wrong in. It is why the unusable check
+below is shared with the scorer rather than reimplemented.
+
+**The alert's window is the wrong window.** Task 7's cAdvisor rule uses a 30m
+deriv with a 10m for: on purpose, so one memory spike cannot trip it. Reusing
+that for verification would mean waiting ~40 minutes to confirm a restart, which
+is not a feature. A container that was just restarted is at baseline by
+definition, so the question is not "is memory growing" but "did the working set
+come down from what it was seconds ago". That is a comparison against the
+snapshot remediator_node took immediately before the action, over a short slope
+window to catch a leak that starts again straight away.
+
+Every PromQL here is authored by this module. Nothing in this file consults the
+model, which is what keeps the observer's five read-only tools the whole read
+surface: verification adds a new kind of question without adding a new tool.
+"""
+
+from phoenix.graph import scoring
+from phoenix.tools.docker_tool import get_container_state
+from phoenix.tools.health_tool import inspect_health
+from phoenix.tools.prometheus_tool import query_prometheus
+
+OUTCOME_PASS = "pass"
+OUTCOME_FAIL = "fail"
+OUTCOME_INCONCLUSIVE = "inconclusive"
+
+# After a restart the working set must sit below this fraction of what it was
+# before. Half is chosen to be a change no amount of ordinary traffic produces in
+# the settling window, so a "pass" cannot be ordinary variance.
+MEMORY_DROP_RATIO = 0.5
+
+# Short window, unlike the alert's 30m: this is not deciding whether to page
+# someone, it is asking whether the memory freed by the restart is staying freed.
+# The threshold is the alert's own 1024 B/s, so a slope above it means the leak
+# is back at the rate that would page a human, and the restart bought minutes
+# rather than a fix.
+SLOPE_WINDOW_MINUTES = 5
+SLOPE_TOLERANCE = 1024
+
+
+def _memory_promql(service_name: str) -> str:
+    return f'container_memory_working_set_bytes{{name="{service_name}"}}'
+
+
+def _slope_promql(service_name: str) -> str:
+    return (
+        f'deriv(container_memory_working_set_bytes'
+        f'{{name="{service_name}"}}[{SLOPE_WINDOW_MINUTES}m])'
+    )
+
+
+def _first_sample(payload) -> float | None:
+    """The value of the first vector sample, or None when there is no sample.
+
+    The value arrives as a string because that is what Prometheus's JSON
+    encodes, and a vector whose result list is empty has no sample at all --
+    which is not the same as a sample of zero and must not be read as one.
+    """
+    try:
+        sample = payload["data"]["result"][0]["value"][1]
+    except (KeyError, IndexError, TypeError):
+        return None
+    try:
+        return float(sample)
+    except (TypeError, ValueError):
+        return None
+
+
+def read_signal(category: str, service_name: str) -> dict:
+    """One reading of whatever proves or disproves this category.
+
+    Returns either a usable payload or the failure envelope, and never raises.
+    A tool that raises is turned into that envelope rather than propagated: this
+    is called after a real action has run, and an exception here would unwind
+    past the final state print and lose the record that the action happened at
+    all -- the one thing the operator cannot reconstruct.
+    """
+    try:
+        if category == "overload":
+            return _read_memory(service_name)
+        if category == "crash":
+            return {
+                "state": get_container_state(service_name),
+                "health": inspect_health(service_name),
+            }
+    except Exception as exc:
+        return {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
+
+    return {
+        "status": "error",
+        "error": f"no verification check for category {category!r}",
+    }
+
+
+def _read_memory(service_name: str) -> dict:
+    """Working set now, and its short-window slope, or the failure envelope.
+
+    Both are needed and they answer different questions. The level says the
+    restart freed anything; the slope says the freed memory is staying freed. A
+    level check alone passes on a container that dipped and is already climbing
+    back, which is the leak scenario this phase is built to demonstrate.
+    """
+    level = query_prometheus(_memory_promql(service_name))
+    if not scoring._is_usable({"raw_data": level}):
+        return {"status": "error", "error": "the working-set query did not return data"}
+
+    slope = query_prometheus(_slope_promql(service_name))
+    if not scoring._is_usable({"raw_data": slope}):
+        return {"status": "error", "error": "the working-set slope query did not return data"}
+
+    bytes_now = _first_sample(level)
+    slope_value = _first_sample(slope)
+
+    if bytes_now is None:
+        return {"status": "error", "error": "the working-set vector carried no sample"}
+    if slope_value is None:
+        return {"status": "error", "error": "the working-set slope vector carried no sample"}
+
+    return {"bytes": bytes_now, "slope": slope_value}
+
+
+def run_check(
+    category: str,
+    service_name: str,
+    before: dict,
+    action_at: str | None,
+) -> tuple[str, dict]:
+    """Judge the signal against the snapshot taken before the action.
+
+    Returns (outcome, detail). outcome is one of pass, fail, or inconclusive,
+    and inconclusive is the honest answer whenever the signal could not be read
+    -- never a pass, and never a silent absence.
+    """
+    signal = read_signal(category, service_name)
+
+    if not scoring._is_usable({"raw_data": signal}):
+        return OUTCOME_INCONCLUSIVE, {
+            "check": category,
+            "reason": (
+                f"the signal for {category} could not be read, so whether the "
+                f"action worked is unknown: {signal.get('error', 'no data')}"
+            ),
+            "signal": signal,
+        }
+
+    if category == "overload":
+        return _check_overload(signal, before or {})
+    if category == "crash":
+        return _check_crash(signal, action_at)
+
+    return OUTCOME_INCONCLUSIVE, {
+        "check": category,
+        "reason": f"no verification check for category {category!r}",
+    }
+
+
+def _check_overload(signal: dict, before: dict) -> tuple[str, dict]:
+    """Did the working set come down, and is it staying down?"""
+    detail = {
+        "check": "overload",
+        "before": before.get("bytes"),
+        "after": signal.get("bytes"),
+        "slope": signal.get("slope"),
+    }
+
+    before_bytes = before.get("bytes")
+    if before_bytes is None:
+        return OUTCOME_INCONCLUSIVE, {
+            **detail,
+            "reason": (
+                "no pre-action working set was captured, so there is nothing to "
+                "compare the current reading against"
+            ),
+        }
+
+    if signal["bytes"] >= before_bytes * MEMORY_DROP_RATIO:
+        return OUTCOME_FAIL, {
+            **detail,
+            "reason": (
+                f"working set is {int(signal['bytes'])} against a pre-action "
+                f"{int(before_bytes)}, which is not the drop a restart should "
+                f"produce"
+            ),
+        }
+
+    if signal["slope"] > SLOPE_TOLERANCE:
+        return OUTCOME_FAIL, {
+            **detail,
+            "reason": (
+                f"working set did come down to {int(signal['bytes'])} but its "
+                f"slope over {SLOPE_WINDOW_MINUTES}m is {signal['slope']:.0f} B/s, "
+                f"above the {SLOPE_TOLERANCE} B/s the alert would page on, so the "
+                f"restart bought time rather than a fix"
+            ),
+        }
+
+    return OUTCOME_PASS, {
+        **detail,
+        "reason": (
+            f"working set fell from {int(before_bytes)} to {int(signal['bytes'])} "
+            f"and is not climbing"
+        ),
+    }
+
+
+def _check_crash(signal: dict, action_at: str | None) -> tuple[str, dict]:
+    """Is it running, did THIS action restart it, and is it answering?
+
+    The start time is what separates a restart that worked from a container that
+    happened to be up already. Without it a check would pass on a service that
+    was never touched, and the agent would credit itself with a fix it did not
+    make.
+    """
+    state = signal.get("state", {})
+    health = signal.get("health", {})
+    container_state = state.get("State", {}) if isinstance(state, dict) else {}
+    started_at = container_state.get("StartedAt")
+    detail = {
+        "check": "crash",
+        "status": container_state.get("Status"),
+        "started_at": started_at,
+    }
+
+    if not started_at:
+        return OUTCOME_INCONCLUSIVE, {
+            **detail,
+            "reason": (
+                "the container's start time could not be read, so there is no way "
+                "to tell whether this action restarted it"
+            ),
+        }
+
+    if action_at and started_at < action_at:
+        return OUTCOME_FAIL, {
+            **detail,
+            "reason": (
+                f"the container started at {started_at}, before the action was "
+                f"taken at {action_at}, so it was already running and the action "
+                f"is not what made it healthy"
+            ),
+        }
+
+    if container_state.get("Status") != "running":
+        return OUTCOME_FAIL, {
+            **detail,
+            "reason": f"the container is {container_state.get('Status')!r}, not running",
+        }
+
+    app = health.get("app", {}) if isinstance(health, dict) else {}
+    if not app.get("status") or app.get("status") != "ok":
+        return OUTCOME_FAIL, {
+            **detail,
+            "reason": (
+                f"the container is running but its health probe reports "
+                f"{app.get('status', 'nothing')!r}, so the service is not serving"
+            ),
+        }
+
+    return OUTCOME_PASS, {
+        **detail,
+        "reason": (
+            f"the container restarted at {started_at}, after the action, and is "
+            f"running with a healthy app probe"
+        ),
+    }
+
