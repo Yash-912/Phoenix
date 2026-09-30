@@ -81,7 +81,7 @@ groups:
     rules:
       - alert: WorkerServiceMemoryGrowth
         expr: |
-          deriv(container_memory_working_set_bytes{name="worker-service"}[30m]) > 1024
+          max(deriv(container_memory_working_set_bytes{name="worker-service", job="cadvisor"}[30m])) > 1024
         for: 10m
         labels:
           severity: high
