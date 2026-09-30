@@ -377,6 +377,28 @@ def test_a_tool_name_alone_never_retires_a_request(monkeypatch):
     assert state.needs_evidence == ["recent deployments"]
 
 
+def test_a_failed_reads_error_text_never_retires_a_request(monkeypatch):
+    request = "recent deployments and what version is running"
+    _stub_hypotheses(
+        monkeypatch,
+        DiagnoserOutput(hypotheses=[
+            Hypothesis(description=DEPLOY.description, category="deploy",
+                       needs_evidence=[request]),
+        ]),
+    )
+    failed = [
+        {"iteration": 1, "source": "get_recent_deployments",
+         "collected_at": "2026-01-01T00:00:00+00:00",
+         "summary": "get_recent_deployments({'service_name': 'checkout-service'})",
+         "raw_data": {"status": "error",
+                      "error": "recent deployments and what version is running: Connection refused"}},
+    ]
+
+    state = nodes.diagnoser_node(_state(failed))
+
+    assert state.needs_evidence == [request]
+
+
 def test_a_call_argument_never_retires_a_request(monkeypatch):
     _stub_hypotheses(
         monkeypatch,

@@ -63,14 +63,25 @@ def _evidence_words(evidence: list[dict]) -> set[str]:
     Matched as whole words, never as substrings: "exit" must not be satisfied by
     "exits", or a request retires against text nobody wrote.
 
+    A read that failed contributes nothing. What a failure carries is the
+    transport's own complaint -- "Connection refused", "Read timed out" -- and
+    those are words like any other, so counting them lets an unanswered request
+    retire against the news that it could not be answered. scoring._is_usable is
+    the same predicate the scorer uses to keep a failure from satisfying a
+    hypothesis and suppressing its contradiction penalty; a request and a
+    hypothesis are both claims about what was learned, and a failed read is
+    evidence that neither can rest on.
+
     The summary is excluded outright. It is "tool(arguments)", and the arguments
-    repeat verbatim every iteration — inspect_health is called with
-    {'service_name': 'checkout-service'} on nearly every one of them — so a
+    repeat verbatim every iteration -- inspect_health is called with
+    {'service_name': 'checkout-service'} on nearly every one of them -- so a
     request naming "service name" would retire against the call rather than the
     result. What was asked is not what was learned; only raw_data counts.
     """
     words: set[str] = set()
     for item in evidence:
+        if not scoring._is_usable(item):
+            continue
         words.update(_WORD.findall(_returned_text(item.get("raw_data")).lower()))
     return words
 
