@@ -246,6 +246,40 @@ def _insert_columns(statement: str) -> tuple[str, set[str]]:
     return table, set(re.findall(r"\w+", columns))
 
 
+def _table_bodies(migration: str) -> dict[str, str]:
+    """The column and constraint block of every CREATE TABLE in a migration."""
+    sql = (INIT_DIR / migration).read_text(encoding="utf-8")
+    return dict(re.findall(r"CREATE TABLE (\w+) \((.*?)\n\);", sql, re.DOTALL))
+
+
+DEFAULTED = re.compile(r"\b(DEFAULT|SERIAL)\b")
+
+
+def _required_columns(migration: str, table: str) -> set[str]:
+    """The columns an INSERT into `table` has to name: NOT NULL, and no default.
+
+    A serial column counts among the defaulted ones because that is what it is --
+    BIGSERIAL is bigint NOT NULL DEFAULT nextval(...) -- even though neither of
+    those words is in the line to be read.
+    """
+    required = set()
+    for line in _table_bodies(migration)[table].splitlines():
+        tokens = line.split()
+        if not tokens or tokens[0].upper() in TABLE_CONSTRAINT_STARTS:
+            continue
+        if "NOT NULL" in line and not DEFAULTED.search(line):
+            required.add(tokens[0].strip('"'))
+    return required
+
+
+def _foreign_keys(migration: str) -> dict[str, set[str]]:
+    """The tables each table in a migration points its id column at."""
+    return {
+        table: set(re.findall(r"REFERENCES (\w+)\(id\)", body))
+        for table, body in _table_bodies(migration).items()
+    }
+
+
 def _evidence_spy(monkeypatch) -> list[tuple[int, dict]]:
     """Replace the observer's evidence writer, keeping its real signature."""
     calls: list[tuple[int, dict]] = []
@@ -561,6 +595,40 @@ def test_the_command_the_docstring_names_applies_a_migration_that_exists_on_disk
     assert "docker-entrypoint-initdb.d" in persist.__doc__
 
 
+def test_every_table_the_module_writes_needs_an_incident_row_and_nothing_here_creates_one():
+    targets = _foreign_keys("002_evidence_hypotheses_audit.sql")
+    written = {_insert_columns(sql)[0] for sql in (persist.INSERT_EVIDENCE,
+                                                    persist.INSERT_HYPOTHESIS,
+                                                    persist.INSERT_AUDIT)}
+
+    assert written == {"evidence", "hypotheses", "audit_log"}
+    for table in written:
+        assert targets[table] == {"incidents"}
+    assert set().union(*targets.values()) <= set(_table_bodies("001_incidents.sql"))
+
+
+def test_the_incident_row_the_fk_requires_is_documented_with_a_check_and_a_create():
+    commands = [
+        line.strip() for line in persist.__doc__.splitlines() if "psql" in line
+    ]
+    about_incidents = [c for c in commands if "incidents" in c]
+    check = [c for c in about_incidents if "SELECT id FROM incidents WHERE id = 1" in c]
+    create = [c for c in about_incidents if "INSERT INTO incidents" in c]
+
+    assert len(check) == 1
+    assert len(create) == 1
+    for command in (check[0], create[0]):
+        assert command.startswith("docker compose exec -T postgres psql -U phoenix -d phoenix -c ")
+
+    table, columns = _insert_columns(create[0])
+    assert table == "incidents"
+    assert columns <= _created_columns("001_incidents.sql")[table]
+    assert _required_columns("001_incidents.sql", table) <= columns
+    assert f"'{table}_id_seq'" in create[0]
+    assert "foreign key" in persist.__doc__
+    assert "[persist]" in persist.__doc__
+
+
 def test_the_evidence_source_is_the_tool_name_the_observer_recorded(monkeypatch):
     recorder = _live(monkeypatch)
 
@@ -815,11 +883,37 @@ def test_the_observer_audits_the_pass_with_what_was_asked_and_what_ran(monkeypat
         "iteration": 1,
         "requested_tools": ["restart_service", "query_prometheus"],
         "dispatched_tools": ["query_prometheus"],
+        "failed_tools": [],
         "evidence_collected": 1,
         "tokens_spent": 940,
     }
     assert audit[0]["reasoning_text"] is None
     assert state.tokens_spent == 940
+
+
+def test_the_observer_audits_a_call_that_raised_as_ran_and_failed(monkeypatch):
+    written = _evidence_spy(monkeypatch)
+    audit = _audit_spy(monkeypatch, nodes)
+    monkeypatch.setattr(
+        nodes,
+        "decide_tool_calls",
+        _tool_calls(
+            [
+                {"name": "query_loki", "arguments": {"minutes": 15}},
+                {"name": "query_prometheus", "arguments": {"promql": "up == 0"}},
+            ],
+            940,
+        ),
+    )
+    monkeypatch.setitem(nodes.TOOL_DISPATCH, "query_prometheus", lambda args: SERVICE_DOWN)
+
+    state = nodes.observer_node(_state())
+
+    assert [item["source"] for _, item in written] == ["query_loki", "query_prometheus"]
+    assert written[0][1] is state.evidence[0]
+    assert written[0][1]["raw_data"] == {"status": "error", "error": "KeyError: 'logql'"}
+    assert audit[0]["detail"]["dispatched_tools"] == ["query_loki", "query_prometheus"]
+    assert audit[0]["detail"]["failed_tools"] == ["query_loki"]
 
 
 def test_an_observer_pass_that_asked_for_nothing_is_still_audited(monkeypatch):

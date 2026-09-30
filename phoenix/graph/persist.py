@@ -37,6 +37,33 @@ constraint on evidence.source is still the old one -- the file sitting on disk
 says nothing about whether the database has run it. The error printed for a
 refused row names the constraint, which is how a run tells a migration to apply
 apart from a write to retry.
+
+Every table written here also foreign-keys to incidents(id) -- 002 declares
+REFERENCES incidents(id) on evidence, hypotheses and audit_log -- and nothing
+here creates that row or the table. The incident belongs to the API, which
+deduplicates an alert into it; the graph is only ever handed its id, and
+graph.py defaults that id to 1. So on a database with no incident 1 every insert
+above is refused, the run finishes on time anyway, and what it leaves is a
+[persist] line per table it tried to write -- each naming the foreign key it
+tripped -- over a trail with no rows in it. That reads as an investigation that
+found nothing and recorded nothing, which is why it is written down here. Check
+for the row with:
+
+    docker compose exec -T postgres psql -U phoenix -d phoenix -c "SELECT id FROM incidents WHERE id = 1"
+
+and create it with:
+
+    docker compose exec -T postgres psql -U phoenix -d phoenix -c "INSERT INTO incidents (id, service_name, alertname, severity, raw_payload) VALUES (1, 'checkout-service', 'ServiceDown', 'critical', '{}'); SELECT setval('incidents_id_seq', (SELECT MAX(id) FROM incidents))"
+
+001 gives every other column a default -- status, first_seen_at, last_seen_at,
+alert_count -- so those four NOT NULL columns are all an INSERT has to name, and
+timestamps are the server's to keep. The id is pinned so the graph's default
+reaches this row, and the setval beside it is not optional next to a pinned id:
+incidents_id_seq is where the API's own INSERT takes its id from, so a pinned 1
+that never reached the sequence would be handed out again and fail its own
+primary key. If checkout-service already has an active ServiceDown incident,
+001's partial unique index means that row is the one to pass as the graph's first
+argument instead.
 """
 
 import os

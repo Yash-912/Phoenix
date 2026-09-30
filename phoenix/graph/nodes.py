@@ -151,6 +151,23 @@ def observer_node(state: AgentState) -> AgentState:
     audit row naming what the LLM asked for, what the allowlist actually let
     run, and what the pass cost. The evidence row is written from the item that
     went onto the state, so the row and the state are the same fact.
+
+    The LLM's arguments are checked only for being JSON, never for carrying the
+    keys or the types a tool needs, so a call the tool cannot accept dies inside
+    the tool: a string where the tool wants an int, a required key that never
+    arrived. The pass is caught around each call rather than around the loop,
+    because one unreadable argument must not cost the operator the run -- the
+    investigation is over and the diagnosis is in this state, and an exception
+    here unwinds past the print of the final state to lose all of it.
+
+    A call that raised is recorded like any other call, in the same
+    {"status": "error", "error": ...} envelope the tools themselves write when a
+    read fails: the trail should carry the fact that a read was attempted and
+    did not come back, which is worth more to whoever reads it afterwards than a
+    gap, and that envelope is the one scoring._is_usable reads, so a recorded
+    failure is recorded and is not evidence. The audit row names the calls that
+    raised in failed_tools, so no row claims a read returned data when it
+    returned nothing.
     """
     state.iteration += 1
 
@@ -160,6 +177,7 @@ def observer_node(state: AgentState) -> AgentState:
     state.tokens_spent += decision.tokens
     requested_calls = decision.calls
     dispatched: list[str] = []
+    failed: list[str] = []
 
     if not requested_calls:
         print(f"[observer] iteration {state.iteration}: LLM requested no tool calls")
@@ -171,7 +189,14 @@ def observer_node(state: AgentState) -> AgentState:
             print(f"[observer] iteration {state.iteration}: ignoring unrecognized tool '{tool_name}'")
             continue
 
-        result = tool_fn(call["arguments"])
+        failure = None
+        try:
+            result = tool_fn(call["arguments"])
+        except Exception as exc:
+            failure = f"{type(exc).__name__}: {exc}"
+            result = {"status": "error", "error": failure}
+            failed.append(tool_name)
+
         item = {
             "iteration": state.iteration,
             "source": tool_name,
@@ -182,7 +207,13 @@ def observer_node(state: AgentState) -> AgentState:
         state.evidence.append(item)
         record_evidence(state.incident_id, item)
         dispatched.append(tool_name)
-        print(f"[observer] iteration {state.iteration}: called {tool_name}({call['arguments']})")
+        if failure is None:
+            print(f"[observer] iteration {state.iteration}: called {tool_name}({call['arguments']})")
+        else:
+            print(
+                f"[observer] iteration {state.iteration}: {tool_name}({call['arguments']}) "
+                f"failed: {failure}"
+            )
 
     record_audit(
         state.incident_id,
@@ -192,6 +223,7 @@ def observer_node(state: AgentState) -> AgentState:
             "iteration": state.iteration,
             "requested_tools": [call["name"] for call in requested_calls],
             "dispatched_tools": dispatched,
+            "failed_tools": failed,
             "evidence_collected": len(state.evidence),
             "tokens_spent": state.tokens_spent,
         },

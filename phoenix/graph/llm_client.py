@@ -249,8 +249,16 @@ def decide_hypotheses(
     Every response that came back is counted, including the structured attempt
     when the fallback is the one that answered: both calls were billed.
 
-    Never raises: an unrecoverable LLM response yields an empty DiagnoserOutput,
-    and a call that produced no response at all costs nothing to count.
+    The guarantee here is narrow, and stated exactly because it is narrow: no
+    unusable RESPONSE takes the run down. Every response that cannot be read
+    yields an empty DiagnoserOutput, and a call that produced no response at all
+    costs nothing to count. It says nothing about the evidence handed in: an
+    item without a source, iteration or summary raises KeyError from the summary
+    this function builds for the prompt, on purpose, because the observer's own
+    state is the one input here that is allowed to be trusted. Swallowing that
+    would turn a broken observer into a diagnoser that reports no hypotheses
+    because it could not read the evidence, and the run would end looking like a
+    clean all-clear.
     """
     summary = [
         {"source": e["source"], "iteration": e["iteration"], "summary": e["summary"]}
