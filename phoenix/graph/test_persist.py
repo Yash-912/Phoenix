@@ -210,6 +210,42 @@ def _allowed_sources(migration: str) -> set[str]:
     return set(re.findall(r"'([a-z_]+)'", check))
 
 
+TABLE_CONSTRAINT_STARTS = {
+    "CHECK",
+    "CONSTRAINT",
+    "EXCLUDE",
+    "FOREIGN",
+    "PRIMARY",
+    "UNIQUE",
+}
+
+
+def _created_columns(migration: str) -> dict[str, set[str]]:
+    """The columns a migration's CREATE TABLE statements declare, by table.
+
+    Reads the file rather than a copy of it, because a hand-kept list of columns
+    is only as honest as the last person to edit the schema. Table-level
+    constraints share the block with the columns and are skipped, so PRIMARY KEY
+    or CHECK on its own line is not mistaken for a column named after it.
+    """
+    sql = (INIT_DIR / migration).read_text(encoding="utf-8")
+    columns: dict[str, set[str]] = {}
+    for table, body in re.findall(r"CREATE TABLE (\w+) \((.*?)\n\);", sql, re.DOTALL):
+        declared = set()
+        for line in body.splitlines():
+            tokens = line.split()
+            if tokens and tokens[0].upper() not in TABLE_CONSTRAINT_STARTS:
+                declared.add(tokens[0].strip('"'))
+        columns[table] = declared
+    return columns
+
+
+def _insert_columns(statement: str) -> tuple[str, set[str]]:
+    """The table and column list one of the module's INSERT statements names."""
+    table, columns = re.search(r"INSERT INTO (\w+) \(([^)]*)\)", statement).groups()
+    return table, set(re.findall(r"\w+", columns))
+
+
 def _evidence_spy(monkeypatch) -> list[tuple[int, dict]]:
     """Replace the observer's evidence writer, keeping its real signature."""
     calls: list[tuple[int, dict]] = []
@@ -475,6 +511,56 @@ def test_the_widening_is_load_bearing_because_the_original_check_rejects_every_t
     assert not set(nodes.TOOL_DISPATCH) & original
 
 
+def test_the_columns_the_module_inserts_are_the_columns_002_actually_created():
+    created = _created_columns("002_evidence_hypotheses_audit.sql")
+
+    assert created["evidence"] >= {
+        "id",
+        "incident_id",
+        "source",
+        "iteration",
+        "collected_at",
+        "summary",
+        "raw_data",
+    }
+    assert created["hypotheses"] >= {
+        "id",
+        "incident_id",
+        "iteration",
+        "created_at",
+        "description",
+        "score",
+        "score_breakdown",
+    }
+    assert created["audit_log"] >= {
+        "id",
+        "incident_id",
+        "created_at",
+        "node",
+        "event_type",
+        "detail",
+        "reasoning_text",
+    }
+
+    for statement in (persist.INSERT_EVIDENCE, persist.INSERT_HYPOTHESIS, persist.INSERT_AUDIT):
+        table, columns = _insert_columns(statement)
+        assert columns
+        assert columns <= created[table]
+
+
+def test_the_command_the_docstring_names_applies_a_migration_that_exists_on_disk():
+    command = next(line.strip() for line in persist.__doc__.splitlines() if "psql" in line)
+
+    assert command == (
+        "docker compose exec -T postgres psql -U phoenix -d phoenix "
+        "-f /docker-entrypoint-initdb.d/004_evidence_source_widen.sql"
+    )
+    migration = command.rsplit("/docker-entrypoint-initdb.d/", 1)[1]
+    assert (INIT_DIR / migration).is_file()
+    assert set(nodes.TOOL_DISPATCH) <= _allowed_sources(migration)
+    assert "docker-entrypoint-initdb.d" in persist.__doc__
+
+
 def test_the_evidence_source_is_the_tool_name_the_observer_recorded(monkeypatch):
     recorder = _live(monkeypatch)
 
@@ -514,12 +600,39 @@ def test_closing_persistence_closes_the_pool_it_opened(monkeypatch):
     assert persist._pool is None
 
 
-def test_closing_persistence_with_nothing_opened_is_harmless(monkeypatch):
-    _live(monkeypatch)
+def test_closing_does_not_forgive_a_pool_that_could_never_be_built(monkeypatch, capsys):
+    recorder = _stub_driver(monkeypatch)
 
+    persist.record_audit(INCIDENT, "observer", "observer_pass", {}, None)
     persist.close_persistence()
 
     assert persist._pool is None
+    assert persist._pool_error is not None
+
+    assert persist.record_audit(INCIDENT, "router", "continuing", {}, None) is None
+
+    assert persist._pool is None
+    assert recorder.pools == []
+    assert capsys.readouterr().out.count("DATABASE_URL is not set") == 1
+
+
+def test_a_write_after_a_plain_close_reopens_a_pool(monkeypatch):
+    recorder = _live(monkeypatch)
+
+    persist.record_audit(INCIDENT, "observer", "observer_pass", {}, None)
+    first = recorder.pools[0]
+    persist.close_persistence()
+
+    assert first.closed is True
+    assert persist._pool is None
+    assert persist._pool_error is None
+
+    persist.record_audit(INCIDENT, "router", "continuing", {}, None)
+
+    assert len(recorder.pools) == 2
+    assert recorder.pools[1] is not first
+    assert recorder.pools[1].opened is True
+    assert persist._pool is recorder.pools[1]
 
 
 def test_every_writer_returns_when_there_is_no_database_url(monkeypatch, capsys):
@@ -567,6 +680,51 @@ def test_a_database_that_refuses_a_row_is_reported_once_not_once_per_row(monkeyp
     assert len(recorder.statements) == 5
     assert printed.count("CHECK constraint failed") == 1
     assert "evidence row from 'query_prometheus' not written" in printed
+
+
+def test_a_second_cause_on_one_table_is_named_and_not_silenced_by_the_first(monkeypatch, capsys):
+    recorder = _live(monkeypatch, execute_error=RuntimeError("CHECK constraint failed"))
+
+    persist.record_evidence(INCIDENT, EVIDENCE_ITEM)
+    recorder.execute_error = TimeoutError("could not connect to server")
+    persist.record_evidence(INCIDENT, {**EVIDENCE_ITEM, "source": "query_loki"})
+
+    printed = capsys.readouterr().out
+    assert "CHECK constraint failed" in printed
+    assert "could not connect to server" in printed
+
+
+def test_two_failures_that_read_the_same_are_still_two_causes(monkeypatch, capsys):
+    recorder = _live(monkeypatch, execute_error=RuntimeError("server closed the connection"))
+
+    persist.record_evidence(INCIDENT, EVIDENCE_ITEM)
+    recorder.execute_error = ConnectionError("server closed the connection")
+    persist.record_evidence(INCIDENT, EVIDENCE_ITEM)
+
+    assert capsys.readouterr().out.count("server closed the connection") == 2
+
+
+def test_one_cause_repeated_on_one_table_is_named_once(monkeypatch, capsys):
+    recorder = _live(monkeypatch, execute_error=RuntimeError("row rejected"))
+
+    for _ in range(3):
+        assert persist.record_evidence(INCIDENT, EVIDENCE_ITEM) is None
+
+    assert capsys.readouterr().out.count("row rejected") == 1
+
+
+def test_one_cause_is_named_on_every_table_it_reached_not_only_the_first(monkeypatch, capsys):
+    recorder = _live(monkeypatch, execute_error=RuntimeError("row rejected"))
+
+    persist.record_evidence(INCIDENT, EVIDENCE_ITEM)
+    persist.record_hypotheses(INCIDENT, [SCORED_CRASH])
+    persist.record_audit(INCIDENT, "observer", "observer_pass", {}, None)
+
+    printed = capsys.readouterr().out
+    assert printed.count("row rejected") == 3
+    assert "evidence row from 'query_prometheus' not written" in printed
+    assert "hypothesis row not written" in printed
+    assert "audit row for observer/observer_pass not written" in printed
 
 
 def test_one_refused_hypothesis_row_does_not_abandon_the_rest_of_the_ranking(monkeypatch):

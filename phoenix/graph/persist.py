@@ -14,7 +14,7 @@ be added to it, however reasonable the reason looks at the time.
 
 A database that is missing, unreachable, or unhappy does not cost an
 investigation. The diagnosis is the product; the trail is a record of it. So
-every public function here degrades instead of raising, and says once per table
+every public function here degrades instead of raising, and says once per cause
 what it could not do. What that buys is a run that finishes on time with its
 findings intact. What it costs is that a run can end with no trail at all, and
 the only evidence of that is a line on stdout -- which is why the diagnostic
@@ -25,10 +25,22 @@ spells it. 002_evidence_hypotheses_audit.sql constrained that column to
 ('prometheus', 'loki', 'docker'); 004_evidence_source_widen.sql widens it to the
 five tool names the observer actually uses. Until that migration has run on the
 database, its CHECK rejects every row this module writes -- a migration to
-apply, not a write to retry.
+apply, not a write to retry, and a run in that state still finishes on time with
+no trail at all. Apply it with:
+
+    docker compose exec -T postgres psql -U phoenix -d phoenix -f /docker-entrypoint-initdb.d/004_evidence_source_widen.sql
+
+Running that by hand is the normal case rather than the exception. Everything
+mounted into /docker-entrypoint-initdb.d executes only when the postgres-data
+volume is first created, so a volume that predates the file never sees it and the
+constraint on evidence.source is still the old one -- the file sitting on disk
+says nothing about whether the database has run it. The error printed for a
+refused row names the constraint, which is how a run tells a migration to apply
+apart from a write to retry.
 """
 
 import os
+from collections.abc import Hashable
 from datetime import datetime
 
 from phoenix.graph.schemas import ScoredHypothesis
@@ -55,16 +67,32 @@ VALUES (%(incident_id)s, %(node)s, %(event_type)s, %(detail)s, %(reasoning_text)
 
 _pool = None
 _pool_error: str | None = None
-_reported: set[str] = set()
+_reported: set[Hashable] = set()
 
 
-def _diagnose(once: str, reason: str) -> None:
-    """Say a persistence problem once, not once per row.
+def _failure_key(table: str, exc: BaseException) -> tuple[str, type[BaseException], str]:
+    """What makes one failed write a different failure from the one before it.
 
     A run writes an evidence row per tool call and an audit row per node pass,
-    so a database that is down fails dozens of times for one reason. A line per
-    failure would bury the reason in its own symptom. The key is the table or
-    the cause, never the row, so a genuine second failure is still reported.
+    so a database that is down fails dozens of times for a single reason, and a
+    line per failure would bury the reason in its own symptom. Keying on the
+    table alone silences that, but it over-silences: the first CHECK violation on
+    evidence.source would be the last word on that table for the rest of the
+    run, and a later disconnection would go unnamed, leaving a trail that is
+    partial with no hint of what stopped it.
+
+    The exception's class and its message say whether this is the same failure
+    arriving again or a new one, and the row is never part of the answer -- a
+    row-per-row key would print every failure and say nothing.
+    """
+    return (table, exc.__class__, str(exc))
+
+
+def _diagnose(once: Hashable, reason: str) -> None:
+    """Say a persistence problem once per cause, not once per row.
+
+    once is a failure key from _failure_key, or the pool's own message when the
+    pool could never be built: either way it names a cause rather than a row.
     """
     if once in _reported:
         return
@@ -181,7 +209,7 @@ def record_evidence(incident_id: int, evidence_item: dict) -> None:
         )
     except Exception as exc:
         _diagnose(
-            "evidence",
+            _failure_key("evidence", exc),
             f"evidence row from {evidence_item.get('source')!r} not written: {exc}",
         )
 
@@ -231,7 +259,7 @@ def record_hypotheses(
                 },
             )
         except Exception as exc:
-            _diagnose("hypotheses", f"hypothesis row not written: {exc}")
+            _diagnose(_failure_key("hypotheses", exc), f"hypothesis row not written: {exc}")
 
 
 def record_audit(
@@ -269,7 +297,8 @@ def record_audit(
         )
     except Exception as exc:
         _diagnose(
-            "audit_log", f"audit row for {node}/{event_type} not written: {exc}"
+            _failure_key("audit_log", exc),
+            f"audit row for {node}/{event_type} not written: {exc}",
         )
 
 
@@ -280,9 +309,16 @@ def close_persistence() -> None:
     write, so the pool is the only thing here that outlives a function call and
     the only thing a caller has to hand back.
 
-    Closing is not permanent: the module treats the database as reachable for as
-    long as the process lives, so a write after this opens a fresh pool. Call it
-    when the run is over, not to disable persistence.
+    Closing is not permanent, but it is not a reset either. After a plain close
+    the module still treats the database as reachable, so a later write builds a
+    fresh pool. A pool that could never be built is the exception: _get_pool
+    short-circuits on the recorded _pool_error and nothing here clears it, so a
+    process whose database was unreachable stays without a trail for the life of
+    the process instead of rebuilding a pool on every row it still has left to
+    write. That latch is deliberate -- it is what keeps a degraded run quiet --
+    and it is why close_persistence cannot be relied on to forgive a database
+    that was already gone. Call it when the run is over, not to disable
+    persistence.
     """
     global _pool
     pool, _pool = _pool, None
