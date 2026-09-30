@@ -37,7 +37,7 @@ def _state(**overrides) -> AgentState:
     return AgentState(incident_id=1, service_name=SERVICE, **overrides)
 
 
-def _settled_remediation(monkeypatch, outcome: str = "pass", **detail) -> None:
+def _settled_remediation(monkeypatch, outcome="pass", **detail) -> None:
     """Neutralize everything downstream of the router's confidence branch.
 
     That branch now routes to the remediator instead of to END, so a test which
@@ -46,17 +46,37 @@ def _settled_remediation(monkeypatch, outcome: str = "pass", **detail) -> None:
     can reach is replaced here rather than in each test, so a future node added
     to that path fails loudly in one place instead of quietly reaching the
     Docker socket from a test that never meant to touch it.
+
+    outcome may be a single verdict or a list of them consumed in order, which
+    is how a run that fails its first check and passes its second is described.
     """
+    verdicts = list(outcome) if isinstance(outcome, list) else None
+
+    def run_check(*args):
+        if verdicts is None:
+            return outcome, {"reason": "stubbed", **detail}
+        verdict = verdicts.pop(0) if verdicts else outcome
+        return verdict, {"reason": "stubbed", "outcome": verdict, **detail}
+
     monkeypatch.setitem(
         dispatch.REMEDIATION_DISPATCH, "restart_service", lambda name: {"status": "ok"}
     )
     monkeypatch.setattr(verification, "read_signal", lambda category, service: SNAPSHOT)
-    monkeypatch.setattr(
-        verification,
-        "run_check",
-        lambda *a: (outcome, {"reason": "stubbed", **detail}),
-    )
+    monkeypatch.setattr(verification, "run_check", run_check)
     monkeypatch.setattr(nodes.time, "sleep", lambda seconds: None)
+
+
+def _no_action_reachable(monkeypatch) -> list[str]:
+    """A dispatch table whose only action fails the test if it is ever reached."""
+    reached: list[str] = []
+
+    def forbidden(name: str) -> dict:
+        reached.append(name)
+        raise AssertionError(f"{name} was dispatched by a run that must not act")
+
+    monkeypatch.setitem(dispatch.REMEDIATION_DISPATCH, "restart_service", forbidden)
+    monkeypatch.setattr(nodes.time, "sleep", lambda seconds: None)
+    return reached
 
 
 def _final(result) -> dict:
@@ -262,3 +282,245 @@ def test_the_compiled_graph_returns_to_the_observer_when_the_router_loops_back(m
     assert final["confidence"] == 0.9
     assert final["status"] == "resolved"
     assert len(final["evidence"]) == 2
+
+
+# --- the whole remediate-and-verify loop, through the compiled graph -----------
+#
+# Everything above drives the router and the nodes separately. These drive the
+# compiled graph, because the failure they exist to catch cannot happen in a
+# unit test: a node that mutates state in place instead of returning it in its
+# Command.update passes every test in isolation and drops the whole effect on the
+# way to the final state. In particular a dropped remediation_attempts would let
+# the run restart a service forever, and a dropped planned_action would leave the
+# verifier with nothing to check. Neither is visible until the nodes are joined
+# by real edges.
+
+DEPLOY_ROLLOUT = {"status": "success", "text": "image checkout:v18, rollout complete"}
+PROBE_FAILING = {"status": "success", "text": "readiness probe failing, cpu at 98%"}
+
+
+def _confident_crash(monkeypatch, calls: list[str] | None = None, passes: int = 1):
+    """A run that reaches the confidence threshold on its first pass."""
+
+    def fake_tool_calls(service_name, evidence_so_far, evidence_requests):
+        if calls is not None:
+            calls.append("observer")
+        return ToolCallDecision(
+            [
+                {"name": "query_prometheus", "arguments": {"promql": "up == 0"}},
+                {"name": "query_loki", "arguments": {"logql": '{container="x"}'}},
+            ],
+            1,
+        )
+
+    def fake_hypotheses(service_name, evidence_so_far):
+        if calls is not None:
+            calls.append("diagnoser")
+        return HypothesisDecision(
+            DiagnoserOutput(hypotheses=[Hypothesis(description="it crashed", category="crash")]),
+            1,
+        )
+
+    monkeypatch.setattr(nodes, "decide_tool_calls", fake_tool_calls)
+    monkeypatch.setattr(nodes, "decide_hypotheses", fake_hypotheses)
+    monkeypatch.setitem(nodes.TOOL_DISPATCH, "query_prometheus", lambda args: SERVICE_DOWN)
+    monkeypatch.setitem(nodes.TOOL_DISPATCH, "query_loki", lambda args: PANIC)
+
+
+def _confident_deploy(monkeypatch):
+    """A run whose finding is a deploy, which no Tier 1 action can fix."""
+
+    def fake_tool_calls(service_name, evidence_so_far, evidence_requests):
+        return ToolCallDecision(
+            [
+                {"name": "get_recent_deployments", "arguments": {"service_name": SERVICE}},
+                {"name": "inspect_health", "arguments": {"service_name": SERVICE}},
+            ],
+            1,
+        )
+
+    def fake_hypotheses(service_name, evidence_so_far):
+        return HypothesisDecision(
+            DiagnoserOutput(
+                hypotheses=[Hypothesis(description="the v18 rollout broke it", category="deploy")]
+            ),
+            1,
+        )
+
+    monkeypatch.setattr(nodes, "decide_tool_calls", fake_tool_calls)
+    monkeypatch.setattr(nodes, "decide_hypotheses", fake_hypotheses)
+    monkeypatch.setitem(nodes.TOOL_DISPATCH, "get_recent_deployments", lambda args: DEPLOY_ROLLOUT)
+    monkeypatch.setitem(nodes.TOOL_DISPATCH, "inspect_health", lambda args: PROBE_FAILING)
+
+
+def test_a_confident_crash_run_restarts_once_and_ends_resolved(monkeypatch):
+    calls: list[str] = []
+    _confident_crash(monkeypatch, calls)
+    _settled_remediation(monkeypatch)
+
+    final = _final(
+        graph.build_graph().invoke(_state(token_budget=100000, max_iterations=5))
+    )
+
+    assert calls == ["observer", "diagnoser"]
+    assert final["remediation_attempts"] == 1
+    assert final["planned_action"]["action"] == "restart_service"
+    assert final["planned_action"]["check"] == "crash"
+    assert final["verification_result"]["outcome"] == "pass"
+    assert final["status"] == "resolved"
+    assert final.get("escalation_reason") is None
+
+
+def test_a_deploy_finding_cannot_clear_the_threshold_so_it_never_reaches_the_remediator(
+    monkeypatch,
+):
+    """A pinned gap, kept as a test so it fails loudly when it is closed.
+
+    The spec wants a confident finding with no Tier 1 action to end as
+    action_unavailable rather than as an escalation. That outcome is unreachable
+    through the real graph today, because the only categories CATEGORY_ACTIONS
+    leaves without an action -- deploy, config, network, unknown -- are also the
+    ones scoring cannot lift to 0.75: deploy's evidence weights cap it at 0.15.
+    The run therefore loops to the iteration cap and escalates for being
+    inconclusive, which is the opposite of the finding: the operator is told the
+    agent gave up rather than that it diagnosed a deploy and knew it needed a
+    human.
+
+    What is asserted here is the safety half, which does hold, plus the fact that
+    keeps the gap visible. The action_unavailable branch itself is proven at the
+    node level in test_nodes.py. Closing this properly means deciding whether a
+    no-action category should be held to the remediation threshold at all, which
+    is a scoring-policy change and not a test change -- so it is deliberately not
+    papered over here by tuning evidence or the threshold to make it pass.
+    """
+    reached = _no_action_reachable(monkeypatch)
+    _confident_deploy(monkeypatch)
+
+    final = _final(
+        graph.build_graph().invoke(_state(token_budget=100000, max_iterations=5))
+    )
+
+    assert reached == []
+    assert final["confidence"] < final["confidence_threshold"]
+    assert final["status"] == "escalated"
+    assert final["status"] != "resolved"
+    assert final["remediation_attempts"] == 0
+    assert final.get("verification_result") is None
+
+
+def test_a_guarded_run_reaches_the_remediator_and_takes_no_action(monkeypatch):
+    reached = _no_action_reachable(monkeypatch)
+    _confident_crash(monkeypatch)
+
+    final = _final(
+        graph.build_graph().invoke(
+            _state(policy_mode="guarded", token_budget=100000, max_iterations=5)
+        )
+    )
+
+    assert reached == []
+    assert final["status"] == "escalated"
+    assert "guarded" in final["escalation_reason"]
+    assert final["remediation_attempts"] == 0
+
+
+def test_a_check_it_cannot_make_escalates_and_never_claims_the_service_recovered(monkeypatch):
+    """The one property the whole module exists for: an unmeasurable outcome is
+    not a success. If this ever passes with a resolved run, the agent is
+    reporting recovery it did not observe."""
+    _confident_crash(monkeypatch)
+    _settled_remediation(monkeypatch, "inconclusive")
+
+    final = _final(
+        graph.build_graph().invoke(_state(token_budget=100000, max_iterations=5))
+    )
+
+    assert final["status"] == "escalated"
+    assert final["status"] != "resolved"
+    assert final["verification_result"]["outcome"] == "inconclusive"
+    assert final["escalation_reason"]
+
+
+def test_a_check_that_fails_comes_back_for_another_attempt_and_then_resolves(monkeypatch):
+    """Proves remediation_attempts actually survives the graph. If the node
+    mutated its copy instead of returning the increment, this run would restart
+    the service on every pass and never reach a second, counted attempt."""
+    calls: list[str] = []
+    passes = {"n": 0}
+
+    def fake_tool_calls(service_name, evidence_so_far, evidence_requests):
+        passes["n"] += 1
+        calls.append("observer")
+        return ToolCallDecision(
+            [
+                {"name": "query_prometheus", "arguments": {"promql": "up == 0"}},
+                {"name": "query_loki", "arguments": {"logql": '{container="x"}'}},
+            ],
+            1,
+        )
+
+    def fake_hypotheses(service_name, evidence_so_far):
+        calls.append("diagnoser")
+        return HypothesisDecision(
+            DiagnoserOutput(hypotheses=[Hypothesis(description="it crashed", category="crash")]),
+            1,
+        )
+
+    monkeypatch.setattr(nodes, "decide_tool_calls", fake_tool_calls)
+    monkeypatch.setattr(nodes, "decide_hypotheses", fake_hypotheses)
+    monkeypatch.setitem(nodes.TOOL_DISPATCH, "query_prometheus", lambda args: SERVICE_DOWN)
+    monkeypatch.setitem(nodes.TOOL_DISPATCH, "query_loki", lambda args: PANIC)
+    _settled_remediation(monkeypatch, ["fail", "pass"])
+
+    final = _final(
+        graph.build_graph().invoke(_state(token_budget=100000, max_iterations=10))
+    )
+
+    assert passes["n"] == 2
+    assert calls == ["observer", "diagnoser", "observer", "diagnoser"]
+    assert final["remediation_attempts"] == 2
+    assert final["verification_result"]["outcome"] == "pass"
+    assert final["status"] == "resolved"
+    assert final.get("escalation_reason") is None
+
+
+def test_a_run_that_keeps_failing_stops_at_the_attempt_cap_instead_of_looping_forever(
+    monkeypatch,
+):
+    """The cap is the thing that bounds how much damage a service can take. If
+    the increment were dropped this test would run to the iteration cap instead,
+    which is a different failure with the same symptom of taking too long."""
+    passes = {"n": 0}
+
+    def fake_tool_calls(service_name, evidence_so_far, evidence_requests):
+        passes["n"] += 1
+        return ToolCallDecision(
+            [
+                {"name": "query_prometheus", "arguments": {"promql": "up == 0"}},
+                {"name": "query_loki", "arguments": {"logql": '{container="x"}'}},
+            ],
+            1,
+        )
+
+    def fake_hypotheses(service_name, evidence_so_far):
+        return HypothesisDecision(
+            DiagnoserOutput(hypotheses=[Hypothesis(description="it crashed", category="crash")]),
+            1,
+        )
+
+    monkeypatch.setattr(nodes, "decide_tool_calls", fake_tool_calls)
+    monkeypatch.setattr(nodes, "decide_hypotheses", fake_hypotheses)
+    monkeypatch.setitem(nodes.TOOL_DISPATCH, "query_prometheus", lambda args: SERVICE_DOWN)
+    monkeypatch.setitem(nodes.TOOL_DISPATCH, "query_loki", lambda args: PANIC)
+    _settled_remediation(monkeypatch, "fail")
+
+    final = _final(
+        graph.build_graph().invoke(
+            _state(token_budget=100000, max_iterations=50, max_remediation_attempts=2)
+        )
+    )
+
+    assert passes["n"] == 2
+    assert final["remediation_attempts"] == 2
+    assert final["status"] == "escalated"
+    assert "attempt" in final["escalation_reason"]

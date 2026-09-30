@@ -319,6 +319,7 @@ def _escalate(
     event_type: str,
     reason: str,
     print_line: str,
+    extra: dict | None = None,
 ) -> Command:
     """Stop the run with a named reason, on the audit trail before it stops.
 
@@ -328,6 +329,11 @@ def _escalate(
     the row is what an operator reads afterwards and the field is what the
     caller reads immediately, and two different strings for one event is how a
     postmortem ends up arguing with itself.
+
+    extra carries whatever else the caller needs to survive into the final
+    state. The verifier passes its verdict this way, because an escalation whose
+    final state does not say what the check actually found is the one row an
+    operator has to act on with no information attached to it.
     """
     print(f"[remediator] {print_line} -> end (escalate)")
     record_audit(
@@ -343,7 +349,10 @@ def _escalate(
         },
         reason,
     )
-    return Command(goto=END, update={"status": "escalated", "escalation_reason": reason})
+    return Command(
+        goto=END,
+        update={"status": "escalated", "escalation_reason": reason, **(extra or {})},
+    )
 
 
 def remediator_node(state: AgentState) -> Command:
@@ -565,10 +574,14 @@ def verifier_node(state: AgentState) -> Command:
             f"{state.remediation_attempts}/{state.max_remediation_attempts} "
             f"attempts"
         )
-        return _escalate(state, "verification_failed", reason, reason)
+        return _escalate(
+            state, "verification_failed", reason, reason, extra={"verification_result": verification_result}
+        )
 
     reason = (
         f"the {category} check could not confirm recovery: "
         f"{detail.get('reason') if isinstance(detail, dict) else detail}"
     )
-    return _escalate(state, "verification_failed", reason, reason)
+    return _escalate(
+        state, "verification_failed", reason, reason, extra={"verification_result": verification_result}
+    )
