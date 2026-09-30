@@ -53,12 +53,50 @@ CATEGORY_KEYWORDS: dict[str, list[str]] = {
 }
 
 
+def _is_failure(payload) -> bool:
+    """True of the error envelope the five read-only tools write when a read fails.
+
+    Four of them write it flat -- phoenix/tools/prometheus_tool.py, loki_tool.py,
+    docker_tool.py and deploy_tool.py all return
+    ``{"status": "error", "error": <message>}`` -- and inspect_health nests one
+    under container and one under app, so the same envelope arrives a level down
+    in the one tool that asks two systems a question.
+
+    Both parts of the envelope are required. A status field alone is not a
+    failure: a successful Prometheus response says "status": "success" at the
+    top and a metric inside its data can be labelled status="error" all day, and
+    a payload that only looked like a failure would be discarded as if the read
+    had never happened.
+    """
+    return isinstance(payload, dict) and payload.get("status") == "error" and "error" in payload
+
+
 def _is_usable(evidence_item: dict) -> bool:
-    """Usable = collection succeeded (not our {'status':'error'} envelope)."""
+    """Usable = the read returned something, rather than failing.
+
+    A failure is not a weaker measurement, it is no measurement. What it carries
+    is the transport's own complaint -- "Connection refused", "Read timed out" --
+    and both are network keywords below, so scoring a failure would let a broken
+    read satisfy the network category, count toward sources_supporting, and
+    suppress the contradiction penalty for a hypothesis that nothing observed.
+    A failed measurement making a guess look better-supported than no measurement
+    at all is the one direction this module must never be wrong in.
+
+    So a payload is dropped when it is itself the error envelope, and when every
+    sub-read nested one level inside it is: that is inspect_health having reached
+    neither the container nor the app, which is a read that reached nothing. A
+    read that answered on any one channel is kept -- inspect_health that reached
+    the container but not /health still measured the container, and throwing that
+    away over a missing health probe would cost the crash signal this whole
+    module exists to find.
+    """
     raw = evidence_item.get("raw_data", {})
     if not isinstance(raw, dict):
         return True
-    return raw.get("status") != "error"
+    if _is_failure(raw):
+        return False
+    sub_reads = [value for value in raw.values() if isinstance(value, dict)]
+    return not (sub_reads and all(_is_failure(sub_read) for sub_read in sub_reads))
 
 
 def _content_summary(evidence_item: dict) -> str:

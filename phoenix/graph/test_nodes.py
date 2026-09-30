@@ -91,6 +91,53 @@ def _state(evidence: list[dict]) -> AgentState:
     return AgentState(incident_id=1, service_name=SERVICE, evidence=evidence)
 
 
+def _trail_spy(monkeypatch) -> tuple[list[dict], list[dict]]:
+    """Replace both writers so a test can read the trail without a database."""
+    evidence: list[dict] = []
+    audit: list[dict] = []
+
+    def record_evidence(incident_id, evidence_item):
+        evidence.append(evidence_item)
+
+    def record_audit(incident_id, node, event_type, detail, reasoning_text):
+        audit.append(detail)
+
+    monkeypatch.setattr(nodes, "record_evidence", record_evidence)
+    monkeypatch.setattr(nodes, "record_audit", record_audit)
+    return evidence, audit
+
+
+def _loki_wanting_an_int(monkeypatch, received: list[tuple]) -> None:
+    """Stand in for query_loki, refusing a minutes it cannot multiply out.
+
+    The real tool fails on a string by computing "15" * 60 * 1_000_000_000, which
+    asks the process for 120 GB before it can raise; this reproduces the refusal
+    it ends up making, without the allocation that ends the test run instead.
+    """
+    def query_loki(logql, minutes=15):
+        received.append((logql, minutes))
+        if not isinstance(minutes, int):
+            raise TypeError(
+                f"unsupported operand type(s) for -: 'int' and '{type(minutes).__name__}'"
+            )
+        return {"status": "success", "text": f"logs for {logql}"}
+
+    monkeypatch.setattr(nodes, "query_loki", query_loki)
+
+
+def _tool_failing_with(monkeypatch, exc: BaseException) -> None:
+    """Stand in for a tool that reached nothing and said so in the raised error.
+
+    A refused connection is the shape that matters: its text names the network,
+    so a failure that was mistaken for a reading would corroborate a network
+    hypothesis instead of being discarded.
+    """
+    def query_loki(logql, minutes=15):
+        raise exc
+
+    monkeypatch.setattr(nodes, "query_loki", query_loki)
+
+
 def test_node_feeds_service_name_and_evidence_to_the_hypothesis_llm(monkeypatch):
     calls = _stub_hypotheses(monkeypatch, DiagnoserOutput.model_construct(hypotheses=[]))
     state = _state(CRASH_EVIDENCE)
@@ -210,6 +257,19 @@ def test_observer_tool_allowlist_is_unchanged():
         "inspect_health",
         "get_recent_deployments",
     }
+
+
+def test_the_llm_is_offered_exactly_those_five_read_only_tools():
+    offered = [schema["function"]["name"] for schema in llm_client.TOOL_SCHEMAS]
+
+    assert offered == [
+        "query_prometheus",
+        "query_loki",
+        "get_container_state",
+        "inspect_health",
+        "get_recent_deployments",
+    ]
+    assert set(offered) == set(nodes.TOOL_DISPATCH)
 
 
 def test_state_rejects_a_wrongly_typed_hypotheses_assignment():
@@ -442,6 +502,173 @@ def test_observer_executes_what_the_llm_decides_and_nothing_outside_the_allowlis
 
     assert [e["source"] for e in state.evidence] == ["inspect_health"]
     assert state.evidence[0]["raw_data"] == {"status": "success", "text": "ok"}
+
+
+def test_a_string_where_an_int_is_expected_fails_that_call_and_ends_the_run_nothing(
+    monkeypatch, capsys
+):
+    _trail_spy(monkeypatch)
+    _loki_wanting_an_int(monkeypatch, [])
+    _stub_tool_calls(monkeypatch, [
+        {"name": "query_loki", "arguments": {"logql": '{container="x"}', "minutes": "15"}},
+    ])
+
+    state = nodes.observer_node(_state([]))
+
+    printed = capsys.readouterr().out
+    assert len(state.evidence) == 1
+    assert state.evidence[0]["source"] == "query_loki"
+    assert state.evidence[0]["raw_data"] == {
+        "status": "error",
+        "error": "TypeError: unsupported operand type(s) for -: 'int' and 'str'",
+    }
+    assert "[observer] iteration 1: query_loki(" in printed
+    assert "failed: TypeError:" in printed
+
+
+def test_a_call_missing_a_required_key_fails_that_call_and_ends_the_run_nothing(
+    monkeypatch, capsys
+):
+    _trail_spy(monkeypatch)
+    _stub_tool_calls(monkeypatch, [
+        {"name": "query_loki", "arguments": {"minutes": 15}},
+    ])
+
+    state = nodes.observer_node(_state([]))
+
+    printed = capsys.readouterr().out
+    assert [e["raw_data"] for e in state.evidence] == [
+        {"status": "error", "error": "KeyError: 'logql'"}
+    ]
+    assert "failed: KeyError: 'logql'" in printed
+
+
+def test_an_unknown_argument_name_is_left_alone_rather_than_called_a_failure(monkeypatch):
+    written, audit = _trail_spy(monkeypatch)
+    received: list[tuple] = []
+    _loki_wanting_an_int(monkeypatch, received)
+    _stub_tool_calls(monkeypatch, [
+        {"name": "query_loki", "arguments": {"logql": '{container="x"}', "minutess": 15}},
+    ])
+
+    state = nodes.observer_node(_state([]))
+
+    assert received == [('{container="x"}', 15)]
+    assert state.evidence[0]["raw_data"] == {"status": "success", "text": 'logs for {container="x"}'}
+    assert written == state.evidence
+    assert audit[0]["failed_tools"] == []
+
+
+def test_one_failed_call_does_not_cost_the_pass_the_calls_after_it(monkeypatch):
+    written, audit = _trail_spy(monkeypatch)
+    _loki_wanting_an_int(monkeypatch, [])
+    _stub_tool_calls(monkeypatch, [
+        {"name": "query_loki", "arguments": {"logql": '{container="x"}', "minutes": "15"}},
+        {"name": "query_prometheus", "arguments": {"promql": "up == 0"}},
+        {"name": "query_loki", "arguments": {"logql": '{container="y"}', "minutes": 5}},
+    ])
+    monkeypatch.setitem(
+        nodes.TOOL_DISPATCH,
+        "query_prometheus",
+        lambda args: {"status": "success", "text": "ServiceDown firing"},
+    )
+
+    state = nodes.observer_node(_state([]))
+
+    assert [e["source"] for e in state.evidence] == [
+        "query_loki", "query_prometheus", "query_loki"
+    ]
+    assert state.evidence[1]["raw_data"] == {"status": "success", "text": "ServiceDown firing"}
+    assert state.evidence[2]["raw_data"] == {"status": "success", "text": 'logs for {container="y"}'}
+    assert written == state.evidence
+    assert audit[0]["dispatched_tools"] == [
+        "query_loki", "query_prometheus", "query_loki"
+    ]
+    assert audit[0]["failed_tools"] == ["query_loki"]
+    assert audit[0]["evidence_collected"] == 3
+
+
+def test_a_failed_call_is_not_something_the_scorer_can_score(monkeypatch):
+    _trail_spy(monkeypatch)
+    _loki_wanting_an_int(monkeypatch, [])
+    _stub_tool_calls(monkeypatch, [
+        {"name": "query_loki", "arguments": {"logql": '{container="x"}', "minutes": "15"}},
+    ])
+
+    state = nodes.observer_node(_state([]))
+
+    score, breakdown = scoring.score_hypothesis(
+        state.evidence, Hypothesis(description="the network dropped", category="network")
+    )
+    assert breakdown["sources_supporting"] == 0
+    assert score == 0.0
+
+
+def test_a_failure_whose_text_names_the_category_is_still_not_evidence(monkeypatch):
+    """A failed read must not score, even when its error text matches the category.
+
+    A refused connection reads "Connection refused", which is a network keyword.
+    If the failure envelope were ever treated as usable, this exact text would
+    satisfy a network hypothesis, raise sources_supporting, and suppress the
+    contradiction penalty -- so a read that reached nothing would look like
+    better evidence than no read at all. The text is chosen to make that
+    specific wrong answer reachable.
+    """
+    _trail_spy(monkeypatch)
+    _tool_failing_with(monkeypatch, ConnectionError("Connection refused by peer"))
+    _stub_tool_calls(monkeypatch, [
+        {"name": "query_loki", "arguments": {"logql": '{container="x"}', "minutes": 15}},
+    ])
+
+    state = nodes.observer_node(_state([]))
+
+    assert state.evidence[0]["raw_data"]["error"] == "ConnectionError: Connection refused by peer"
+
+    score, breakdown = scoring.score_hypothesis(
+        state.evidence, Hypothesis(description="the network dropped", category="network")
+    )
+    assert breakdown["sources_supporting"] == 0
+    assert score == 0.0
+
+
+def test_a_failure_cannot_suppress_the_contradiction_penalty(monkeypatch):
+    """A failure must not rescue a guess that the real reads all contradict.
+
+    The penalty only bites at two or more distinct sources that support nothing,
+    so a test with a single failure cannot see it. Two real reads that match
+    nothing, plus a failure whose text would match if it were counted, is the
+    shape that matters: counting the failure lifts sources_supporting to one and
+    the penalty vanishes, turning a contradicted guess into a corroborated one.
+    """
+    _trail_spy(monkeypatch)
+    _tool_failing_with(monkeypatch, ConnectionError("Connection refused by peer"))
+    _stub_tool_calls(monkeypatch, [
+        {"name": "query_loki", "arguments": {"logql": '{container="x"}', "minutes": 15}},
+    ])
+
+    def _clean_read(source: str, text: str) -> dict:
+        return {
+            "iteration": 1,
+            "source": source,
+            "collected_at": "2026-01-01T00:00:00+00:00",
+            "summary": f"{source}()",
+            "raw_data": {"status": "success", "text": text},
+        }
+
+    contradicted = [
+        _clean_read("get_container_state", "container up, restart count 0"),
+        _clean_read("get_recent_deployments", "no releases in the last 24 hours"),
+    ]
+    network = Hypothesis(description="the network dropped", category="network")
+
+    without = scoring.score_hypothesis(contradicted, network)
+    with_failure = nodes.observer_node(_state(contradicted))
+    after = scoring.score_hypothesis(with_failure.evidence, network)
+
+    assert without[1]["contradiction_penalty"] > 0.0
+    assert after[1]["contradiction_penalty"] == without[1]["contradiction_penalty"]
+    assert after[1]["sources_supporting"] == 0
+    assert after[0] == without[0]
 
 
 def test_state_rejects_a_wrongly_typed_needs_evidence_assignment():

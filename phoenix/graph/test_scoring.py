@@ -177,3 +177,96 @@ def test_score_all_sorts_best_first_and_confidence():
     assert ranked[1][1] == 0.0
     assert top_confidence(ev, [h_wrong, h_right]) == 0.4
     assert top_confidence([], []) == 0.0
+
+
+FAILED_HEALTH = {
+    "container": {"status": "error", "error": "Connection refused by the docker-socket-proxy"},
+    "app": {"status": "error", "error": "HTTPConnectionPool(host='localhost'): Read timed out."},
+}
+
+DEGRADED_HEALTH = {
+    "container": {"status": "error", "error": "Connection refused by the docker-socket-proxy"},
+    "app": {"status": "degraded", "detail": "upstream connection refused by payment-service"},
+}
+
+DEAD_CONTAINER = {
+    "container": {"State": {"Status": "exited", "ExitCode": 1}},
+    "app": {"status": "error", "error": "HTTPConnectionPool(host='localhost'): Read timed out."},
+}
+
+
+def _health_ev(raw_data: dict) -> dict:
+    """An inspect_health item carrying what the tool really returns.
+
+    The payload is quoted from phoenix/tools/health_tool.py: four of the five
+    read-only tools write their failure envelope flat, and inspect_health is the
+    one that asks two systems a question, so a read that reached neither arrives
+    as an envelope under container and the same envelope again under app.
+    """
+    return {"iteration": 1, "source": "inspect_health",
+            "collected_at": "2026-01-01T00:00:00+00:00",
+            "summary": "inspect_health({'service_name': 'checkout-service'})",
+            "raw_data": raw_data}
+
+
+def _prom_ev(raw_data: dict) -> dict:
+    return {"iteration": 1, "source": "query_prometheus",
+            "collected_at": "2026-01-01T00:00:00+00:00",
+            "summary": "query_prometheus({'promql': 'up'})",
+            "raw_data": raw_data}
+
+
+def test_a_health_read_that_reached_nothing_is_not_evidence():
+    h = Hypothesis(description="the network dropped", category="network")
+
+    score, bd = score_hypothesis([_health_ev(FAILED_HEALTH)], h)
+
+    assert bd["has_health_signal"] == 0
+    assert bd["sources_supporting"] == 0
+    assert score == 0.0
+
+
+def test_a_failed_read_scores_below_a_read_that_answered_and_reported_the_same_words():
+    h = Hypothesis(description="the network dropped", category="network")
+
+    failed, _ = score_hypothesis([_health_ev(FAILED_HEALTH)], h)
+    answered, bd = score_hypothesis([_health_ev(DEGRADED_HEALTH)], h)
+
+    assert bd["sources_supporting"] == 1
+    assert failed < answered
+    assert answered == 0.15
+
+
+def test_a_failed_read_does_not_suppress_the_contradiction_penalty():
+    h = Hypothesis(description="the network dropped", category="network")
+    ev = [_ev("query_prometheus", "all healthy, latency fine"),
+          _ev("query_loki", "all healthy, no errors"),
+          _health_ev(FAILED_HEALTH)]
+
+    score, bd = score_hypothesis(ev, h)
+
+    assert bd["sources_supporting"] == 0
+    assert bd["contradiction_penalty"] == 0.3
+    assert score == 0.0
+
+
+def test_a_health_read_that_answered_on_one_channel_is_still_evidence():
+    h = Hypothesis(description="the container is dead", category="crash")
+
+    score, bd = score_hypothesis([_health_ev(DEAD_CONTAINER)], h)
+
+    assert bd["has_health_signal"] == 1
+    assert score == 0.15
+
+
+def test_a_successful_prometheus_response_stays_evidence_though_a_metric_is_labelled_status_error():
+    labelled = _prom_ev({"status": "success", "data": {"resultType": "vector", "result": [
+        {"metric": {"__name__": "probe", "status": "error"},
+         "value": [1767225600, "0"]}]}})
+    h = Hypothesis(description="the v18 rollout broke it", category="deploy")
+
+    score, bd = score_hypothesis([labelled, _ev("query_loki", "all healthy, no errors")], h)
+
+    assert bd["sources_supporting"] == 0
+    assert bd["contradiction_penalty"] == 0.3
+    assert score == 0.0
