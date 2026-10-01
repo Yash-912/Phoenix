@@ -111,6 +111,36 @@ def test_a_nan_working_set_never_raises_out_of_the_check(monkeypatch):
     assert outcome in {"inconclusive", "fail", "pass"}
 
 
+def test_an_ambiguous_series_is_inconclusive_rather_than_graded_on_an_arbitrary_one(
+    monkeypatch,
+):
+    """result[0] of a multi-series match is whichever the engine ordered first.
+    Reporting a confident verdict about that series is worse than reporting
+    nothing, so an ambiguous match is refused."""
+
+    def two_series(promql: str) -> dict:
+        payload = _series("0.0") if "deriv" in promql else _series("400000000.0")
+        payload["data"]["result"].append(
+            {"metric": {"__name__": MEMORY_PROMQL, "name": SERVICE, "job": "other"}, "value": [1, "999999999"]}
+        )
+        return payload
+
+    monkeypatch.setattr(verification, "query_prometheus", two_series)
+
+    outcome, _ = verification.run_check(
+        "overload", SERVICE, {"bytes": BEFORE_BYTES, "slope": 0.0}, ACTION_AT
+    )
+
+    assert outcome == "inconclusive"
+
+
+def test_the_working_set_queries_are_scoped_to_the_job_the_alert_rule_uses():
+    """An unscoped selector can match the same container name from another job,
+    and then the check is reading an arbitrary series."""
+    assert 'job="cadvisor"' in verification._memory_promql(SERVICE)
+    assert 'job="cadvisor"' in verification._slope_promql(SERVICE)
+
+
 def test_an_infinite_slope_is_climbing_rather_than_unmeasurable(monkeypatch):
     """Distinct from NaN: +Inf is a slope that really is unbounded, which is a
     leak, not a broken query."""

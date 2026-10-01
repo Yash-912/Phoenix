@@ -52,26 +52,50 @@ SLOPE_WINDOW_MINUTES = 5
 SLOPE_TOLERANCE = 1024
 
 
+# job="cadvisor" is part of the selector rather than incidental: the alert rule
+# scopes on it, and an unscoped selector can match the same container name from
+# another job. Two series matching would mean reading an arbitrary one of them,
+# which is how a check ends up grading a restart on a series that has nothing
+# to do with the service it restarted.
+CADVISOR_JOB = "cadvisor"
+
+
 def _memory_promql(service_name: str) -> str:
-    return f'container_memory_working_set_bytes{{name="{service_name}"}}'
+    return (
+        f'container_memory_working_set_bytes'
+        f'{{name="{service_name}", job="{CADVISOR_JOB}"}}'
+    )
 
 
 def _slope_promql(service_name: str) -> str:
     return (
         f'deriv(container_memory_working_set_bytes'
-        f'{{name="{service_name}"}}[{SLOPE_WINDOW_MINUTES}m])'
+        f'{{name="{service_name}", job="{CADVISOR_JOB}"}}[{SLOPE_WINDOW_MINUTES}m])'
     )
 
 
-def _first_sample(payload) -> float | None:
-    """The value of the first vector sample, or None when there is no sample.
+def _single_sample(payload) -> float | None:
+    """The value of the one matching series, or None when there is not exactly one.
 
     The value arrives as a string because that is what Prometheus's JSON
     encodes, and a vector whose result list is empty has no sample at all --
-which is not the same as a sample of zero and must not be read as one.
+    which is not the same as a sample of zero and must not be read as one.
+
+    More than one matching series is refused rather than answered from the first.
+    Reading result[0] would silently grade a restart on whichever series the
+    query engine happened to order first, and a check that reports a confident
+    verdict about an arbitrary series is worse than one that reports nothing.
+    The selector is scoped by name and job precisely so this should not happen;
+    if it does, something is wrong with the labels and saying so is the answer.
     """
     try:
-        sample = payload["data"]["result"][0]["value"][1]
+        results = payload["data"]["result"]
+    except (KeyError, TypeError):
+        return None
+    if not isinstance(results, list) or len(results) != 1:
+        return None
+    try:
+        sample = results[0]["value"][1]
     except (KeyError, IndexError, TypeError):
         return None
     try:
@@ -89,6 +113,8 @@ which is not the same as a sample of zero and must not be read as one.
     if math.isnan(value):
         return None
     return value
+
+
 
 
 def _as_instant(moment: str | None) -> datetime | None:
@@ -151,8 +177,8 @@ def _read_memory(service_name: str) -> dict:
     if not scoring._is_usable({"raw_data": slope}):
         return {"status": "error", "error": "the working-set slope query did not return data"}
 
-    bytes_now = _first_sample(level)
-    slope_value = _first_sample(slope)
+    bytes_now = _single_sample(level)
+    slope_value = _single_sample(slope)
 
     if bytes_now is None:
         return {"status": "error", "error": "the working-set vector carried no sample"}
