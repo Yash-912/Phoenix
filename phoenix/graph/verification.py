@@ -318,14 +318,34 @@ make.
             **detail,
             "reason": f"the container is {container_state.get('Status')!r}, not running",
         }
-
+  
     app = health.get("app", {}) if isinstance(health, dict) else {}
-    if not app.get("status") or app.get("status") != "ok":
+    app_status = app.get("status")
+    if app_status != "ok":
+        # A probe that answered "I am unhealthy" and a probe that could not be
+        # reached are both non-ok, but only one of them is evidence about the
+        # service. inspect_health writes {"status": "error", "error": ...} when
+        # the request raises, and reading that as an unhealthy service would
+        # grade a restart as failed because an HTTP call timed out -- then loop
+        # back and spend another attempt on a check that never ran. The design
+        # puts "/health timed out" under signal unobtainable, not under a failed
+        # check, so the error envelope is inconclusive like every other
+        # unreadable signal.
+        if app_status == "error":
+            return OUTCOME_INCONCLUSIVE, {
+                **detail,
+                "reason": (
+                    f"the container restarted at {started_at} and is running, but "
+                    f"its health probe could not be reached "
+                    f"({app.get('error', 'no detail')}), so whether the service is "
+                    f"serving is unknown"
+                ),
+            }
         return OUTCOME_FAIL, {
             **detail,
             "reason": (
                 f"the container is running but its health probe reports "
-                f"{app.get('status', 'nothing')!r}, so the service is not serving"
+                f"{app_status!r}, so the service is not serving"
             ),
         }
 

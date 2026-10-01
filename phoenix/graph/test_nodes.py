@@ -1063,6 +1063,23 @@ def _verifier_state(**overrides) -> AgentState:
     return AgentState(**fields)
 
 
+def test_a_verifier_escalation_is_recorded_under_the_verifier_not_the_remediator(
+    monkeypatch,
+):
+    """The verifier escalates through _escalate, which defaults to naming the
+    remediator. A trail that files the verifier's rows under a node that never
+    ran the pass is a trail that contradicts itself about who did what."""
+    rows = _audit_rows(monkeypatch)
+    _verdict(monkeypatch, "inconclusive")
+
+    nodes.verifier_node(_verifier_state())
+
+    escalated = [r for r in rows if r["event_type"] == "verification_failed"]
+    assert escalated, [(r["node"], r["event_type"]) for r in rows]
+    assert escalated[0]["node"] == "verifier"
+    assert all(r["node"] == "verifier" for r in rows)
+
+
 def _verdict(monkeypatch, outcome: str, **detail):
     monkeypatch.setattr(
         verification, "run_check", lambda *a: (outcome, {"reason": "stubbed", **detail})

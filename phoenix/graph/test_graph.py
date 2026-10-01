@@ -299,7 +299,7 @@ DEPLOY_ROLLOUT = {"status": "success", "text": "image checkout:v18, rollout comp
 PROBE_FAILING = {"status": "success", "text": "readiness probe failing, cpu at 98%"}
 
 
-def _confident_crash(monkeypatch, calls: list[str] | None = None, passes: int = 1):
+def _confident_crash(monkeypatch, calls: list[str] | None = None):
     """A run that reaches the confidence threshold on its first pass."""
 
     def fake_tool_calls(service_name, evidence_so_far, evidence_requests):

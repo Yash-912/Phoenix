@@ -320,6 +320,7 @@ def _escalate(
     reason: str,
     print_line: str,
     extra: dict | None = None,
+    node: str = "remediator",
 ) -> Command:
     """Stop the run with a named reason, on the audit trail before it stops.
 
@@ -334,11 +335,17 @@ def _escalate(
     state. The verifier passes its verdict this way, because an escalation whose
     final state does not say what the check actually found is the one row an
     operator has to act on with no information attached to it.
+
+    node is a parameter rather than a constant because the verifier escalates
+    through here too. Filing its rows under 'remediator' would print and record
+    a node that never ran the pass, immediately after the verifier wrote a row
+    correctly attributed to itself -- a trail that contradicts itself about who
+    did what, which is the one thing a trail exists to prevent.
     """
-    print(f"[remediator] {print_line} -> end (escalate)")
+    print(f"[{node}] {print_line} -> end (escalate)")
     record_audit(
         state.incident_id,
-        "remediator",
+        node,
         event_type,
         {
             "iteration": state.iteration,
@@ -406,7 +413,7 @@ def remediator_node(state: AgentState) -> Command:
             state,
             "action_blocked_by_policy",
             f"policy_mode is guarded, so no action was taken for the {category} finding",
-            f"policy_mode is guarded, so no action taken",
+            "policy_mode is guarded, so no action taken",
         )
 
     plan = plan_action(state)
@@ -520,6 +527,7 @@ def verifier_node(state: AgentState) -> Command:
             "the verifier was reached with no planned action, so there is "
             "nothing to check and no basis for calling the service recovered",
             "reached with no planned action to verify",
+            node="verifier",
         )
 
     time.sleep(state.verification_delay_seconds)
@@ -575,7 +583,12 @@ def verifier_node(state: AgentState) -> Command:
             f"attempts"
         )
         return _escalate(
-            state, "verification_failed", reason, reason, extra={"verification_result": verification_result}
+            state,
+            "verification_failed",
+            reason,
+            reason,
+            extra={"verification_result": verification_result},
+            node="verifier",
         )
 
     reason = (
@@ -583,5 +596,10 @@ def verifier_node(state: AgentState) -> Command:
         f"{detail.get('reason') if isinstance(detail, dict) else detail}"
     )
     return _escalate(
-        state, "verification_failed", reason, reason, extra={"verification_result": verification_result}
+        state,
+        "verification_failed",
+        reason,
+        reason,
+        extra={"verification_result": verification_result},
+        node="verifier",
     )

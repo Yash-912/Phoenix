@@ -164,6 +164,19 @@ exactly the "unhealthy → restart" behaviour PRD §2 says Phoenix must be disti
 understanding. Such a run ends `action_unavailable`: a confident diagnosis plus a clear statement
 that the correct tier is out of scope. That is a better demo artifact than a wrong restart.
 
+> **Known gap, found in the Phase 3 final review.** `action_unavailable` is implemented and proven at
+> the node level, but **it is not reachable through the compiled graph.** Every category
+> `CATEGORY_ACTIONS` leaves without an action - `deploy`, `config`, `network`, `unknown` - is also a
+> category the scorer cannot lift to the 0.75 threshold; measured, `deploy` reaches 0.15 on its
+> strongest evidence. Such a run loops to the iteration cap and escalates for being inconclusive,
+> which inverts the intent: the operator is told the agent gave up rather than that it diagnosed a
+> deploy and knew a human was needed. Closing this is a policy question, not a scoring one - either
+> the router hands any surviving top hypothesis to the remediator and lets `plan_action` decide, or
+> no-action categories get scored on their own terms. Tuning the threshold or the evidence weights to
+> force it would be changing product behaviour to satisfy a test. Pinned by
+> `test_a_deploy_finding_cannot_clear_the_threshold_so_it_never_reaches_the_remediator`, which will
+> fail loudly when the gap closes.
+
 **Known cost.** A single invocation now spans mutations, so a crash mid-remediation loses in-flight
 state. Step C's persistence means the *trail* survives; the loss is bounded to the last node's
 return value.
@@ -289,9 +302,15 @@ Step C's four carry forward unchanged, plus one new:
 
 Three paths, one of which is the dangerous one.
 
-- **Action fails to execute.** The tool returns an error. Count it as an attempt, record it, and
-  route to the retry-or-escalate path. **Do not run verification** — there is nothing to verify, and
-  a verification pass over an action that never ran would be a false all-clear.
+- **Action fails to execute.** The tool returns an error or raises. Record `action_failed` and end
+  escalated. **Do not run verification** - there is nothing to verify, and a verification pass over an
+  action that never ran would be a false all-clear. **No attempt is consumed**, because the container
+  was never restarted; counting it would spend the cap on changes that did not happen, so the next
+  run would stop with attempts remaining having tried fewer times than the cap allows.
+  *(Amended during implementation: the original text said to count a failed dispatch as an attempt
+  and route to retry-or-escalate. The implemented behaviour is the safer reading of the same rule and
+  now matches the policy-blocked entry below. A dispatch failure and a policy block are the same
+  situation from the cap's point of view - nothing was attempted against the service.)*
 
 - **Policy blocks.** Record `action_blocked_by_policy`, end escalated. **No attempt is consumed**,
   because nothing was attempted.

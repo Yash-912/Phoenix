@@ -59,11 +59,6 @@ def _healthy() -> dict:
     return {"container": {"status": "running"}, "app": {"status": "ok", "http_status": 200}}
 
 
-def _check(monkeypatch, outcome: str, detail: dict, category="overload", before=None):
-    monkeypatch.setattr(verification, "run_check", lambda *a: (outcome, detail))
-    return verification.run_check(category, SERVICE, before, ACTION_AT)
-
-
 # --- readings that cannot be trusted are not readings -------------------------
 #
 # A restart empties a container's time series, and Prometheus answers a query
@@ -298,12 +293,36 @@ def test_a_healthy_container_whose_app_health_probe_fails_does_not_verify(monkey
     monkeypatch.setattr(
         verification,
         "inspect_health",
-        lambda name: {"container": {"status": "running"}, "app": {"status": "error", "error": "503"}},
+        lambda name: {
+            "container": {"status": "running"},
+            "app": {"status": "unhealthy", "http_status": 503},
+        },
     )
 
     outcome, detail = verification.run_check("crash", SERVICE, {}, ACTION_AT)
 
     assert outcome == "fail"
+
+
+def test_an_unreachable_health_probe_is_inconclusive_not_a_failed_check(monkeypatch):
+    """inspect_health writes {"status": "error"} when the request raises, which
+    is what a timeout looks like. Grading that as an unhealthy service would
+    fail a restart that may well have worked, loop back to the observer, and
+    spend another attempt on a check that never ran."""
+    monkeypatch.setattr(verification, "get_container_state", lambda name: _container("running", STARTED_AFTER))
+    monkeypatch.setattr(
+        verification,
+        "inspect_health",
+        lambda name: {
+            "container": {"status": "running"},
+            "app": {"status": "error", "error": "HTTPConnectionPool: Read timed out"},
+        },
+    )
+
+    outcome, detail = verification.run_check("crash", SERVICE, {}, ACTION_AT)
+
+    assert outcome == "inconclusive"
+    assert "timed out" in detail["reason"] or "reached" in detail["reason"]
 
 
 def test_a_container_that_is_not_running_does_not_verify(monkeypatch):
