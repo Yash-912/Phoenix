@@ -31,6 +31,9 @@ from phoenix.tools.docker_tool import get_container_state
 from phoenix.tools.health_tool import inspect_health
 from phoenix.tools.prometheus_tool import query_prometheus
 
+import math
+from datetime import datetime, timezone
+
 OUTCOME_PASS = "pass"
 OUTCOME_FAIL = "fail"
 OUTCOME_INCONCLUSIVE = "inconclusive"
@@ -65,16 +68,45 @@ def _first_sample(payload) -> float | None:
 
     The value arrives as a string because that is what Prometheus's JSON
     encodes, and a vector whose result list is empty has no sample at all --
-    which is not the same as a sample of zero and must not be read as one.
+which is not the same as a sample of zero and must not be read as one.
     """
     try:
         sample = payload["data"]["result"][0]["value"][1]
     except (KeyError, IndexError, TypeError):
         return None
     try:
-        return float(sample)
+        value = float(sample)
     except (TypeError, ValueError):
         return None
+    # NaN is what Prometheus returns for a range query it cannot compute: deriv()
+    # over fewer than two points, or a series with no value in range. A restart
+    # empties the series, so this is the normal answer right after one. It is
+    # not a number and must not be allowed to behave like one -- every
+    # comparison against NaN is False, which would silently satisfy the
+    # "is it holding steady" test and report a pass for an unmeasured slope.
+    # +Inf and -Inf are different: they are real readings of a slope that is
+    # genuinely unbounded, so they are kept and judged as the leak they are.
+    if math.isnan(value):
+        return None
+    return value
+
+
+def _as_instant(moment: str | None) -> datetime | None:
+    """A timestamp as an aware datetime, or None when it cannot be read as one.
+
+    Accepts what both producers actually write: Docker's RFC3339 with a Z, and
+    isoformat() output with a numeric offset and microseconds. A timestamp with
+    no timezone is refused rather than assumed to be UTC -- guessing the offset
+    would reintroduce exactly the class of wrong answer this function exists to
+    prevent, one layer further from where it is visible.
+    """
+    if not moment:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(moment).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo else None
 
 
 def read_signal(category: str, service_name: str) -> dict:
@@ -220,7 +252,7 @@ def _check_crash(signal: dict, action_at: str | None) -> tuple[str, dict]:
     The start time is what separates a restart that worked from a container that
     happened to be up already. Without it a check would pass on a service that
     was never touched, and the agent would credit itself with a fix it did not
-    make.
+make.
     """
     state = signal.get("state", {})
     health = signal.get("health", {})
@@ -241,7 +273,37 @@ def _check_crash(signal: dict, action_at: str | None) -> tuple[str, dict]:
             ),
         }
 
-    if action_at and started_at < action_at:
+    # Both sides are parsed into datetimes rather than compared as strings.
+    # Docker writes StartedAt as RFC3339 with trailing zeros trimmed
+    # ("2026-09-30T10:00:00.123Z") and the remediator writes action_at through
+    # isoformat(), which keeps the microseconds and an offset
+    # ("2026-09-30T10:00:00.123456+00:00"). As strings those two are not
+    # comparable at all: 'Z' is 0x5A and '+' is 0x2B, so a container that
+    # started microseconds BEFORE the action sorts as though it started after
+    # it, and this check passes on a container the action never touched.
+    # A naive timestamp would be worse than either: it would compare wall-clock
+    # labels across offsets, so it is treated as unreadable instead.
+    started_moment = _as_instant(started_at)
+    action_moment = _as_instant(action_at)
+    if started_moment is None:
+        return OUTCOME_INCONCLUSIVE, {
+            **detail,
+            "reason": (
+                f"the container's start time {started_at!r} could not be read as a "
+                f"timestamp, so there is no way to tell whether this action "
+                f"restarted it"
+            ),
+        }
+    if action_moment is None:
+        return OUTCOME_INCONCLUSIVE, {
+            **detail,
+            "reason": (
+                f"the action time {action_at!r} could not be read as a timestamp, so "
+                f"there is no way to tell whether this action restarted the container"
+            ),
+        }
+
+    if started_moment < action_moment:
         return OUTCOME_FAIL, {
             **detail,
             "reason": (

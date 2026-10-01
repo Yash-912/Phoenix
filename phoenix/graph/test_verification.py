@@ -1,3 +1,6 @@
+from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
+
 from phoenix.graph import verification
 
 SERVICE = "checkout-service"
@@ -35,6 +38,16 @@ def _prom(after_bytes: int, slope: float = 0.0):
     return fake
 
 
+def _prom_bytes(level: float, slope: float = 0.0):
+    """The same shape, with the level left as whatever float it was given so a
+    test can put a non-finite value in the place Prometheus would."""
+
+    def fake(promql: str) -> dict:
+        return _series(str(slope)) if "deriv" in promql else _series(str(level))
+
+    return fake
+
+
 def _container(status: str, started_at: str) -> dict:
     return {
         "Name": f"/{SERVICE}",
@@ -49,6 +62,127 @@ def _healthy() -> dict:
 def _check(monkeypatch, outcome: str, detail: dict, category="overload", before=None):
     monkeypatch.setattr(verification, "run_check", lambda *a: (outcome, detail))
     return verification.run_check(category, SERVICE, before, ACTION_AT)
+
+
+# --- readings that cannot be trusted are not readings -------------------------
+#
+# A restart empties a container's time series, and Prometheus answers a query
+# over an empty or too-short range with NaN rather than with nothing. So NaN is
+# not a hypothetical here: it is what this module sees on the pass path it most
+# wants to take. Every test below builds the exact payload a real Prometheus
+# would return, because the shape of the failure is that the value parses
+# cleanly as a float and then behaves unlike one.
+
+
+def test_a_nan_slope_is_not_read_as_memory_holding_steady(monkeypatch):
+    """deriv() over fewer than two points returns NaN, which is the normal state
+    in the window right after a restart. `nan > 1024` is False, so a slope that
+    could not be computed would otherwise satisfy "is not climbing" and pass."""
+    monkeypatch.setattr(verification, "query_prometheus", _prom(400_000_000, slope=float("nan")))
+
+    outcome, detail = verification.run_check(
+        "overload", SERVICE, {"bytes": BEFORE_BYTES, "slope": 0.0}, ACTION_AT
+    )
+
+    assert outcome == "inconclusive"
+    assert "slope" in detail["reason"]
+
+
+def test_a_nan_working_set_is_not_a_reading(monkeypatch):
+    monkeypatch.setattr(
+        verification, "query_prometheus", _prom_bytes(float("nan"), slope=0.0)
+    )
+
+    outcome, detail = verification.run_check(
+        "overload", SERVICE, {"bytes": BEFORE_BYTES, "slope": 0.0}, ACTION_AT
+    )
+
+    assert outcome == "inconclusive"
+    assert detail["reason"]
+
+
+def test_a_nan_working_set_never_raises_out_of_the_check(monkeypatch):
+    """int(nan) raises ValueError. A restart has already happened by the time
+    this runs, so an exception here unwinds past the print of the final state
+    and the operator gets a traceback instead of the diagnosis."""
+    monkeypatch.setattr(
+        verification, "query_prometheus", _prom_bytes(float("nan"), slope=0.0)
+    )
+
+    outcome, _ = verification.run_check(
+        "overload", SERVICE, {"bytes": BEFORE_BYTES, "slope": 0.0}, ACTION_AT
+    )
+
+    assert outcome in {"inconclusive", "fail", "pass"}
+
+
+def test_an_infinite_slope_is_climbing_rather_than_unmeasurable(monkeypatch):
+    """Distinct from NaN: +Inf is a slope that really is unbounded, which is a
+    leak, not a broken query."""
+    monkeypatch.setattr(verification, "query_prometheus", _prom(400_000_000, slope=float("inf")))
+
+    outcome, _ = verification.run_check(
+        "overload", SERVICE, {"bytes": BEFORE_BYTES, "slope": 0.0}, ACTION_AT
+    )
+
+    assert outcome == "fail"
+
+
+# --- timestamps are compared as instants, not as strings ---------------------
+
+
+def test_a_container_that_started_before_the_action_does_not_verify_even_when_the_two_timestamps_look_later_in_the_string():
+    """Docker writes StartedAt as RFC3339 with trailing zeros trimmed
+    ("...:00.123Z"); the remediator writes action_at through isoformat(), which
+    keeps microseconds and an offset ("...:00.123456+00:00"). Compared as
+    strings, 'Z' (0x5A) sorts after '+' (0x2B), so a container that started
+    456 microseconds BEFORE the action reads as having started after it.
+
+    The window is sub-second, so this rarely fires on the success path -- a
+    restart lands well after action_at. It fires precisely on the claim this
+    check exists to make: proving the action is what brought the container up.
+    """
+    # Fixed, not now(): the wall clock's microseconds would decide whether this
+    # test exercises the bug, so it would pass or fail by luck of the second.
+    action_instant = datetime(2026, 9, 30, 10, 0, 0, 123456, tzinfo=timezone.utc)
+    action_at = action_instant.isoformat()
+    started_at = "2026-09-30T10:00:00.123Z"
+    assert (
+        datetime.fromisoformat(started_at.replace("Z", "+00:00")) < action_instant
+    ), "fixture must be genuinely earlier"
+
+    with patch.object(verification, "get_container_state", return_value=_container("running", started_at)), \
+         patch.object(verification, "inspect_health", return_value=_healthy()):
+        outcome, detail = verification.run_check("crash", SERVICE, {}, action_at)
+
+    assert outcome == "fail"
+
+
+def test_a_container_started_after_the_action_verifies_when_the_two_formats_differ():
+    """The same comparison, the other way: a real restart must still pass with
+    action_at carrying an offset and StartedAt a Z."""
+    action_at = datetime.now(timezone.utc).isoformat()
+    started_at = (datetime.fromisoformat(action_at) + timedelta(seconds=30)).isoformat().replace(
+        "+00:00", "Z"
+    )
+
+    with patch.object(verification, "get_container_state", return_value=_container("running", started_at)), \
+         patch.object(verification, "inspect_health", return_value=_healthy()):
+        outcome, _ = verification.run_check("crash", SERVICE, {}, action_at)
+
+    assert outcome == "pass"
+
+
+def test_an_unreadable_action_timestamp_is_inconclusive_rather_than_skipped(monkeypatch):
+    """The guard is written `if action_at and started_at < action_at`, so a
+    planned_action missing its timestamp falls straight through to the pass
+    branch. Absence of a comparison is not a comparison that succeeded."""
+    monkeypatch.setattr(verification, "get_container_state", lambda n: _container("running", STARTED_AFTER))
+    monkeypatch.setattr(verification, "inspect_health", lambda n: _healthy())
+
+    outcome, _ = verification.run_check("crash", SERVICE, {}, None)
+
+    assert outcome == "inconclusive"
 
 
 # --- the signal that could not be read is never a pass -------------------------
