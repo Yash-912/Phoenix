@@ -185,6 +185,15 @@ def observer_node(state: AgentState) -> AgentState:
     failure is recorded and is not evidence. The audit row names the calls that
     raised in failed_tools, so no row claims a read returned data when it
     returned nothing.
+
+    This node mutates its argument and returns it, which the two nodes added
+    after it deliberately do not do. The distinction is the return value: a node
+    that returns the state hands langgraph the whole object, so an in-place
+    change is part of what gets persisted. A node that returns a Command without
+    an update does not, so an in-place change there would be written onto a copy
+    the run never sees. Both shapes are correct in their own place and only one
+    of them is, which is why every routing node in this module returns its
+    changes in Command(update=...) and this one does not route.
     """
     state.iteration += 1
 
