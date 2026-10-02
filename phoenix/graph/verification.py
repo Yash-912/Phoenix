@@ -179,6 +179,8 @@ def read_signal(category: str, service_name: str) -> dict:
             }
         if category == "deploy":
             return _read_deploy(service_name)
+        if category == "config":
+            return _read_config(service_name)
     except Exception as exc:
         return {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
 
@@ -290,6 +292,50 @@ def _read_deploy(service_name: str) -> dict:
     }
 
 
+# Each configurable service's key name (as used across the policy/dispatch/tool
+# boundary) and the field its own /health JSON reports that key under. Kept
+# separate from remediation_policy.CONFIG_KEYS_BY_SERVICE /
+# CONFIG_HEALTH_FIELDS -- that module reads the same field to decide whether a
+# rollback is still needed, this one reads it to decide whether the rollback it
+# took worked, and the two questions are allowed to diverge even though today's
+# answer is the same field.
+CONFIG_SIGNALS: dict[str, dict[str, str]] = {
+    "auth-service": {"key": "DB_POOL_SIZE", "field": "db_pool_size"},
+}
+
+
+def _read_config(service_name: str) -> dict:
+    """The live value of the one config key this service is verified on, or the
+    failure envelope.
+
+    Read from the service's own /health response, not from docker or from
+    compose: a config value is a property of the running process, and only the
+    process can say what it actually believes is configured. DB_POOL_SIZE in
+    particular is too fragile to probe by opening a database connection
+    ourselves here, so this reads the number the process reports of itself.
+    """
+    spec = CONFIG_SIGNALS.get(service_name)
+    if spec is None:
+        return {
+            "status": "error",
+            "error": f"no config signal known for {service_name!r}",
+        }
+
+    health = inspect_health(service_name)
+    app = health.get("app") if isinstance(health, dict) else None
+    if not isinstance(app, dict) or app.get("status") != "ok":
+        return {"status": "error", "error": "the health probe did not return data"}
+
+    value = app.get(spec["field"])
+    if value is None:
+        return {
+            "status": "error",
+            "error": f"the health probe carried no {spec['field']!r}",
+        }
+
+    return {"status": "ok", "key": spec["key"], "value": str(value)}
+
+
 def run_check(
     category: str,
     service_name: str,
@@ -321,10 +367,55 @@ def run_check(
         return _check_crash(signal, action_at)
     if category == "deploy":
         return _check_deploy(signal, expect_version)
+    if category == "config":
+        return _check_config(signal, expect_version)
 
     return OUTCOME_INCONCLUSIVE, {
         "check": category,
         "reason": f"no verification check for category {category!r}",
+    }
+
+
+def _check_config(signal: dict, expect_value: str | None) -> tuple[str, dict]:
+    """Does the service now report the value the rollback was supposed to set?
+
+    Read-and-compare only, the same shape _check_deploy uses for identity: the
+    signal already is the live answer, so there is nothing before/after to
+    reconcile the way the memory check does. A config rollback either stuck or
+    it did not, and the service's own report is the one source that can say so.
+    """
+    detail = {
+        "check": "config",
+        "key": signal.get("key"),
+        "reported_value": signal.get("value"),
+        "expected_value": expect_value,
+    }
+
+    if expect_value is None:
+        return OUTCOME_INCONCLUSIVE, {
+            **detail,
+            "reason": (
+                "no target value was recorded for this action, so there is "
+                "nothing to confirm the service reports"
+            ),
+        }
+
+    if signal.get("value") != expect_value:
+        return OUTCOME_FAIL, {
+            **detail,
+            "reason": (
+                f"the service reports {signal.get('key')}={signal.get('value')!r}, "
+                f"not the {expect_value!r} the rollback set, so the config was not "
+                f"restored"
+            ),
+        }
+
+    return OUTCOME_PASS, {
+        **detail,
+        "reason": (
+            f"the service reports {signal.get('key')}={expect_value!r}, matching "
+            f"what the rollback set"
+        ),
     }
 
 

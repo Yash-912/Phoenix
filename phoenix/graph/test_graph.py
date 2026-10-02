@@ -1,4 +1,4 @@
-﻿"""Unit tests for the router â€” no network, no LLM, no database.
+"""Unit tests for the router â€” no network, no LLM, no database.
 
 should_continue is pure code over AgentState, so these drive it directly and
 assert both halves of the Command it returns: the destination it routes to and
@@ -613,3 +613,191 @@ def test_an_observer_asking_for_a_rollback_is_ignored(monkeypatch):
     assert final["evidence"] == []
     assert [hypothesis.score for hypothesis in final["hypotheses"]] == [0.0]
     assert final["status"] != "resolved"
+
+
+# --- Phase 4: the Tier 2 config path -----------------------------------------
+#
+# Same shape as the deploy section above, for the other Tier 2 action: a shrunk
+# connection pool is a value, not an artifact, so there is no image to roll back
+# and no app.version label to read -- the running state is the service's own
+# /health response instead.
+
+AUTH_SERVICE = "auth-service"
+
+
+def _pool_evidence_payloads(history: list[dict] | None = None) -> dict:
+    """What the read-only tools return for a genuine pool-size regression.
+
+    "pool" has to land in the primary sources' content for scoring to clear the
+    confidence threshold, the same requirement _v18_evidence_payloads meets for
+    "v18": a metric name, a log line, and a container env entry, each carrying
+    it for a different, real reason.
+    """
+    history = history if history is not None else [
+        {"service": AUTH_SERVICE, "timestamp": "2026-10-02T08:00:00+00:00",
+         "image_tag": "same", "config": {"DB_POOL_SIZE": "1"},
+         "deployed_by": "chaos/config_pool.py",
+         "correlation": "before_incident", "delta_seconds": -30.0, "in_window": True},
+    ]
+    return {
+        "get_container_state": {
+            "Image": "sha256:auth",
+            "State": {"Status": "running"},
+            "Config": {"Env": ["DB_POOL_SIZE=1"], "Labels": {}},
+        },
+        "query_loki": {
+            "status": "ok",
+            "data": {"result": [
+                {"line": "2026-10-02 08:00:03 ERROR auth-service "
+                         "connection pool exhausted, cannot acquire connection"}]},
+        },
+        "query_prometheus": {
+            "status": "success",
+            "data": {"resultType": "vector", "result": [
+                {"metric": {"__name__": "db_pool_size", "job": AUTH_SERVICE},
+                 "value": [1759000000.0, "1"]}]},
+        },
+        "inspect_health": {"container": {"status": "running"},
+                           "app": {"status": "ok", "db_pool_size": "1"}},
+        "get_recent_deployments": {
+            "status": "ok",
+            "service": AUTH_SERVICE,
+            "incident_started_at": "2026-10-02T08:00:30+00:00",
+            "deployments": history,
+        },
+    }
+
+
+def _config_run(monkeypatch, *, running_value="1", history=None) -> list[dict]:
+    """Drive the compiled graph over real pool-regression evidence, stubbing
+    only the mutation and the health probes the policy/verifier read live."""
+    payloads = _pool_evidence_payloads(history)
+    rolled_back: list[dict] = []
+
+    def fake_tool_calls(service_name, evidence_so_far, evidence_requests):
+        return ToolCallDecision(
+            [
+                {"name": "get_recent_deployments", "arguments": {"service_name": AUTH_SERVICE}},
+                {"name": "get_container_state", "arguments": {"container_name": AUTH_SERVICE}},
+                {"name": "query_loki", "arguments": {"logql": '{container="auth-service"}'}},
+                {"name": "query_prometheus", "arguments": {"promql": "db_pool_size"}},
+            ],
+            1,
+        )
+
+    def fake_hypotheses(service_name, evidence_so_far):
+        return HypothesisDecision(
+            DiagnoserOutput(
+                hypotheses=[Hypothesis(description="the auth pool was shrunk",
+                                       category="config")]
+            ),
+            1,
+        )
+
+    monkeypatch.setattr(nodes, "decide_tool_calls", fake_tool_calls)
+    monkeypatch.setattr(nodes, "decide_hypotheses", fake_hypotheses)
+    for name, payload in payloads.items():
+        monkeypatch.setitem(nodes.TOOL_DISPATCH, name, lambda args, _p=payload: _p)
+
+    monkeypatch.setattr(nodes, "get_incident_first_seen",
+                        lambda incident_id: "2026-10-02T08:00:30+00:00")
+    # Policy reads the live /health response directly rather than through nodes,
+    # the config equivalent of the deploy section's get_container_state stub.
+    monkeypatch.setattr(
+        remediation_policy, "inspect_health",
+        lambda name: {"app": {"status": "ok", "db_pool_size": running_value}},
+    )
+    monkeypatch.setattr(
+        "phoenix.graph.config_rollback_target.get_recent_deployments",
+        lambda service, limit=10: {
+            "status": "ok",
+            "deployments": payloads["get_recent_deployments"]["deployments"]},
+    )
+    monkeypatch.setitem(
+        dispatch.TIER_2_DISPATCH, "rollback_config",
+        lambda service, *args: rolled_back.append({"service": service, "args": args})
+        or {"status": "ok", "to_value": args[1]},
+    )
+    monkeypatch.setattr(
+        verification, "run_check",
+        lambda category, service_name, before, action_at, expect_version=None:
+            ("pass", {"check": category, "expected_value": expect_version,
+                      "reported_value": running_value}),
+    )
+    monkeypatch.setattr(nodes.time, "sleep", lambda seconds: None)
+    return rolled_back
+
+
+def test_a_confident_config_finding_rolls_back_to_the_known_good_pool_size(monkeypatch):
+    """The Phase 4 config path end to end through the compiled graph: score,
+    route, resolve the target from the declared known-good value, roll back,
+    verify."""
+    rolled_back = _config_run(monkeypatch)
+
+    final = _final(
+        graph.build_graph().invoke(AgentState(incident_id=1, service_name=AUTH_SERVICE, token_budget=100000, max_iterations=5))
+    )
+
+    assert final["confidence"] >= final["confidence_threshold"], final["confidence"]
+    assert final["planned_action"]["action"] == "rollback_config"
+    assert final["planned_action"]["check"] == "config"
+    assert rolled_back == [{"service": AUTH_SERVICE,
+                            "args": ("DB_POOL_SIZE", "10", "2026-10-02T08:00:00+00:00")}]
+    assert final["verification_result"]["outcome"] == "pass"
+    assert final["status"] == "resolved"
+
+
+def test_a_config_run_with_no_configurable_key_for_the_service_takes_no_action(monkeypatch):
+    """A service with no declared key is as valid a refusal as history offering
+    nothing safe -- this run targets checkout-service, which has none."""
+    rolled_back = _config_run(monkeypatch)
+    monkeypatch.setitem(
+        dispatch.TIER_2_DISPATCH, "rollback_config",
+        lambda *a: pytest.fail("checkout-service has no configurable key"),
+    )
+
+    final = _final(
+        graph.build_graph().invoke(_state(token_budget=100000, max_iterations=5))
+    )
+
+    assert rolled_back == []
+    assert final["status"] == "action_unavailable"
+    assert final["remediation_attempts"] == 0
+
+
+def test_a_service_already_reporting_the_good_pool_size_is_not_rolled_back_again(monkeypatch):
+    """Mirrors the deploy guard: stale evidence must not justify reverting a
+    service that already reports the known-good value."""
+    rolled_back = _config_run(monkeypatch, running_value="10")
+    monkeypatch.setitem(
+        dispatch.TIER_2_DISPATCH, "rollback_config",
+        lambda *a: pytest.fail("the service already reports DB_POOL_SIZE=10"),
+    )
+
+    final = _final(
+        graph.build_graph().invoke(AgentState(incident_id=1, service_name=AUTH_SERVICE, token_budget=100000, max_iterations=5))
+    )
+
+    assert rolled_back == []
+    assert final["remediation_attempts"] == 0
+
+
+def test_a_guarded_run_with_a_config_finding_takes_no_action(monkeypatch):
+    """Tier 2 is gated for config the same as for deploy: the gate applies
+    before the rollback, not after it."""
+    rolled_back = _config_run(monkeypatch)
+    monkeypatch.setitem(
+        dispatch.TIER_2_DISPATCH, "rollback_config",
+        lambda *a: pytest.fail("guarded mode must not reach a Tier 2 action"),
+    )
+
+    final = _final(
+        graph.build_graph().invoke(
+            AgentState(incident_id=1, service_name=AUTH_SERVICE, policy_mode="guarded",
+                       token_budget=100000, max_iterations=5)
+        )
+    )
+
+    assert rolled_back == []
+    assert final["status"] != "resolved"
+    assert final["remediation_attempts"] == 0

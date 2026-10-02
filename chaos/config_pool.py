@@ -1,7 +1,9 @@
-"""Scenario 4: config regression — shrink auth pool via env note + marker.
+"""Scenario 4: config regression — shrink auth-service's DB connection pool.
 
-Note: live env change needs container recreate; V1 records the marker and
-hits a chaos note endpoint. Full env-swap lands with Tier 2 work.
+Goes through chaos/lib/deployer.apply_config, the same path
+rollback_config uses to restore it: one code path means the restore cannot
+drift from the regression it undoes.
+
 Usage: python -m chaos.config_pool [--reset]
 """
 
@@ -9,31 +11,26 @@ from __future__ import annotations
 
 import sys
 
-from chaos.lib.deploy_tracker import write_deployment_marker
+from chaos.lib.deployer import apply_config
 
 
 def inject() -> dict:
-    marker = write_deployment_marker(
-        service="auth-service",
-        image_tag="same",
-        git_commit="same",
-        config={"DB_POOL_SIZE": "1"},
+    marker = apply_config(
+        "auth-service",
+        {"DB_POOL_SIZE": "1"},
         deployed_by="chaos/config_pool.py",
     )
-    print(f"recorded config regression (pool=1): {marker['timestamp']}")
-    print("NOTE: apply with: docker compose up -d --no-deps auth-service (DB_POOL_SIZE=1)")
+    print(f"applied config regression (pool=1): {marker['timestamp']}")
     return marker
 
 
-def reset() -> None:
-    marker = write_deployment_marker(
-        service="auth-service",
-        image_tag="same",
-        git_commit="same",
-        config={"DB_POOL_SIZE": "10"},
+def reset() -> dict:
+    marker = apply_config(
+        "auth-service",
+        {"DB_POOL_SIZE": "10"},
         deployed_by="chaos/config_pool.py --reset",
     )
-    print(f"recorded config restore (pool=10): {marker['timestamp']}")
+    print(f"restored config (pool=10): {marker['timestamp']}")
     return marker
 
 

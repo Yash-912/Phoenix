@@ -48,3 +48,10 @@ def test_the_llm_is_offered_exactly_the_five_read_only_tools():
 
 def test_no_observer_tool_name_collides_with_a_remediation_action():
     assert OBSERVER_TOOLS & set(REMEDIATION_DISPATCH) == set()
+
+
+def test_both_tier_2_actions_are_bound_to_their_own_tool():
+    from phoenix.tools import remediation_tool
+
+    assert TIER_2_DISPATCH["rollback_deployment"] is remediation_tool.rollback_deployment
+    assert TIER_2_DISPATCH["rollback_config"] is remediation_tool.rollback_config

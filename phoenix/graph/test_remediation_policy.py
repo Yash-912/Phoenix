@@ -4,6 +4,7 @@ from typing import get_args
 import pytest
 
 from phoenix.graph import remediation_policy
+from phoenix.graph.config_rollback_target import ConfigRollbackTarget
 from phoenix.graph.remediation_policy import CATEGORY_ACTIONS, plan_action
 from phoenix.graph.rollback_target import RollbackTarget
 from phoenix.graph.schemas import Hypothesis, ScoredHypothesis
@@ -11,28 +12,46 @@ from phoenix.graph.state import AgentState
 
 SERVICE = "checkout-service"
 
-# Phase 4 routes deploy to Tier 2; config, network, and unknown still have no
-# action, which is the honest answer while their tiers are unbuilt.
-NO_ACTION_CATEGORIES = ("config", "network", "unknown")
+# Phase 4 routes deploy to rollback_deployment and config to rollback_config;
+# network and unknown still have no action, which is the honest answer while
+# their tiers are unbuilt.
+NO_ACTION_CATEGORIES = ("network", "unknown")
+
+_DEPLOY_TARGET = RollbackTarget(
+    version="v17",
+    from_marker="2026-10-02T08:00:00+00:00",
+    from_version="v18",
+    reasoning="newest non-regression artifact is v17",
+)
+
+_CONFIG_TARGET = ConfigRollbackTarget(
+    key="DB_POOL_SIZE",
+    value="10",
+    from_marker="2026-10-02T08:00:00+00:00",
+    from_value="1",
+    reasoning="known-good DB_POOL_SIZE is 10",
+)
+
+_TARGETS_BY_ACTION = {
+    "rollback_deployment": _DEPLOY_TARGET,
+    "rollback_config": _CONFIG_TARGET,
+}
 
 
 @pytest.fixture(autouse=True)
 def _known_good_target(monkeypatch):
-    """Give deploy a resolvable target so policy tests exercise routing, not Docker.
+    """Give each Tier 2 action a resolvable target so policy tests exercise
+    routing, not Docker or the live service.
 
-    The alternative -- letting these tests reach the live container and the real
-    deployment history -- would make the policy suite depend on whatever the lab
-    last deployed, so a test would pass or fail depending on lab state.
+    The alternative -- letting these tests reach the live container, the real
+    deployment history, and the live /health response -- would make the policy
+    suite depend on whatever the lab last deployed or was last configured to,
+    so a test would pass or fail depending on lab state.
     """
     monkeypatch.setattr(
         remediation_policy,
         "_resolve_tier_2_target",
-        lambda action, service: RollbackTarget(
-            version="v17",
-            from_marker="2026-10-02T08:00:00+00:00",
-            from_version="v18",
-            reasoning="newest non-regression artifact is v17",
-        ),
+        lambda action, service: _TARGETS_BY_ACTION.get(action),
     )
 
 
@@ -95,12 +114,40 @@ def test_a_deploy_category_with_nothing_safe_to_restore_refuses_to_act(monkeypat
     assert "no known-good artifact" in plan.reasoning
 
 
-def test_an_unmapped_category_says_which_tier_would_be_correct():
+def test_a_config_category_plans_a_rollback_of_the_known_good_value():
+    """Phase 4 change: config maps to rollback_config rather than to no action.
+
+    No Tier 1 action precedes it, on the same reasoning as deploy: the pool
+    size is a value the process rereads at connection time, not a process state
+    a restart would clear, and a restart under the regressed value would just
+    come back up exhausted again.
+    """
+    plan = plan_action(_state("config"))
+
+    assert plan.available is True
+    assert plan.action == "rollback_config"
+    assert plan.container == SERVICE
+    assert plan.check == "config"
+    assert plan.args == ("DB_POOL_SIZE", "10", "2026-10-02T08:00:00+00:00")
+    assert "DB_POOL_SIZE" in plan.reasoning
+
+
+def test_a_config_category_with_nothing_safe_to_restore_refuses_to_act(monkeypatch):
+    monkeypatch.setattr(remediation_policy, "_resolve_tier_2_target", lambda action, service: None)
+
     plan = plan_action(_state("config"))
 
     assert plan.available is False
     assert plan.action is None
-    assert "Tier 2" in plan.reasoning
+    assert "no known-good value" in plan.reasoning
+
+
+def test_an_unmapped_category_says_a_later_phase_is_correct():
+    plan = plan_action(_state("network"))
+
+    assert plan.available is False
+    assert plan.action is None
+    assert "later phase" in plan.reasoning
 
 
 def test_no_action_is_available_without_a_hypothesis():

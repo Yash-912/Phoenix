@@ -54,6 +54,29 @@ def guarded(monkeypatch):
     return calls
 
 
+@pytest.fixture
+def no_config_change(monkeypatch):
+    """Replace apply_config so a passing test proves nothing was executed."""
+    sentinel = _ExplodingDeployer()
+    monkeypatch.setattr(remediation_tool, "apply_config", sentinel, raising=False)
+    return sentinel
+
+
+@pytest.fixture
+def config_guarded(monkeypatch):
+    """Same lazy-import reasoning as `guarded`, for apply_config."""
+    from chaos.lib import deployer
+
+    calls: list[dict] = []
+
+    def fake_apply(**kwargs):
+        calls.append(kwargs)
+        return {"timestamp": "2026-10-02T09:00:00+00:00"}
+
+    monkeypatch.setattr(deployer, "apply_config", fake_apply)
+    return calls
+
+
 # --- refusals ---------------------------------------------------------------
 
 
@@ -163,3 +186,99 @@ def test_the_rollback_allowlists_are_declared_next_to_the_proxy_one():
 
     assert "checkout-service" in remediation_tool.ALLOWED_ROLLBACK_SERVICES
     assert rollback_target.KNOWN_GOOD_VERSIONS <= remediation_tool.ALLOWED_ROLLBACK_VERSIONS
+
+
+# --- rollback_config: refusals -----------------------------------------------
+
+
+@pytest.mark.parametrize("service", ["checkout-service", "postgres", "", "auth-service; rm -rf /"])
+def test_a_config_service_outside_the_allowlist_is_refused_without_a_change(service, no_config_change):
+    result = remediation_tool.rollback_config(service, "DB_POOL_SIZE", "10")
+
+    assert result["status"] == "error"
+    assert "not config-rollback-eligible" in result["error"]
+
+
+@pytest.mark.parametrize("key", ["REDIS_URL", "", "DB_POOL_SIZE; rm -rf /", "db_pool_size"])
+def test_a_config_key_outside_the_allowlist_is_refused_without_a_change(key, no_config_change):
+    result = remediation_tool.rollback_config("auth-service", key, "10")
+
+    assert result["status"] == "error"
+    assert "not an allowed config key" in result["error"]
+
+
+@pytest.mark.parametrize("value", ["0", "100", "", "10; rm -rf /", "$(whoami)", " 10"])
+def test_a_config_value_outside_the_allowlist_is_refused_without_a_change(value, no_config_change):
+    result = remediation_tool.rollback_config("auth-service", "DB_POOL_SIZE", value)
+
+    assert result["status"] == "error"
+    assert "not a known state" in result["error"]
+
+
+def test_the_config_refusal_names_what_was_allowed_so_the_trail_is_readable(no_config_change):
+    result = remediation_tool.rollback_config("auth-service", "DB_POOL_SIZE", "100")
+
+    assert result["allowed"] == ["1", "10"]
+
+
+# --- rollback_config: the success path ---------------------------------------
+
+
+def test_a_valid_config_rollback_reaches_the_deployer_with_service_and_config(config_guarded):
+    result = remediation_tool.rollback_config("auth-service", "DB_POOL_SIZE", "10")
+
+    assert result["status"] == "ok"
+    assert config_guarded == [
+        {
+            "service": "auth-service",
+            "config": {"DB_POOL_SIZE": "10"},
+            "deployed_by": "phoenix/remediation_tool.rollback_config",
+            "rolled_back_from": None,
+        }
+    ]
+
+
+def test_the_config_result_reports_the_value_that_was_set(config_guarded):
+    result = remediation_tool.rollback_config("auth-service", "DB_POOL_SIZE", "10")
+
+    assert result["to_value"] == "10"
+    assert result["key"] == "DB_POOL_SIZE"
+
+
+def test_the_config_marker_being_reverted_is_carried_through_for_the_trail(config_guarded):
+    remediation_tool.rollback_config(
+        "auth-service", "DB_POOL_SIZE", "10", rolled_back_from="2026-10-02T08:00:00+00-00.json"
+    )
+
+    assert config_guarded[0]["rolled_back_from"] == "2026-10-02T08:00:00+00-00.json"
+
+
+def test_a_config_deployer_failure_is_reported_as_an_error_result_not_raised(monkeypatch):
+    from chaos.lib import deployer
+
+    def explode(**kwargs):
+        raise deployer.DeploymentError("compose exited 1: port already allocated")
+
+    monkeypatch.setattr(deployer, "apply_config", explode)
+
+    result = remediation_tool.rollback_config("auth-service", "DB_POOL_SIZE", "10")
+
+    assert result["status"] == "error"
+    assert "port already allocated" in result["error"]
+
+
+# --- rollback_config is not one of the proxy's Tier 1 verbs either -----------
+
+
+def test_rollback_config_is_not_in_the_tier_1_proxy_allowlist():
+    assert "rollback_config" not in remediation_tool.ALLOWED_DOCKER_ACTIONS
+
+
+def test_the_config_allowlists_are_declared_next_to_the_proxy_one():
+    from phoenix.graph import config_rollback_target
+
+    assert "auth-service" in remediation_tool.ALLOWED_CONFIG_SERVICES
+    for service, values in config_rollback_target.KNOWN_GOOD_CONFIG.items():
+        for key, value in values.items():
+            assert key in remediation_tool.ALLOWED_CONFIG_KEYS
+            assert value in remediation_tool.ALLOWED_CONFIG_VALUES.get(key, set())

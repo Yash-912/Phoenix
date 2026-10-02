@@ -36,6 +36,13 @@ ALLOWED_DOCKER_ACTIONS = {
 ALLOWED_ROLLBACK_SERVICES = {"checkout-service"}
 ALLOWED_ROLLBACK_VERSIONS = {"v17", "v18"}
 
+# Tier 2, config rollback. Separate allowlists from the ones above because a
+# service being deployment-rollback-eligible says nothing about which config
+# keys on it are safe to flip -- the two are independent grants.
+ALLOWED_CONFIG_SERVICES = {"auth-service"}
+ALLOWED_CONFIG_KEYS = {"DB_POOL_SIZE"}
+ALLOWED_CONFIG_VALUES = {"DB_POOL_SIZE": {"1", "10"}}
+
 
 def _call_proxy(action: str, container_name: str) -> dict:
     spec = ALLOWED_DOCKER_ACTIONS.get(action)
@@ -124,6 +131,73 @@ def rollback_deployment(
         "timestamp": marker.get("timestamp"),
         "image_digest": marker.get("image_digest"),
         "observed_label_version": marker.get("observed_label_version"),
+    }
+
+
+def rollback_config(
+    service_name: str,
+    key: str,
+    target_value: str,
+    rolled_back_from: str | None = None,
+) -> dict:
+    """Restore a known-good config value on a running service. Tier 2.
+
+    Three arguments, three allowlists: service, key, and value are each
+    re-validated here rather than trusted from the caller, the same discipline
+    rollback_deployment applies to service and version. A config rollback is a
+    narrower surface than a deployment rollback -- it changes an environment
+    variable, not an artifact -- but it is still a mutating action reached from
+    a diagnosis, so it gets the same independent re-check.
+
+    Goes through chaos.lib.deployer.apply_config, which still shells out to
+    compose rather than the socket proxy: the container is recreated so the new
+    environment value actually reaches the process, and recreate is DELETE plus
+    NETWORKS, which the proxy denies for the same reason given in the module
+    docstring.
+    """
+    if service_name not in ALLOWED_CONFIG_SERVICES:
+        return {
+            "status": "error",
+            "action": "rollback_config",
+            "error": f"service '{service_name}' not config-rollback-eligible",
+            "allowed": sorted(ALLOWED_CONFIG_SERVICES),
+        }
+    if key not in ALLOWED_CONFIG_KEYS:
+        return {
+            "status": "error",
+            "action": "rollback_config",
+            "error": f"key '{key}' not an allowed config key",
+            "allowed": sorted(ALLOWED_CONFIG_KEYS),
+        }
+    allowed_values = ALLOWED_CONFIG_VALUES.get(key, set())
+    if target_value not in allowed_values:
+        return {
+            "status": "error",
+            "action": "rollback_config",
+            "error": f"value '{target_value}' not a known state for {key}",
+            "allowed": sorted(allowed_values),
+        }
+
+    from chaos.lib.deployer import DeploymentError, apply_config
+
+    try:
+        marker = apply_config(
+            service=service_name,
+            config={key: target_value},
+            deployed_by="phoenix/remediation_tool.rollback_config",
+            rolled_back_from=rolled_back_from,
+        )
+    except DeploymentError as exc:
+        return {"status": "error", "action": "rollback_config", "error": str(exc)}
+
+    return {
+        "status": "ok",
+        "action": "rollback_config",
+        "service": service_name,
+        "key": key,
+        "rolled_back_from": rolled_back_from,
+        "to_value": target_value,
+        "timestamp": marker.get("timestamp"),
     }
 
 

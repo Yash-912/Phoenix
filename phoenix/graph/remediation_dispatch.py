@@ -23,11 +23,14 @@ REMEDIATION_DISPATCH: dict[str, Callable[[str], dict]] = {
 }
 
 # Actions with a different signature, bound to their fixed extra arguments.
-# Rollback receives (service, target_version, rolled_back_from); the version
-# comes from deployment history via rollback_target, never from the model, and
-# the marker name is provenance for the audit trail.
+# rollback_deployment receives (service, target_version, rolled_back_from); the
+# version comes from deployment history via rollback_target, never from the
+# model. rollback_config receives (service, key, target_value,
+# rolled_back_from); key and value come from config_rollback_target on the
+# same basis. The marker name in both is provenance for the audit trail.
 TIER_2_DISPATCH: dict[str, Callable[..., dict]] = {
     "rollback_deployment": remediation_tool.rollback_deployment,
+    "rollback_config": remediation_tool.rollback_config,
 }
 
 

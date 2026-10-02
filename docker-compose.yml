@@ -47,7 +47,11 @@ services:
     container_name: auth-service
     environment:
       - CHAOS_ENABLED=true
-      - DB_POOL_SIZE=10
+      # Read back from the running container's own /health response, not from
+      # docker, which is what rollback_config verifies against and what the
+      # rollback target resolver checks before acting -- see
+      # phoenix/graph/config_rollback_target.py.
+      - DB_POOL_SIZE=${AUTH_DB_POOL_SIZE:-10}
     ports:
       - "8002:8000"
     networks:
