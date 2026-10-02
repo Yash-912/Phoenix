@@ -184,6 +184,30 @@ def _jsonb(value: dict):
     return Jsonb(value)
 
 
+def get_incident_first_seen(incident_id: int) -> str | None:
+    """When this incident was first observed, or None if it cannot be read.
+
+    A read rather than a write, because the deployment correlation needs the
+    incident's onset and must not create a row in order to learn it. Same
+    no-pool-means-no-trail posture as the writers: a run without a database still
+    diagnoses, it just cannot say whether a deploy preceded the incident, and
+    the correlation verdicts say so rather than guessing.
+    """
+    pool = _get_pool()
+    if pool is None:
+        return None
+    try:
+        with pool.connection() as conn:
+            row = conn.execute(
+                "SELECT first_seen_at FROM incidents WHERE id = %(incident_id)s",
+                {"incident_id": incident_id},
+            ).fetchone()
+    except Exception as exc:  # noqa: BLE001 - an unreadable clock is not a failed run
+        _diagnose(exc, f"could not read first_seen_at for incident {incident_id}: {exc}")
+        return None
+    return row[0].isoformat() if row and row[0] else None
+
+
 def _execute(sql: str, params: dict) -> None:
     """Run one INSERT, committed, or do nothing if there is no pool to run it.
 

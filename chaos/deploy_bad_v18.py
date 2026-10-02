@@ -1,45 +1,45 @@
-"""Scenario 1: bad deployment — break checkout, record marker.
+"""Scenario 1: deploy the bad v18 artifact.
 
 Usage: python -m chaos.deploy_bad_v18 [--reset]
-Idempotent: repeated runs keep BROKEN on, single latest marker per minute is fine.
+
+This used to flip a process-local flag via POST /chaos/break, which a container
+restart silently cleared -- so "restart fixes it" was an artifact of where the
+state lived, not a fact about the release. It now deploys a genuinely different
+image. The v18 regression is baked into that image, so restarting v18 leaves it
+broken and only redeploying v17 restores service. That is the condition Tier 2
+exists to detect and reverse.
 """
 
 from __future__ import annotations
 
 import sys
 
-import requests
+from chaos.lib.deployer import apply_deployment
 
-from chaos.lib.deploy_tracker import write_deployment_marker
-
-CHECKOUT_URL = "http://localhost:8001"
+GOOD_VERSION = "v17"
+BAD_VERSION = "v18"
 
 
 def inject() -> dict:
-    r = requests.post(f"{CHECKOUT_URL}/chaos/break", timeout=5)
-    r.raise_for_status()
-    marker = write_deployment_marker(
+    marker = apply_deployment(
         service="checkout-service",
-        image_tag="v18",
-        git_commit="bad-v18",
-        config={"broken": True},
+        version=BAD_VERSION,
         deployed_by="chaos/deploy_bad_v18.py",
     )
-    print(f"injected bad deploy v18: {marker['timestamp']}")
+    print(
+        f"deployed bad {BAD_VERSION} to checkout-service at {marker['timestamp']} "
+        f"(digest={marker['image_digest']}, label={marker['observed_label_version']})"
+    )
     return marker
 
 
 def reset() -> None:
-    r = requests.post(f"{CHECKOUT_URL}/chaos/heal", timeout=5)
-    r.raise_for_status()
-    write_deployment_marker(
+    marker = apply_deployment(
         service="checkout-service",
-        image_tag="v17",
-        git_commit="good-v17",
-        config={"broken": False},
+        version=GOOD_VERSION,
         deployed_by="chaos/deploy_bad_v18.py --reset",
     )
-    print("reset to healthy v17")
+    print(f"reset to healthy {GOOD_VERSION} (label={marker['observed_label_version']})")
 
 
 if __name__ == "__main__":

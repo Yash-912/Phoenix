@@ -5,5 +5,11 @@ __pycache__/
 *.pyc
 .superpowers
 .pytest_cache
+
+# Deployment history is lab runtime state, not source. Each real deployment
+# writes a marker here, so committing it would fill the log with one file per
+# deploy and make every rollback show a diff. The record Phoenix acts on lives
+# in the running system; see chaos/lib/deploy_tracker.py for the override that
+# points tests and the API at a shared root instead of this checkout's.
 deployments/
 .worktrees/

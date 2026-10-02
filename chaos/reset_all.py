@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import requests
 
+# checkout-service is absent from this list on purpose. Its fault lives in the
+# image, so there is no flag to clear and no endpoint that could clear one --
+# asking it to 'heal' reported success while the service stayed broken. It is
+# reset by redeploying v17 through chaos/deploy_bad_v18.py --reset, which is the
+# same operation a Tier 2 rollback performs.
 TARGETS = [
-    ("checkout-service", "http://localhost:8001/chaos/heal"),
     ("payment-service", "http://localhost:8003/chaos/slow/disable"),
     ("worker-service", "http://localhost:8004/chaos/leak/stop"),
     ("api-gateway", "http://localhost:8005/chaos/heal"),

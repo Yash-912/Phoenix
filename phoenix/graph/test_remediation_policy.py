@@ -1,13 +1,39 @@
 from pathlib import Path
 from typing import get_args
 
+import pytest
+
+from phoenix.graph import remediation_policy
 from phoenix.graph.remediation_policy import CATEGORY_ACTIONS, plan_action
+from phoenix.graph.rollback_target import RollbackTarget
 from phoenix.graph.schemas import Hypothesis, ScoredHypothesis
 from phoenix.graph.state import AgentState
 
 SERVICE = "checkout-service"
 
-NO_ACTION_CATEGORIES = ("deploy", "config", "network", "unknown")
+# Phase 4 routes deploy to Tier 2; config, network, and unknown still have no
+# action, which is the honest answer while their tiers are unbuilt.
+NO_ACTION_CATEGORIES = ("config", "network", "unknown")
+
+
+@pytest.fixture(autouse=True)
+def _known_good_target(monkeypatch):
+    """Give deploy a resolvable target so policy tests exercise routing, not Docker.
+
+    The alternative -- letting these tests reach the live container and the real
+    deployment history -- would make the policy suite depend on whatever the lab
+    last deployed, so a test would pass or fail depending on lab state.
+    """
+    monkeypatch.setattr(
+        remediation_policy,
+        "_resolve_tier_2_target",
+        lambda action, service: RollbackTarget(
+            version="v17",
+            from_marker="2026-10-02T08:00:00+00:00",
+            from_version="v18",
+            reasoning="newest non-regression artifact is v17",
+        ),
+    )
 
 
 def _state(category: str | None, **overrides) -> AgentState:
@@ -41,8 +67,36 @@ def test_an_overload_category_plans_a_restart():
     assert plan_action(_state("overload")).action == "restart_service"
 
 
-def test_a_deploy_category_plans_no_action_and_says_which_tier_would():
+def test_a_deploy_category_plans_a_rollback_of_the_last_good_artifact():
+    """Phase 4 change: deploy maps to Tier 2 rather than to no action at all.
+
+    It deliberately does not plan a restart first. v18's regression is compiled
+    into the image, so restarting it cannot help, and PRD section 8 lists
+    Scenario 1 as Tier 2 directly. The version is resolved from history, never
+    from the hypothesis.
+    """
     plan = plan_action(_state("deploy"))
+
+    assert plan.available is True
+    assert plan.action == "rollback_deployment"
+    assert plan.container == SERVICE
+    assert plan.check == "deploy"
+    assert plan.args == ("v17", "2026-10-02T08:00:00+00:00")
+    assert "v17" in plan.reasoning
+
+
+def test_a_deploy_category_with_nothing_safe_to_restore_refuses_to_act(monkeypatch):
+    monkeypatch.setattr(remediation_policy, "_resolve_tier_2_target", lambda action, service: None)
+
+    plan = plan_action(_state("deploy"))
+
+    assert plan.available is False
+    assert plan.action is None
+    assert "no known-good artifact" in plan.reasoning
+
+
+def test_an_unmapped_category_says_which_tier_would_be_correct():
+    plan = plan_action(_state("config"))
 
     assert plan.available is False
     assert plan.action is None

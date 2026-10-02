@@ -772,6 +772,36 @@ def test_the_diagnoser_bills_its_tokens_even_when_it_proposed_nothing(monkeypatc
     assert state.tokens_spent == 760
 
 
+def test_a_hypothesis_this_console_cannot_encode_does_not_kill_the_run(monkeypatch, tmp_path):
+    """Hypothesis descriptions are the model's own words, and a live model writes
+    typographic hyphens and other non-ASCII characters as a matter of course.
+
+    Printing one of those to a cp1252 console raises UnicodeEncodeError from
+    inside the node, which aborts the whole run over a character nobody can act on.
+    The diagnosis still has to come back.
+    """
+    import io
+    import sys
+
+    awkward = Hypothesis(
+        description="the process died — it was killed mid‑checkout",
+        category="crash",
+    )
+    _stub_hypotheses(monkeypatch, DiagnoserOutput(hypotheses=[awkward]), tokens=900)
+
+    console = io.TextIOWrapper(
+        (tmp_path / "console.txt").open("wb"), encoding="cp1252", errors="strict"
+    )
+    monkeypatch.setattr(sys, "stdout", console)
+
+    state = nodes.diagnoser_node(_state(CRASH_EVIDENCE))
+
+    console.flush()
+    assert state.hypotheses, "the diagnosis must survive a console that cannot render it"
+    assert state.confidence > 0
+    assert state.tokens_spent == 900
+
+
 def test_both_nodes_accumulate_into_the_same_running_total(monkeypatch):
     _stub_hypotheses(monkeypatch, DiagnoserOutput(hypotheses=[CRASH]), tokens=1350)
     _stub_tool_calls(monkeypatch, [], tokens=940)
@@ -859,6 +889,26 @@ def _no_action(monkeypatch) -> list[str]:
     return called
 
 
+def _deploy_target(monkeypatch, *, running_version: str, history: list[dict]) -> None:
+    """Pin what policy reads when it resolves a rollback target.
+
+    Both reads are live by design -- the running container and the deployment
+    history are the two facts a rollback is allowed to trust -- so a test that
+    leaves them live is a test whose result depends on the lab.
+    """
+    from phoenix.graph import remediation_policy
+
+    monkeypatch.setattr(
+        remediation_policy,
+        "get_container_state",
+        lambda name: {"Config": {"Labels": {"app.version": running_version}}},
+    )
+    monkeypatch.setattr(
+        "phoenix.graph.rollback_target.get_recent_deployments",
+        lambda service, limit=10: {"status": "ok", "deployments": history},
+    )
+
+
 def _audit_rows(monkeypatch) -> list[dict]:
     """Every audit write with all its parts, which the shared _trail_spy drops."""
     rows: list[dict] = []
@@ -923,17 +973,48 @@ def test_the_attempt_cap_stops_a_misrouted_remediator_before_it_dispatches(monke
     assert "attempt" in update["escalation_reason"]
 
 
-def test_a_deploy_finding_calls_no_tool_at_all(monkeypatch):
-    called = _no_action(monkeypatch)
-    state = _remediator_state("deploy")
+def test_a_deploy_finding_calls_no_tool_when_history_offers_nothing_safe(monkeypatch):
+    """Both halves matter: nothing is deployed, and the run says so.
 
-    command = nodes.remediator_node(state)
+    The stubs are not incidental. Policy resolves a deploy's target by reading the
+    live container and the deployment history, so without them this test's outcome
+    depended on what the lab happened to be running -- it passed only when the
+    container was already on the good artifact and resolution therefore refused.
+    """
+    called = _no_action(monkeypatch)
+    _deploy_target(monkeypatch, running_version="v18", history=[
+        {"image_tag": "v18", "timestamp": "2026-10-02T08:00:00+00:00", "config": {"regression": True}},
+    ])
+
+    command = nodes.remediator_node(_remediator_state("deploy"))
     update = _update(command)
 
     assert called == []
     assert command.goto == END
     assert update["status"] == "action_unavailable"
     assert update.get("escalation_reason") is None
+
+
+def test_a_deploy_finding_with_a_safe_target_reaches_the_rollback(monkeypatch):
+    """The counterpart, so the test above cannot pass by the deploy category
+    simply having stopped mapping to an action."""
+    calls: list[dict] = []
+    monkeypatch.setitem(
+        dispatch.TIER_2_DISPATCH,
+        "rollback_deployment",
+        lambda service, *args: calls.append({"service": service, "args": args})
+        or {"status": "ok", "to_version": args[0]},
+    )
+    _deploy_target(monkeypatch, running_version="v18", history=[
+        {"image_tag": "v18", "timestamp": "2026-10-02T08:00:00+00:00", "config": {"regression": True}},
+        {"image_tag": "v17", "timestamp": "2026-10-01T08:00:00+00:00", "config": {"regression": False}},
+    ])
+
+    command = nodes.remediator_node(_remediator_state("deploy"))
+    update = _update(command)
+
+    assert calls == [{"service": SERVICE, "args": ("v17", "2026-10-02T08:00:00+00:00")}]
+    assert update["planned_action"]["action"] == "rollback_deployment"
 
 
 def test_a_run_with_no_surviving_hypothesis_acts_on_nothing(monkeypatch):
@@ -1156,7 +1237,7 @@ def test_the_check_runs_against_the_pre_action_snapshot_and_the_action_time(monk
 
     nodes.verifier_node(_verifier_state())
 
-    assert seen == [("crash", SERVICE, PRE_ACTION_SIGNAL, ACTION_AT)]
+    assert seen == [("crash", SERVICE, PRE_ACTION_SIGNAL, ACTION_AT, None)]
 
 
 def test_the_verdict_is_recorded_on_the_trail_and_kept_on_the_state(monkeypatch):

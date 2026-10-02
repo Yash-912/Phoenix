@@ -1,4 +1,4 @@
-"""Which Tier 1 action, if any, a confident diagnosis is allowed to take.
+"""Which action, if any, a confident diagnosis is allowed to take.
 
 This module is the boundary the whole mutating path leans on. The LLM proposes a
 root cause and names its category; the scorer turns evidence into a confidence;
@@ -15,13 +15,20 @@ implemented and allowlisted in remediation_tool.py but unrouted. They enter
 CATEGORY_ACTIONS as a data change when a scenario demands them, which is the
 point of keeping the mapping a table rather than a branch.
 
-**Why an unmapped category is a good outcome.** A deploy-category root cause has
-a confident diagnosis and no valid Tier 1 action -- the right action is a
-rollback, which is Tier 2 and does not exist until Phase 4. Restarting a service
-because its root cause was a bad deploy is the "unhealthy means restart" reflex
-PRD section 2 says Phoenix must be distinguishable from real understanding. The
-honest answer is to end with the diagnosis and say the correct tier is out of
-scope, which is a better artifact than a wrong restart.
+**Why deploy goes straight to Tier 2.** Phase 3 left it empty, and the reason
+recorded here was that restarting a service whose root cause was a bad deploy is
+the "unhealthy means restart" reflex PRD section 2 says Phoenix must be
+distinguishable from real understanding. Phase 4 keeps that reasoning and acts
+on it: the fix is to stop guessing a Tier 1 action, not to try a useless one.
+PRD section 8 lists Scenario 1 as Tier 2 directly, with no Tier 1 step, so
+restarting here would be inventing a round trip the spec does not ask for. The
+proof that Tier 1 was insufficient comes from the evidence, not from performing
+it -- v18 is baked into the image, so a restart cannot clear it.
+
+**Why an unmapped category is still a good outcome.** `config` and `network`
+remain empty, and an honest "the right action is Tier 2 rollback_config or Tier 3
+code fix, which this phase does not implement" is a better artifact than a wrong
+action. The table stays a table so adding them later is a data change.
 
 **Where the model's influence still reaches.** The LLM picks the category, and the
 category selects this row, so category -> action is inside the model's reach.
@@ -36,20 +43,29 @@ could suffice. Later elements are fallbacks on retry, and there are none yet.
 
 from dataclasses import dataclass
 
+from phoenix.graph.rollback_target import resolve_rollback_target
 from phoenix.graph.state import AgentState
+from phoenix.tools.docker_tool import get_container_state
 
 CATEGORY_ACTIONS: dict[str, tuple[str, ...]] = {
     "crash": ("restart_service",),
     "overload": ("restart_service",),
-    "deploy": (),
+    "deploy": ("rollback_deployment",),
     "config": (),
     "network": (),
     "unknown": (),
 }
 
-NO_TIER_1_REASON = (
-    "a {category} root cause has no Tier 1 action; the correct action is Tier 2 "
-    "(rollback), which is Phase 4"
+# Actions that replace an artifact rather than perturbing a running one. They
+# are Tier 2 by construction: not idempotent, not reversible by a second
+# invocation, and destructive if aimed at the wrong target. Keeping them
+# separate from ALLOWED_DOCKER_ACTIONS is what stops "allowed" from quietly
+# meaning "safe to repeat".
+TIER_2_ACTIONS = {"rollback_deployment"}
+
+NO_ACTION_REASON = (
+    "a {category} root cause has no action in this phase; the correct action is "
+    "Tier 2 (rollback_config) or Tier 3 (code fix), which are later phases"
 )
 
 
@@ -65,6 +81,13 @@ class ActionPlan:
     what was wrong rather than on what was done. Two actions that were meant to
     fix the same failure family are verified the same way, and one action used
     for two families would need the family to verify it correctly.
+
+    `args` carries whatever the chosen action needs beyond the container name.
+    For Tier 1 that is empty; for rollback it is the target version, which the
+    policy resolves from deployment history. Keeping it here rather than at the
+    call site means the dispatch table stays a flat name -> callable mapping and
+    the target version is decided in one place, by code that never reads model
+    output.
     """
 
     available: bool
@@ -72,6 +95,7 @@ class ActionPlan:
     container: str | None
     check: str | None
     reasoning: str
+    args: tuple[str, ...] = ()
 
 
 def plan_action(state: AgentState) -> ActionPlan:
@@ -93,20 +117,61 @@ def plan_action(state: AgentState) -> ActionPlan:
 
     category = state.hypotheses[0].hypothesis.category
     actions = CATEGORY_ACTIONS.get(category, ())
+    action = actions[0] if actions else None
 
-    if not actions:
+    if action is None:
         return ActionPlan(
             available=False,
             action=None,
             container=None,
             check=None,
-            reasoning=NO_TIER_1_REASON.format(category=category),
+            reasoning=NO_ACTION_REASON.format(category=category),
+        )
+
+    if action in TIER_2_ACTIONS:
+        target = _resolve_tier_2_target(action, state.service_name)
+        if target is None:
+            return ActionPlan(
+                available=False,
+                action=None,
+                container=None,
+                check=None,
+                reasoning=(
+                    f"top hypothesis is {category}, which maps to {action}, but deployment "
+                    f"history for {state.service_name} offers no known-good artifact to "
+                    f"restore; refusing rather than guessing a version"
+                ),
+            )
+        return ActionPlan(
+            available=True,
+            action=action,
+            container=state.service_name,
+            check=category,
+            reasoning=f"top hypothesis is {category}, which maps to {action}; {target.reasoning}",
+            args=(target.version, target.from_marker or ""),
         )
 
     return ActionPlan(
         available=True,
-        action=actions[0],
+        action=action,
         container=state.service_name,
         check=category,
-        reasoning=f"top hypothesis is {category}, which maps to {actions[0]}",
+        reasoning=f"top hypothesis is {category}, which maps to {action}",
     )
+
+
+def _resolve_tier_2_target(action: str, service_name: str):
+    """Read live container identity, then ask history for a version to restore.
+
+    The running version is fetched rather than assumed so the already-rolled-back
+    case is detected: once v17 is serving, the stale v18 evidence would otherwise
+    justify a second rollback of a healthy service. Returns None when there is no
+    safe target, which plan_action turns into an honest refusal.
+    """
+    running_version = None
+    container = get_container_state(service_name)
+    if isinstance(container, dict) and container.get("status") != "error":
+        labels = (container.get("Config") or {}).get("Labels") or {}
+        running_version = labels.get("app.version")
+
+    return resolve_rollback_target(service_name, running_version=running_version)
