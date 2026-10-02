@@ -41,14 +41,15 @@ import os
 import time
 
 from phoenix.graph.graph import build_graph
-from phoenix.graph.persist import close_persistence, list_unhandled_incidents
+from phoenix.graph.persist import close_persistence, list_unhandled_incidents, max_incident_id
 from phoenix.graph.state import AgentState
 
 POLL_INTERVAL_SECONDS = int(os.environ.get("PHOENIX_WATCH_INTERVAL_SECONDS", "10"))
 
 
-def poll_once() -> list[int]:
-    """Run every unhandled incident once. Returns the ids it started.
+def poll_once(after_id: int = 0) -> list[int]:
+    """Run every incident newer than `after_id` with no investigation yet.
+    Returns the ids it started.
 
     A single pass is the unit this module is tested against: run_forever is a
     thin loop around it, and nothing here has to fake time passing to be
@@ -61,7 +62,7 @@ def poll_once() -> list[int]:
     the run it could not complete.
     """
     started: list[int] = []
-    for incident_id, service_name in list_unhandled_incidents():
+    for incident_id, service_name in list_unhandled_incidents(after_id):
         print(f"[watcher] incident {incident_id} ({service_name}) has no investigation yet -- starting one")
         started.append(incident_id)
         try:
@@ -75,9 +76,20 @@ def poll_once() -> list[int]:
 
 
 def run_forever() -> None:
-    print(f"[watcher] polling for unhandled incidents every {POLL_INTERVAL_SECONDS}s")
+    """Poll forever, starting from a floor set once at startup.
+
+    The floor is read here, not inside poll_once, so it is fixed for the life
+    of the process: once an incident above it has been investigated it drops
+    out of list_unhandled_incidents on its own (it now has audit_log rows),
+    and nothing here needs to raise the floor to keep up with that.
+    """
+    floor = max_incident_id()
+    print(
+        f"[watcher] polling for unhandled incidents every {POLL_INTERVAL_SECONDS}s "
+        f"(ignoring incident {floor} and everything before it)"
+    )
     while True:
-        poll_once()
+        poll_once(floor)
         time.sleep(POLL_INTERVAL_SECONDS)
 
 
