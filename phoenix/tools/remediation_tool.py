@@ -202,7 +202,18 @@ def rollback_config(
 
 
 def clear_approved_cache(cache_key: str) -> dict:
-    """Clear a Redis key. Tier 1, low risk. Only single-key DEL, no FLUSHALL."""
+    """Clear a Redis key. Tier 1, low risk. Only single-key DEL, no FLUSHALL.
+
+    The RESP length prefix is computed from the encoded bytes, not len(cache_key):
+    a key with any non-ASCII character has more UTF-8 bytes than Python
+    characters, and a prefix built from the character count would frame the
+    command wrong, corrupting the protocol for every byte after it.
+
+    DEL's reply is read and checked rather than discarded. Redis answers with
+    an integer reply (":0" or ":1", both legitimate -- 0 means the key was
+    already gone) or an error reply ("-ERR ..."). Returning "ok" without
+    reading the reply would report success on a command Redis rejected.
+    """
     if not cache_key or not isinstance(cache_key, str):
         return {"status": "error", "error": "cache_key must be a non-empty string"}
     if "*" in cache_key or cache_key.upper() in ("*", "FLUSHALL", "FLUSHDB"):
@@ -211,11 +222,33 @@ def clear_approved_cache(cache_key: str) -> dict:
         import socket
 
         redis_host = os.environ.get("REDIS_HOST", "localhost")
+        key_bytes = cache_key.encode("utf-8")
+        cmd = (
+            b"*2\r\n$3\r\nDEL\r\n$" + str(len(key_bytes)).encode("ascii") + b"\r\n"
+            + key_bytes + b"\r\n"
+        )
         s = socket.create_connection((redis_host, 6379), timeout=5)
-        cmd = f"*2\r\n$3\r\nDEL\r\n${len(cache_key)}\r\n{cache_key}\r\n".encode()
-        s.sendall(cmd)
-        s.recv(1024)
-        s.close()
-        return {"status": "ok", "action": "clear_approved_cache", "key": cache_key}
+        try:
+            s.sendall(cmd)
+            reply = s.recv(1024)
+        finally:
+            s.close()
     except OSError as exc:
         return {"status": "error", "error": str(exc)}
+
+    if reply.startswith(b":"):
+        return {
+            "status": "ok",
+            "action": "clear_approved_cache",
+            "key": cache_key,
+            "deleted": reply.strip(b"\r\n") == b":1",
+        }
+    if reply.startswith(b"-"):
+        return {
+            "status": "error",
+            "error": reply.strip(b"\r\n").decode("utf-8", "replace").lstrip("-"),
+        }
+    return {
+        "status": "error",
+        "error": f"unexpected reply from redis: {reply!r}",
+    }
