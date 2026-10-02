@@ -549,3 +549,73 @@ def test_a_service_with_no_known_business_endpoint_is_refused_not_guessed(monkey
 
     assert result["status"] == "error"
     assert "no business endpoint" in result["error"]
+
+
+# --- config: a rollback_config result is verified by the service's own report
+
+
+AUTH_SERVICE = "auth-service"
+
+
+def _auth_health(pool_size: str | None = "10", status: str = "ok") -> dict:
+    app = {"status": status}
+    if pool_size is not None:
+        app["db_pool_size"] = pool_size
+    return {"container": {"Status": "running"}, "app": app}
+
+
+def test_a_config_rollback_verifies_when_the_service_reports_the_restored_value(monkeypatch):
+    monkeypatch.setattr(verification, "inspect_health", lambda name: _auth_health("10"))
+
+    outcome, detail = verification.run_check("config", AUTH_SERVICE, {}, ACTION_AT, "10")
+
+    assert outcome == "pass"
+    assert detail["key"] == "DB_POOL_SIZE"
+    assert detail["reported_value"] == "10"
+
+
+def test_a_service_still_reporting_the_regressed_value_does_not_verify(monkeypatch):
+    monkeypatch.setattr(verification, "inspect_health", lambda name: _auth_health("1"))
+
+    outcome, detail = verification.run_check("config", AUTH_SERVICE, {}, ACTION_AT, "10")
+
+    assert outcome == "fail"
+    assert "1" in detail["reason"]
+    assert "not restored" in detail["reason"]
+
+
+def test_a_config_check_with_no_recorded_target_cannot_verify(monkeypatch):
+    monkeypatch.setattr(verification, "inspect_health", lambda name: _auth_health("10"))
+
+    outcome, detail = verification.run_check("config", AUTH_SERVICE, {}, ACTION_AT, None)
+
+    assert outcome == "inconclusive"
+    assert "no target value" in detail["reason"]
+
+
+def test_an_unreachable_health_probe_is_inconclusive_for_a_config_check(monkeypatch):
+    monkeypatch.setattr(verification, "inspect_health", lambda name: _auth_health(status="error"))
+
+    outcome, _ = verification.run_check("config", AUTH_SERVICE, {}, ACTION_AT, "10")
+
+    assert outcome == "inconclusive"
+
+
+def test_a_health_response_missing_the_pool_field_is_inconclusive_not_a_pass(monkeypatch):
+    monkeypatch.setattr(verification, "inspect_health", lambda name: _auth_health(pool_size=None))
+
+    outcome, _ = verification.run_check("config", AUTH_SERVICE, {}, ACTION_AT, "10")
+
+    assert outcome == "inconclusive"
+
+
+def test_a_service_with_no_known_config_signal_is_refused_not_guessed(monkeypatch):
+    monkeypatch.setattr(
+        verification, "inspect_health",
+        lambda name: pytest.fail("must not probe a service it has no config signal for"),
+    )
+
+    outcome, detail = verification.run_check("config", "mystery-service", {}, ACTION_AT, "10")
+
+    assert outcome == "inconclusive"
+    assert "no config signal" in detail["reason"]

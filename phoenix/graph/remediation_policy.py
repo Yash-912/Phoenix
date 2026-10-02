@@ -25,10 +25,13 @@ restarting here would be inventing a round trip the spec does not ask for. The
 proof that Tier 1 was insufficient comes from the evidence, not from performing
 it -- v18 is baked into the image, so a restart cannot clear it.
 
-**Why an unmapped category is still a good outcome.** `config` and `network`
-remain empty, and an honest "the right action is Tier 2 rollback_config or Tier 3
-code fix, which this phase does not implement" is a better artifact than a wrong
-action. The table stays a table so adding them later is a data change.
+**Why config now routes too.** `config` maps to rollback_config on the same
+reasoning deploy maps to rollback_deployment: Scenario 4's root cause is a
+value, not a process state, and no Tier 1 action changes a value a restart
+would just reread unchanged. `network` remains empty -- there is no Tier 2
+action for it yet, and an honest "the right action is a later phase" is a
+better artifact than a wrong one. The table stays a table so adding it later is
+a data change.
 
 **Where the model's influence still reaches.** The LLM picks the category, and the
 category selects this row, so category -> action is inside the model's reach.
@@ -43,29 +46,48 @@ could suffice. Later elements are fallbacks on retry, and there are none yet.
 
 from dataclasses import dataclass
 
+from phoenix.graph.config_rollback_target import resolve_config_rollback_target
 from phoenix.graph.rollback_target import resolve_rollback_target
 from phoenix.graph.state import AgentState
 from phoenix.tools.docker_tool import get_container_state
+from phoenix.tools.health_tool import inspect_health
 
 CATEGORY_ACTIONS: dict[str, tuple[str, ...]] = {
     "crash": ("restart_service",),
     "overload": ("restart_service",),
     "deploy": ("rollback_deployment",),
-    "config": (),
+    "config": ("rollback_config",),
     "network": (),
     "unknown": (),
 }
 
-# Actions that replace an artifact rather than perturbing a running one. They
-# are Tier 2 by construction: not idempotent, not reversible by a second
-# invocation, and destructive if aimed at the wrong target. Keeping them
-# separate from ALLOWED_DOCKER_ACTIONS is what stops "allowed" from quietly
-# meaning "safe to repeat".
-TIER_2_ACTIONS = {"rollback_deployment"}
+# Actions that replace an artifact or a config value rather than perturbing a
+# running one. They are Tier 2 by construction: not idempotent, not reversible
+# by a second invocation, and destructive if aimed at the wrong target. Keeping
+# them separate from ALLOWED_DOCKER_ACTIONS is what stops "allowed" from
+# quietly meaning "safe to repeat".
+TIER_2_ACTIONS = {"rollback_deployment", "rollback_config"}
+
+# Which config key a rollback_config plan targets, by service. One key per
+# service today; the config dict markers already support more if a future
+# scenario needs it.
+CONFIG_KEYS_BY_SERVICE: dict[str, str] = {
+    "auth-service": "DB_POOL_SIZE",
+}
+
+# Where a config key's live value is reported, inside inspect_health's app
+# payload. A separate map from CONFIG_KEYS_BY_SERVICE on purpose: the key name
+# used across the policy/dispatch/tool boundary (DB_POOL_SIZE, matching the
+# compose env var) is not the field name the service's own /health JSON uses
+# (db_pool_size) -- conflating them would make a rename of either look like a
+# rename of both.
+CONFIG_HEALTH_FIELDS: dict[str, str] = {
+    "DB_POOL_SIZE": "db_pool_size",
+}
 
 NO_ACTION_REASON = (
     "a {category} root cause has no action in this phase; the correct action is "
-    "Tier 2 (rollback_config) or Tier 3 (code fix), which are later phases"
+    "a later phase"
 )
 
 
@@ -136,11 +158,7 @@ def plan_action(state: AgentState) -> ActionPlan:
                 action=None,
                 container=None,
                 check=None,
-                reasoning=(
-                    f"top hypothesis is {category}, which maps to {action}, but deployment "
-                    f"history for {state.service_name} offers no known-good artifact to "
-                    f"restore; refusing rather than guessing a version"
-                ),
+                reasoning=_tier_2_refusal_reason(action, category, state.service_name),
             )
         return ActionPlan(
             available=True,
@@ -148,7 +166,7 @@ def plan_action(state: AgentState) -> ActionPlan:
             container=state.service_name,
             check=category,
             reasoning=f"top hypothesis is {category}, which maps to {action}; {target.reasoning}",
-            args=(target.version, target.from_marker or ""),
+            args=_tier_2_args(action, target),
         )
 
     return ActionPlan(
@@ -161,17 +179,84 @@ def plan_action(state: AgentState) -> ActionPlan:
 
 
 def _resolve_tier_2_target(action: str, service_name: str):
-    """Read live container identity, then ask history for a version to restore.
+    """The target this Tier 2 action would restore, or None if there is nothing
+    safe to do.
 
-    The running version is fetched rather than assumed so the already-rolled-back
-    case is detected: once v17 is serving, the stale v18 evidence would otherwise
-    justify a second rollback of a healthy service. Returns None when there is no
-    safe target, which plan_action turns into an honest refusal.
+    One seam for both actions rather than one each, because plan_action's
+    Tier-2 branch is itself one piece of code: it resolves whichever target the
+    action needs, then hands the result to _tier_2_args without caring which
+    kind of target it got. Tests patch this function directly to give policy
+    tests a resolvable target without reaching the live container or real
+    deployment history.
     """
-    running_version = None
+    if action == "rollback_deployment":
+        return resolve_rollback_target(
+            service_name, running_version=_read_running_version(service_name)
+        )
+    if action == "rollback_config":
+        key = CONFIG_KEYS_BY_SERVICE.get(service_name)
+        if key is None:
+            return None
+        running_value = _read_running_config_value(service_name, key)
+        return resolve_config_rollback_target(service_name, key, running_value=running_value)
+    return None
+
+
+def _read_running_version(service_name: str) -> str | None:
+    """The live app.version label, read from the container -- or None.
+
+    Fetched rather than assumed so the already-rolled-back case is detected:
+    once v17 is serving, stale v18 evidence would otherwise justify a second
+    rollback of a healthy service.
+    """
     container = get_container_state(service_name)
     if isinstance(container, dict) and container.get("status") != "error":
         labels = (container.get("Config") or {}).get("Labels") or {}
-        running_version = labels.get("app.version")
+        return labels.get("app.version")
+    return None
 
-    return resolve_rollback_target(service_name, running_version=running_version)
+
+def _read_running_config_value(service_name: str, key: str) -> str | None:
+    """The live value of `key`, read from the service's own /health response.
+
+    Mirrors _read_running_version's reasoning for config: both exist so the
+    already-healed case is detectable before a second rollback is planned
+    against evidence that has not caught up yet.
+    """
+    field = CONFIG_HEALTH_FIELDS.get(key)
+    if field is None:
+        return None
+    health = inspect_health(service_name)
+    app = health.get("app") if isinstance(health, dict) else None
+    if not isinstance(app, dict) or app.get("status") != "ok":
+        return None
+    value = app.get(field)
+    return str(value) if value is not None else None
+
+
+def _tier_2_args(action: str, target) -> tuple[str, ...]:
+    """The dispatch args this target implies, keyed to rollback_config/
+    rollback_deployment's own signatures in remediation_tool.py."""
+    if action == "rollback_deployment":
+        return (target.version, target.from_marker or "")
+    if action == "rollback_config":
+        return (target.key, target.value, target.from_marker or "")
+    return ()
+
+
+def _tier_2_refusal_reason(action: str, category: str, service_name: str) -> str:
+    """Why plan_action refused this Tier 2 action, named precisely enough to
+    read in the audit trail without the code behind it."""
+    if action == "rollback_deployment":
+        return (
+            f"top hypothesis is {category}, which maps to {action}, but deployment "
+            f"history for {service_name} offers no known-good artifact to "
+            f"restore; refusing rather than guessing a version"
+        )
+    if action == "rollback_config":
+        return (
+            f"top hypothesis is {category}, which maps to {action}, but there is no "
+            f"known-good value to restore for {service_name}, or it already reports "
+            f"one; refusing rather than guessing a value"
+        )
+    return f"top hypothesis is {category}, which maps to {action}, but no target could be resolved"

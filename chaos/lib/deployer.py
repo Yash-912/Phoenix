@@ -69,6 +69,30 @@ VERSION_COMMIT = {"v17": "good-v17", "v18": "bad-v18"}
 
 DEPLOY_TIMEOUT_SECONDS = 600
 
+# The only services whose runtime config this module may switch, and the only
+# keys and values it will set for them. A config rollback does not replace an
+# artifact, so it has its own allowlist rather than reusing DEPLOYABLE_SERVICES
+# and KNOWN_VERSIONS -- a service could be configurable without being
+# redeployable, and conflating the two would let one allowlist's growth loosen
+# the other.
+CONFIGURABLE_SERVICES = {"auth-service"}
+
+# Maps (service, key) to the compose environment variable that actually reaches
+# the container. The container's own variable name (DB_POOL_SIZE) is not reused
+# as the compose-level one, because compose only recreates a container when the
+# *resolved* environment changes -- naming the host variable identically to the
+# container's own default would make "set DB_POOL_SIZE=10" and "do nothing"
+# indistinguishable to compose on the one value that matters most, the reset.
+CONFIG_ENV_VARS = {
+    ("auth-service", "DB_POOL_SIZE"): "AUTH_DB_POOL_SIZE",
+}
+
+# The values each key is known to take. A rollback to a value nobody verified
+# is the same mistake KNOWN_VERSIONS exists to prevent for images.
+CONFIG_KNOWN_VALUES = {
+    ("auth-service", "DB_POOL_SIZE"): {"1", "10"},
+}
+
 
 class DeploymentError(RuntimeError):
     """Raised when a deployment is refused or fails. Never swallowed."""
@@ -205,6 +229,63 @@ def apply_deployment(
         image_digest=digest,
         rolled_back_from=rolled_back_from,
     ) | {"observed_label_version": label_version}
+
+
+def apply_config(
+    service: str,
+    config: dict[str, str],
+    *,
+    deployed_by: str = "chaos/config_pool.py",
+    rolled_back_from: str | None = None,
+) -> dict:
+    """Set `config`'s keys on `service` and record what was set.
+
+    Unlike `apply_deployment`, this never builds: a config value is a runtime
+    input, not a compile-time one, so there is no artifact to produce and
+    nothing for `build=False`'s absent-image check to guard against. The only
+    thing that can make this fail is compose itself refusing to recreate the
+    container, which `_compose`'s returncode check already catches.
+
+    `config` is an entire key/value set rather than one pair so a future
+    multi-key config change does not need a new signature, but today's callers
+    only ever pass one.
+    """
+    if service not in CONFIGURABLE_SERVICES:
+        raise DeploymentError(
+            f"service '{service}' is not configurable; allowed: {sorted(CONFIGURABLE_SERVICES)}"
+        )
+
+    env = dict(os.environ)
+    for key, value in config.items():
+        var = CONFIG_ENV_VARS.get((service, key))
+        if var is None:
+            raise DeploymentError(f"key '{key}' is not configurable for '{service}'")
+        allowed = CONFIG_KNOWN_VALUES.get((service, key), set())
+        if value not in allowed:
+            raise DeploymentError(
+                f"value '{value}' is not a known state for {service}.{key}; "
+                f"known: {sorted(allowed)}"
+            )
+        env[var] = value
+    env.setdefault("POSTGRES_PASSWORD", os.environ.get("POSTGRES_PASSWORD", ""))
+    env.setdefault("PHOENIX_APP_PASSWORD", os.environ.get("PHOENIX_APP_PASSWORD", ""))
+
+    # --force-recreate for the same reason apply_deployment uses it: compose
+    # resolves the new environment either way, but the running container must
+    # actually be replaced for the new value to reach the process, not just be
+    # true the next time something else recreates it.
+    result = _compose("up", "-d", "--no-deps", "--force-recreate", service, env=env)
+    if result.returncode != 0:
+        raise DeploymentError(f"config change on {service} failed:\n{result.stderr[-2000:]}")
+
+    return write_deployment_marker(
+        service=service,
+        image_tag="same",
+        git_commit="same",
+        config=config,
+        deployed_by=deployed_by,
+        rolled_back_from=rolled_back_from,
+    )
 
 
 def _inspect_container(service: str) -> tuple[str | None, str | None]:

@@ -504,8 +504,13 @@ def remediator_node(state: AgentState) -> Command:
         "action_at": action_at,
         # What the action was supposed to achieve, so verification can check the
         # thing that was planned rather than inferring intent from the category.
-        # A rollback names the artifact it restored; Tier 1 has no such target.
-        "expected_version": result.get("to_version") if plan.action in TIER_2_ACTIONS else None,
+        # A deploy rollback names the artifact it restored (to_version); a config
+        # rollback names the value it restored (to_value). Tier 1 has neither.
+        "expected_version": (
+            (result.get("to_version") or result.get("to_value"))
+            if plan.action in TIER_2_ACTIONS
+            else None
+        ),
     }
     record_audit(
         state.incident_id,

@@ -277,3 +277,116 @@ def test_an_image_inspection_failure_does_not_read_as_absence_of_the_artifact(re
     deployer.apply_deployment("checkout-service", "v17", build=False)
 
     assert any("up" in argv for argv, _ in recorder.calls)
+
+
+# --- apply_config: refusals, nothing may be spawned for any of these --------
+
+
+@pytest.mark.parametrize("service", ["checkout-service", "postgres", "", "auth-service; rm -rf /"])
+def test_a_config_service_outside_the_configurable_set_is_refused_before_any_process_starts(recorder, service):
+    with pytest.raises(deployer.DeploymentError, match="not configurable"):
+        deployer.apply_config(service, {"DB_POOL_SIZE": "10"})
+
+    assert recorder.calls == []
+
+
+def test_a_config_key_outside_the_known_set_is_refused_before_any_process_starts(recorder):
+    with pytest.raises(deployer.DeploymentError, match="not configurable"):
+        deployer.apply_config("auth-service", {"REDIS_URL": "redis://evil"})
+
+    assert recorder.calls == []
+
+
+def test_a_config_value_outside_the_known_set_is_refused_before_any_process_starts(recorder):
+    with pytest.raises(deployer.DeploymentError, match="not a known state"):
+        deployer.apply_config("auth-service", {"DB_POOL_SIZE": "9999"})
+
+    assert recorder.calls == []
+
+
+def test_a_config_recreate_failure_raises_rather_than_writing_a_marker(recorder, monkeypatch):
+    recorder.returncode = 1
+
+    written = []
+    monkeypatch.setattr(
+        deployer,
+        "write_deployment_marker",
+        lambda **kwargs: written.append(kwargs) or {"timestamp": "now"},
+    )
+
+    with pytest.raises(deployer.DeploymentError, match="failed"):
+        deployer.apply_config("auth-service", {"DB_POOL_SIZE": "10"})
+
+    assert written == []
+
+
+# --- apply_config: the argv and environment are fixed to validated input ----
+
+
+def test_apply_config_never_builds(recorder, monkeypatch):
+    """A config value is a runtime input; there is no artifact for build_artifact
+    to produce and nothing it would be building towards."""
+    built: list[str] = []
+    monkeypatch.setattr(deployer, "build_artifact", lambda version: built.append(version))
+
+    deployer.apply_config("auth-service", {"DB_POOL_SIZE": "10"})
+
+    assert built == []
+    assert not any("build" in argv for argv, _ in recorder.calls)
+
+
+def test_apply_config_recreates_so_the_new_value_reaches_the_process(recorder):
+    deployer.apply_config("auth-service", {"DB_POOL_SIZE": "10"})
+
+    up_call = next(argv for argv, _ in recorder.calls if "up" in argv)
+    assert "--force-recreate" in up_call
+    assert up_call[-1] == "auth-service"
+
+
+def test_apply_config_is_never_run_through_a_shell(recorder):
+    deployer.apply_config("auth-service", {"DB_POOL_SIZE": "10"})
+
+    for _argv, kwargs in recorder.calls:
+        assert kwargs["shell"] is False
+
+
+def test_apply_config_maps_the_key_to_its_own_compose_variable(recorder):
+    """DB_POOL_SIZE is the container's own variable name; AUTH_DB_POOL_SIZE is the
+    compose-level one, kept distinct so compose actually sees a changed value on
+    the reset back to the container's own default."""
+    deployer.apply_config("auth-service", {"DB_POOL_SIZE": "10"})
+
+    up_call_kwargs = next(kwargs for argv, kwargs in recorder.calls if "up" in argv)
+    assert up_call_kwargs["env"]["AUTH_DB_POOL_SIZE"] == "10"
+    assert "DB_POOL_SIZE" not in up_call_kwargs["env"]
+
+
+def test_apply_config_records_a_marker_with_no_artifact_change(recorder, monkeypatch):
+    written = {}
+    monkeypatch.setattr(
+        deployer,
+        "write_deployment_marker",
+        lambda **kwargs: written.update(kwargs) or {"timestamp": "now"},
+    )
+
+    deployer.apply_config("auth-service", {"DB_POOL_SIZE": "10"})
+
+    assert written["image_tag"] == "same"
+    assert written["config"] == {"DB_POOL_SIZE": "10"}
+
+
+def test_apply_config_records_the_marker_it_reverted(recorder, monkeypatch):
+    written = {}
+    monkeypatch.setattr(
+        deployer,
+        "write_deployment_marker",
+        lambda **kwargs: written.update(kwargs) or {"timestamp": "now"},
+    )
+
+    deployer.apply_config(
+        "auth-service",
+        {"DB_POOL_SIZE": "10"},
+        rolled_back_from="2026-10-02T08:00:00+00-00.json",
+    )
+
+    assert written["rolled_back_from"] == "2026-10-02T08:00:00+00-00.json"
