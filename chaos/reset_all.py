@@ -14,6 +14,7 @@ from chaos.lib.deployer import DeploymentError
 # same operation a Tier 2 rollback performs.
 TARGETS = [
     ("payment-service", "http://localhost:8003/chaos/slow/disable"),
+    ("payment-service", "http://localhost:8003/chaos/blip/stop"),
     ("worker-service", "http://localhost:8004/chaos/leak/stop"),
     ("api-gateway", "http://localhost:8005/chaos/heal"),
 ]
