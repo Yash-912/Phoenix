@@ -208,6 +208,45 @@ def get_incident_first_seen(incident_id: int) -> str | None:
     return row[0].isoformat() if row and row[0] else None
 
 
+def list_unhandled_incidents() -> list[tuple[int, str]]:
+    """Active incidents with no audit_log row yet -- investigations that have
+    never been started, oldest first.
+
+    This is the read a watcher polls. "No audit_log row" rather than a
+    watcher-local set of seen ids, because the audit trail is already the
+    durable record of what has been investigated: a process restart loses an
+    in-memory set and would re-run every incident from scratch, while this
+    query asks the same question the trail was built to answer and gets it
+    right on the first poll after a restart.
+
+    A second alert for the same service+alertname while the first is still
+    active bumps that row's alert_count rather than creating a new incident
+    (001's partial unique index), so it does not reappear here once the first
+    poll has started a run against it -- the row already has audit_log rows.
+    An incident whose only run escalated is deliberately not retried: ending
+    with no action is this run's answer, not a reason to ask again next poll.
+
+    Same no-pool-means-nothing-to-report posture as every other read here: a
+    watcher with no database sees an empty list and polls again, rather than
+    raising out of its own loop.
+    """
+    pool = _get_pool()
+    if pool is None:
+        return []
+    try:
+        with pool.connection() as conn:
+            rows = conn.execute(
+                "SELECT id, service_name FROM incidents "
+                "WHERE status = 'active' "
+                "AND id NOT IN (SELECT DISTINCT incident_id FROM audit_log) "
+                "ORDER BY id"
+            ).fetchall()
+    except Exception as exc:  # noqa: BLE001 - an unreadable table is not a failed poll
+        _diagnose(exc, f"could not list unhandled incidents: {exc}")
+        return []
+    return [(row[0], row[1]) for row in rows]
+
+
 def _execute(sql: str, params: dict) -> None:
     """Run one INSERT, committed, or do nothing if there is no pool to run it.
 

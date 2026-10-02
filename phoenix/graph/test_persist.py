@@ -96,14 +96,34 @@ class StubJsonb:
         self.obj = obj
 
 
+class StubResult:
+    """Stands in for psycopg's cursor-like execute() return.
+
+    Rows are whatever the test queued on Recorder.query_results, popped one
+    result set per execute() call in order. A test that never queues one gets
+    an empty result set -- correct for the many writer tests that call
+    execute() and never read anything back.
+    """
+
+    def __init__(self, rows):
+        self._rows = rows
+
+    def fetchone(self):
+        return self._rows[0] if self._rows else None
+
+    def fetchall(self):
+        return self._rows
+
+
 class StubConnection:
     def __init__(self, recorder: "Recorder"):
         self._recorder = recorder
 
-    def execute(self, sql, params):
+    def execute(self, sql, params=None):
         self._recorder.statements.append((sql, params))
         if self._recorder.execute_error is not None:
             raise self._recorder.execute_error
+        return StubResult(self._recorder.next_query_result())
 
     def commit(self):
         self._recorder.commits += 1
@@ -133,12 +153,22 @@ class StubPool:
 class Recorder:
     """Everything the module asked the driver to do, in the order it asked."""
 
-    def __init__(self, connection_error=None, execute_error=None):
+    def __init__(self, connection_error=None, execute_error=None, query_results=None):
         self.statements: list[tuple[str, dict]] = []
         self.commits = 0
         self.pools: list[StubPool] = []
         self.connection_error = connection_error
         self.execute_error = execute_error
+        self.query_results: list[list] = list(query_results) if query_results else []
+
+    def next_query_result(self) -> list:
+        """Rows for the next execute() call, queued by the test, oldest first.
+
+        Popped rather than indexed so a test driving two reads in sequence --
+        the watcher's poll, say -- can give each its own result set without
+        tracking which call number it is on.
+        """
+        return self.query_results.pop(0) if self.query_results else []
 
     @property
     def sql(self) -> list[str]:
@@ -184,9 +214,11 @@ def clean_persist(monkeypatch):
     monkeypatch.delenv(persist.DATABASE_URL_ENV, raising=False)
 
 
-def _stub_driver(monkeypatch, *, connection_error=None, execute_error=None) -> Recorder:
+def _stub_driver(
+    monkeypatch, *, connection_error=None, execute_error=None, query_results=None
+) -> Recorder:
     """Put a fake psycopg where persist.py imports it, and record its calls."""
-    recorder = Recorder(connection_error, execute_error)
+    recorder = Recorder(connection_error, execute_error, query_results)
 
     def make_pool(conninfo, **kwargs):
         if connection_error is not None:
@@ -211,10 +243,15 @@ def _stub_driver(monkeypatch, *, connection_error=None, execute_error=None) -> R
     return recorder
 
 
-def _live(monkeypatch, *, connection_error=None, execute_error=None) -> Recorder:
+def _live(
+    monkeypatch, *, connection_error=None, execute_error=None, query_results=None
+) -> Recorder:
     """A stub driver behind a DATABASE_URL, so writes actually reach it."""
     recorder = _stub_driver(
-        monkeypatch, connection_error=connection_error, execute_error=execute_error
+        monkeypatch,
+        connection_error=connection_error,
+        execute_error=execute_error,
+        query_results=query_results,
     )
     monkeypatch.setenv(
         persist.DATABASE_URL_ENV, "postgresql://phoenix_app:secret@localhost:5432/phoenix"
@@ -1347,3 +1384,43 @@ def test_the_router_row_names_the_state_it_decided_on_and_nothing_else(monkeypat
         "destination",
         "escalation_reason",
     }
+
+
+# --- list_unhandled_incidents: what a watcher polls -------------------------
+
+
+def test_unhandled_incidents_come_back_oldest_first(monkeypatch):
+    _live(monkeypatch, query_results=[[(7, "checkout-service"), (9, "auth-service")]])
+
+    assert persist.list_unhandled_incidents() == [(7, "checkout-service"), (9, "auth-service")]
+
+
+def test_no_unhandled_incidents_is_an_empty_list_not_none(monkeypatch):
+    _live(monkeypatch, query_results=[[]])
+
+    assert persist.list_unhandled_incidents() == []
+
+
+def test_the_query_excludes_anything_with_an_audit_row_and_anything_not_active(monkeypatch):
+    """Pins the two clauses rather than just the result: a query that happened
+    to return the right rows today could still be wrong about why."""
+    recorder = _live(monkeypatch, query_results=[[]])
+
+    persist.list_unhandled_incidents()
+
+    sql = recorder.sql[0]
+    assert "status = 'active'" in sql
+    assert "NOT IN" in sql
+    assert "audit_log" in sql
+
+
+def test_a_run_with_no_database_lists_no_unhandled_incidents(monkeypatch):
+    """Same posture as every other read: no pool means nothing to report, not
+    an exception out of a watcher's loop."""
+    assert persist.list_unhandled_incidents() == []
+
+
+def test_an_unreadable_table_lists_no_unhandled_incidents_rather_than_raising(monkeypatch):
+    _live(monkeypatch, execute_error=RuntimeError("relation \"audit_log\" does not exist"))
+
+    assert persist.list_unhandled_incidents() == []
