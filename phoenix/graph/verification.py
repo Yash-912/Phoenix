@@ -12,14 +12,14 @@ measurement making a guess look better-supported than no measurement at all is
 the one direction an agent must never be wrong in. It is why the unusable check
 below is shared with the scorer rather than reimplemented.
 
-**The alert's window is the wrong window.** Task 7's cAdvisor rule uses a 30m
+**The alert's window is the wrong window.** The memory-growth alert uses a 30m
 deriv with a 10m for: on purpose, so one memory spike cannot trip it. Reusing
 that for verification would mean waiting ~40 minutes to confirm a restart, which
-is not a feature. A container that was just restarted is at baseline by
-definition, so the question is not "is memory growing" but "did the working set
-come down from what it was seconds ago". That is a comparison against the
-snapshot remediator_node took immediately before the action, over a short slope
-window to catch a leak that starts again straight away.
+is not a feature. A service that was just restarted is at baseline by definition,
+so the question is not "is memory growing" but "did the resident set come down
+from what it was seconds ago". That is a comparison against the snapshot
+remediator_node took immediately before the action, over a short slope window to
+catch a leak that starts again straight away.
 
 Every PromQL here is authored by this module. Nothing in this file consults the
 model, which is what keeps the observer's five read-only tools the whole read
@@ -52,26 +52,34 @@ SLOPE_WINDOW_MINUTES = 5
 SLOPE_TOLERANCE = 1024
 
 
-# job="cadvisor" is part of the selector rather than incidental: the alert rule
-# scopes on it, and an unscoped selector can match the same container name from
-# another job. Two series matching would mean reading an arbitrary one of them,
-# which is how a check ends up grading a restart on a series that has nothing
-# to do with the service it restarted.
-CADVISOR_JOB = "cadvisor"
+# The memory metric is process_resident_memory_bytes, not cAdvisor's
+# container_memory_working_set_bytes. cAdvisor on Docker Desktop/WSL2 exposes only
+# seven root-level cgroup series, labelled {__name__, id, instance, job}, with no
+# name label on any of them -- so a name-scoped cAdvisor selector returns zero
+# series here, and every overload check graded inconclusive regardless of what
+# the container was doing. Measured, not assumed: this was the second place that
+# inference went wrong, the first being the alert rule that reads the same signal.
+#
+# process_resident_memory_bytes is exported by prometheus_fastapi_instrumentator
+# on each service's own /metrics, which Prometheus already scrapes. It is also a
+# more honest measure for this check: the leak being verified is a growing Python
+# dict in one process, so the process's resident set is the thing that grew.
+#
+# job= is the service name because prometheus.yml names each scrape job after
+# its target. Scoping on it is load-bearing rather than incidental -- it is what
+# makes "exactly one series" a real constraint instead of a formality, so the
+# refusal in _single_sample keeps its meaning. Left unscoped, two services
+# exporting the same metric name would match, and reading an arbitrary one of them
+# is how a check ends up grading a restart on a series belonging to another service.
+MEMORY_METRIC = "process_resident_memory_bytes"
 
 
 def _memory_promql(service_name: str) -> str:
-    return (
-        f'container_memory_working_set_bytes'
-        f'{{name="{service_name}", job="{CADVISOR_JOB}"}}'
-    )
+    return f'{MEMORY_METRIC}{{job="{service_name}"}}'
 
 
 def _slope_promql(service_name: str) -> str:
-    return (
-        f'deriv(container_memory_working_set_bytes'
-        f'{{name="{service_name}", job="{CADVISOR_JOB}"}}[{SLOPE_WINDOW_MINUTES}m])'
-    )
+    return f'deriv({MEMORY_METRIC}{{job="{service_name}"}}[{SLOPE_WINDOW_MINUTES}m])'
 
 
 def _single_sample(payload) -> float | None:

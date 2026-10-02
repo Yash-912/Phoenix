@@ -6,7 +6,7 @@ from phoenix.graph import verification
 SERVICE = "checkout-service"
 
 BEFORE_BYTES = 900_000_000
-MEMORY_PROMQL = "container_memory_working_set_bytes"
+MEMORY_PROMQL = "process_resident_memory_bytes"
 ACTION_AT = "2026-09-30T10:00:00Z"
 STARTED_BEFORE = "2026-09-30T09:00:00Z"
 STARTED_AFTER = "2026-09-30T10:00:30Z"
@@ -19,7 +19,7 @@ def _series(value: str, name: str = MEMORY_PROMQL) -> dict:
         "status": "success",
         "data": {
             "resultType": "vector",
-            "result": [{"metric": {"__name__": name, "name": SERVICE}, "value": [1759000000.123, value]}],
+            "result": [{"metric": {"__name__": name, "job": SERVICE}, "value": [1759000000.123, value]}],
         },
     }
 
@@ -135,10 +135,35 @@ def test_an_ambiguous_series_is_inconclusive_rather_than_graded_on_an_arbitrary_
 
 
 def test_the_working_set_queries_are_scoped_to_the_job_the_alert_rule_uses():
-    """An unscoped selector can match the same container name from another job,
-    and then the check is reading an arbitrary series."""
-    assert 'job="cadvisor"' in verification._memory_promql(SERVICE)
-    assert 'job="cadvisor"' in verification._slope_promql(SERVICE)
+    """An unscoped selector can match the same metric from another job, and then
+    the check is reading an arbitrary series.
+
+    Scoped to job="<service>" rather than job="cadvisor": prometheus.yml names
+    each scrape job after its target, so this is the label that both identifies
+    the service and keeps the constraint that _single_sample relies on."""
+    assert f'job="{SERVICE}"' in verification._memory_promql(SERVICE)
+    assert f'job="{SERVICE}"' in verification._slope_promql(SERVICE)
+
+
+def test_the_working_set_queries_do_not_select_cadvisor():
+    """A regression guard, and the reason this file has one.
+
+    The queries used to select cAdvisor's container_memory_working_set_bytes on a
+    name label. Measured against a running Prometheus, that returns zero series on
+    Docker Desktop/WSL2: cAdvisor exposes seven root-level cgroup series with no
+    name label at all. Every overload check therefore graded inconclusive no
+    matter what the container was doing, and the failure looked like a flaky
+    query rather than a dead selector.
+
+    Asserted as an absence, because a test that only pins the current string would
+    still pass if someone reintroduced the dead selector alongside it. The check
+    that matters is not "the query has the right shape" but "the query names a
+    series that exists" -- and that can only be settled against a live Prometheus,
+    which is why this guard exists rather than being the whole test."""
+    for promql in (verification._memory_promql(SERVICE), verification._slope_promql(SERVICE)):
+        assert "container_memory_working_set_bytes" not in promql
+        assert "cadvisor" not in promql
+        assert verification.MEMORY_METRIC in promql
 
 
 def test_an_infinite_slope_is_climbing_rather_than_unmeasurable(monkeypatch):
