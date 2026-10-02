@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import requests
 
+from chaos import config_pool
+from chaos.lib.deployer import DeploymentError
+
 # checkout-service is absent from this list on purpose. Its fault lives in the
 # image, so there is no flag to clear and no endpoint that could clear one --
 # asking it to 'heal' reported success while the service stayed broken. It is
@@ -28,6 +31,17 @@ def main() -> None:
         print(f"auth-service: {r.status_code}")
     except requests.RequestException as exc:
         print(f"auth-service: FAILED {exc}")
+
+    # auth-service's DB_POOL_SIZE regression is a config value, not a toggle an
+    # endpoint can clear -- the same reason checkout-service is absent from
+    # TARGETS above. Reset the same way a Tier 2 rollback does: apply_config
+    # back to the known-good value, recreating the container so the value
+    # actually takes effect.
+    try:
+        marker = config_pool.reset()
+        print(f"auth-service DB_POOL_SIZE: reset to {marker['config']['DB_POOL_SIZE']}")
+    except DeploymentError as exc:
+        print(f"auth-service DB_POOL_SIZE: FAILED {exc}")
 
 
 if __name__ == "__main__":
