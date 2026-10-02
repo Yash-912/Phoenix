@@ -16,10 +16,27 @@ services:
       - phoenix-net
 
   checkout-service:
-    build: ./services/demo-checkout
+    # CHECKOUT_VERSION selects which pre-built artifact runs. It is a build arg,
+    # so the version is baked into the image rather than passed in at run time --
+    # restarting the container cannot change it. Rollback redeploys a different
+    # value of this one variable against the image already built for it. The
+    # rollback path does not build: it checks the tag exists locally first, so a
+    # version that was never built fails loudly rather than pulling an artifact
+    # nobody verified (see the proxy's denied IMAGES above).
+    image: agentic/checkout-service:${CHECKOUT_VERSION:-v17}
+    build:
+      context: ./services/demo-checkout
+      args:
+        APP_VERSION: ${CHECKOUT_VERSION:-v17}
+        REGRESSION_ENABLED: ${CHECKOUT_REGRESSION:-false}
     container_name: checkout-service
     environment:
       - CHAOS_ENABLED=true
+    labels:
+      # Read back from the running container by the observer. This is the
+      # artifact identity that verification trusts, as opposed to the version
+      # the process claims over HTTP.
+      - app.version=${CHECKOUT_VERSION:-v17}
     ports:
       - "8001:8000"
     networks:
@@ -195,8 +212,6 @@ services:
       DATABASE_URL: postgresql://phoenix_app:${PHOENIX_APP_PASSWORD}@postgres:5432/phoenix
     ports:
       - "5000:8000"
-    volumes:
-      - ./deployments:/deployments:ro
     networks:
       - phoenix-net
     depends_on:

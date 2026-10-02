@@ -1,6 +1,8 @@
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
+import pytest
+
 from phoenix.graph import verification
 
 SERVICE = "checkout-service"
@@ -387,3 +389,163 @@ def test_a_container_that_is_not_running_does_not_verify(monkeypatch):
     outcome, _ = verification.run_check("crash", SERVICE, {}, ACTION_AT)
 
     assert outcome == "fail"
+
+
+# --- Phase 4: deploy (Tier 2) verification ---------------------------------
+#
+# A deploy is verified by two independent facts: which artifact the container
+# says it is, and whether the business endpoint works. /health is green in both
+# artifacts, so none of these tests consult it -- that is the trap this category
+# exists to avoid.
+
+
+def _deploy_container(version: str | None = "v17", digest: str = "sha256:abc") -> dict:
+    labels = {"app.version": version} if version else {}
+    return {
+        "Image": digest,
+        "Config": {"Labels": labels},
+        "State": {"Status": "running"},
+    }
+
+
+def _endpoint(status_code: int = 200, body: str = '{"order_id":"demo-order-1"}') -> dict:
+    return {"status": "ok", "url": "http://localhost:8001/checkout", "http_status": status_code,
+            "body": body, "serving": status_code < 500}
+
+
+def _deploy_probes(monkeypatch, version="v17", endpoint=None, digest="sha256:abc") -> None:
+    monkeypatch.setattr(verification, "get_container_state", lambda name: _deploy_container(version, digest))
+    monkeypatch.setattr(
+        verification, "_probe_business_endpoint",
+        lambda name: endpoint if endpoint is not None else _endpoint(),
+    )
+
+
+def test_a_rollback_verifies_when_the_artifact_is_replaced_and_the_endpoint_serves(monkeypatch):
+    _deploy_probes(monkeypatch)
+
+    outcome, detail = verification.run_check("deploy", SERVICE, {}, ACTION_AT, "v17")
+
+    assert outcome == "pass"
+    assert detail["running_version"] == "v17"
+    assert detail["image_digest"] == "sha256:abc"
+
+
+def test_a_container_still_running_the_bad_release_does_not_verify(monkeypatch):
+    """The failure a fake verification would miss: identity unchanged."""
+    _deploy_probes(monkeypatch, version="v18")
+
+    outcome, detail = verification.run_check("deploy", SERVICE, {}, ACTION_AT, "v17")
+
+    assert outcome == "fail"
+    assert "v18" in detail["reason"]
+    assert "not replaced" in detail["reason"]
+
+
+def test_the_right_artifact_that_still_rejects_traffic_does_not_verify(monkeypatch):
+    """Identity alone is not recovery: v17 could be up but wedged."""
+    _deploy_probes(monkeypatch, version="v17", endpoint=_endpoint(500, "checkout unavailable (v17)"))
+
+    outcome, detail = verification.run_check("deploy", SERVICE, {}, ACTION_AT, "v17")
+
+    assert outcome == "fail"
+    assert "still rejects" in detail["reason"]
+
+
+def test_a_container_with_no_version_label_is_unreadable_rather_than_a_pass(monkeypatch):
+    """No identity means no basis for calling it recovered."""
+    _deploy_probes(monkeypatch, version=None)
+
+    outcome, detail = verification.run_check("deploy", SERVICE, {}, ACTION_AT, "v17")
+
+    assert outcome == "inconclusive"
+    assert "app.version" in detail["reason"]
+
+
+def test_a_deploy_check_with_no_recorded_target_cannot_verify(monkeypatch):
+    _deploy_probes(monkeypatch)
+
+    outcome, detail = verification.run_check("deploy", SERVICE, {}, ACTION_AT, None)
+
+    assert outcome == "inconclusive"
+    assert "no target version" in detail["reason"]
+
+
+def test_an_unreachable_container_is_inconclusive_not_a_failure(monkeypatch):
+    monkeypatch.setattr(
+        verification, "get_container_state",
+        lambda name: {"status": "error", "error": "connection refused"},
+    )
+
+    outcome, _ = verification.run_check("deploy", SERVICE, {}, ACTION_AT, "v17")
+
+    assert outcome == "inconclusive"
+
+
+def test_the_deploy_check_never_reads_the_health_endpoint(monkeypatch):
+    """/health is green in v18, so consulting it would pass a broken release."""
+
+    def forbidden(name):
+        raise AssertionError("a deploy check must not trust /health")
+
+    monkeypatch.setattr(verification, "inspect_health", forbidden)
+    _deploy_probes(monkeypatch, version="v18")
+
+    outcome, _ = verification.run_check("deploy", SERVICE, {}, ACTION_AT, "v17")
+
+    assert outcome == "fail"
+
+
+def test_a_500_is_recorded_as_evidence_rather_than_raised(monkeypatch):
+    """A rejection is the thing being verified, so it must survive as a reading."""
+    seen = []
+
+    class Response:
+        status_code = 500
+        text = "checkout unavailable (v18)"
+
+    monkeypatch.setattr(verification.time, "sleep", lambda s: None)
+
+    def fake_get(url, timeout=None):
+        seen.append(url)
+        return Response()
+
+    monkeypatch.setattr(verification.requests, "get", fake_get)
+
+    result = verification._probe_business_endpoint(SERVICE)
+
+    assert result["http_status"] == 500
+    assert result["serving"] is False
+    assert "v18" in result["body"]
+    assert seen == ["http://localhost:8001/checkout"]
+
+
+def test_an_unreachable_endpoint_is_retried_then_reported_unreadable(monkeypatch):
+    attempts = []
+    monkeypatch.setattr(verification.time, "sleep", lambda s: attempts.append(s))
+
+    def refuse(url, timeout=None):
+        raise verification.requests.RequestException("connection refused")
+
+    monkeypatch.setattr(verification.requests, "get", refuse)
+
+    result = verification._probe_business_endpoint(SERVICE)
+
+    assert result["status"] == "error"
+    assert "connection refused" in result["error"]
+    # Bounded: an endpoint that never answers is a failure to read, not a reason
+    # to hold the run open indefinitely.
+    assert len(attempts) == verification.DEPLOY_SETTLE_ATTEMPTS
+
+
+def test_a_service_with_no_known_business_endpoint_is_refused_not_guessed(monkeypatch):
+    """Guessing a port could read some other service's answer as this one's."""
+    monkeypatch.setattr(
+        verification.requests, "get",
+        lambda *a, **k: pytest.fail("must not probe an endpoint it does not know"),
+    )
+
+    result = verification._probe_business_endpoint("mystery-service")
+
+    assert result["status"] == "error"
+    assert "no business endpoint" in result["error"]

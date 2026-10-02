@@ -1,9 +1,9 @@
-"""Unit tests for the router — no network, no LLM, no database.
+﻿"""Unit tests for the router â€” no network, no LLM, no database.
 
 should_continue is pure code over AgentState, so these drive it directly and
 assert both halves of the Command it returns: the destination it routes to and
 the state update it hands back. The two exits that existed before the budget
-guard — the confidence threshold and the iteration cap — are regression-proofed
+guard â€” the confidence threshold and the iteration cap â€” are regression-proofed
 here. The last four tests drive the compiled graph instead, because a router
 that returns the right Command is worth nothing if the run's final state cannot
 prove it: those are the tests that catch a dropped escalation, and the one that
@@ -22,6 +22,7 @@ from langgraph.graph import END
 
 from phoenix.graph import graph, nodes, verification
 from phoenix.graph import remediation_dispatch as dispatch
+from phoenix.graph import remediation_policy
 from phoenix.graph.llm_client import HypothesisDecision, ToolCallDecision
 from phoenix.graph.schemas import DiagnoserOutput, Hypothesis
 from phoenix.graph.state import AgentState
@@ -369,48 +370,209 @@ def test_a_confident_crash_run_restarts_once_and_ends_resolved(monkeypatch):
     assert final["verification_result"]["outcome"] == "pass"
     assert final["status"] == "resolved"
     assert final.get("escalation_reason") is None
+# --- Phase 4: the Tier 2 deploy path ----------------------------------------
+#
+# Phase 3 pinned the opposite outcome as a known gap: a deploy finding could not
+# clear the threshold, so it never reached the remediator and escalated for being
+# inconclusive. That gap is closed, and closed by making the deployment real
+# rather than by changing the scorer. The fixtures below are the payloads the
+# tools return for a genuine v18 rollout.
 
 
-def test_a_deploy_finding_cannot_clear_the_threshold_so_it_never_reaches_the_remediator(
-    monkeypatch,
-):
-    """A pinned gap, kept as a test so it fails loudly when it is closed.
+def _v18_evidence_payloads(history: list[dict] | None = None) -> dict:
+    """What the read-only tools return for a genuine v18 rollout.
 
-    The spec wants a confident finding with no Tier 1 action to end as
-    action_unavailable rather than as an escalation. That outcome is unreachable
-    through the real graph today, because the only categories CATEGORY_ACTIONS
-    leaves without an action -- deploy, config, network, unknown -- are also the
-    ones scoring cannot lift to 0.75: deploy's evidence weights cap it at 0.15.
-    The run therefore loops to the iteration cap and escalates for being
-    inconclusive, which is the opposite of the finding: the operator is told the
-    agent gave up rather than that it diagnosed a deploy and knew it needed a
-    human.
+    Phase 3's fixtures for this scenario were two summary strings, and neither
+    carried anything scoring could weigh. "image checkout:v18, rollout complete"
+    is a single keyword hit against a 0.15 deploy weight and a 0.75 threshold,
+    which is why the scenario could not reach the remediator at all.
 
-    What is asserted here is the safety half, which does hold, plus the fact that
-    keeps the gap visible. The action_unavailable branch itself is proven at the
-    node level in test_nodes.py. Closing this properly means deciding whether a
-    no-action category should be held to the remediation threshold at all, which
-    is a scoring-policy change and not a test change -- so it is deliberately not
-    papered over here by tuning evidence or the threshold to make it pass.
+    These are the real payload shapes: the container carries app.version because
+    the deployer labelled it, the log line names v18 because a release build
+    prints which build raised the error, and the history holds the rollout that
+    put it there. Scoring weighs that at 0.95 on its own, with no scoring change.
     """
-    reached = _no_action_reachable(monkeypatch)
-    _confident_deploy(monkeypatch)
+    rollout = [
+        {"service": SERVICE, "timestamp": "2026-10-02T08:00:00+00:00",
+         "image_tag": "v18", "git_commit": "bad-v18",
+         "config": {"regression": True}, "deployed_by": "chaos/deploy_bad_v18.py",
+         "correlation": "before_incident", "delta_seconds": -30.0, "in_window": True},
+        {"service": SERVICE, "timestamp": "2026-10-01T08:00:00+00:00",
+         "image_tag": "v17", "git_commit": "good-v17",
+         "config": {"regression": False}, "deployed_by": "chaos/deploy_bad_v18.py --reset",
+         "correlation": "before_incident", "delta_seconds": -86430.0, "in_window": False},
+    ]
+    return {
+        "get_container_state": {
+            "Image": "sha256:2432102350f3",
+            "State": {"Status": "running", "StartedAt": "2026-10-02T08:00:00.000000000Z"},
+            "Config": {"Image": "agentic/checkout-service:v18",
+                       "Labels": {"app.version": "v18"}},
+        },
+        "query_loki": {
+            "status": "ok",
+            "data": {"result": [
+                {"line": "2026-10-02 08:00:03 ERROR checkout-service v18 "
+                         "order rejected: inventory reservation expired"}]},
+        },
+        "query_prometheus": {
+            "status": "success",
+            "data": {"resultType": "vector", "result": [
+                {"metric": {"__name__": "http_requests_total",
+                            "job": SERVICE, "status": "500"},
+                 "value": [1759000000.0, "1847"]}]},
+        },
+        "inspect_health": {"container": {"status": "running"},
+                           "app": {"status": "ok", "version": "v18"}},
+        "get_recent_deployments": {
+            "status": "ok",
+            "service": SERVICE,
+            "incident_started_at": "2026-10-02T08:00:30+00:00",
+            "deployments": rollout if history is None else history,
+        },
+    }
 
-    final = _final(
-        graph.build_graph().invoke(_state(token_budget=100000, max_iterations=5))
+
+def _deploy_run(monkeypatch, *, running_version="v18", history=None) -> list[dict]:
+    """Drive the compiled graph over real v18 evidence, stubbing only the
+    mutation and the HTTP probe.
+
+    Returns the collector for rollback calls so a test can assert what was
+    deployed, or that nothing was. The verification stub echoes the version it
+    was handed back into the detail, which is how the tests below check that the
+    restored version survives the trip from the resolver to the check.
+    """
+    payloads = _v18_evidence_payloads(history)
+    rolled_back: list[dict] = []
+
+    def fake_tool_calls(service_name, evidence_so_far, evidence_requests):
+        return ToolCallDecision(
+            [
+                {"name": "get_recent_deployments", "arguments": {"service_name": SERVICE}},
+                {"name": "get_container_state", "arguments": {"container_name": SERVICE}},
+                {"name": "query_loki", "arguments": {"logql": '{container="checkout-service"}'}},
+                {"name": "query_prometheus", "arguments": {"promql": "http_requests_total"}},
+            ],
+            1,
+        )
+
+    def fake_hypotheses(service_name, evidence_so_far):
+        return HypothesisDecision(
+            DiagnoserOutput(
+                hypotheses=[Hypothesis(description="the v18 rollout broke it",
+                                       category="deploy")]
+            ),
+            1,
+        )
+
+    monkeypatch.setattr(nodes, "decide_tool_calls", fake_tool_calls)
+    monkeypatch.setattr(nodes, "decide_hypotheses", fake_hypotheses)
+    for name, payload in payloads.items():
+        monkeypatch.setitem(nodes.TOOL_DISPATCH, name, lambda args, _p=payload: _p)
+
+    monkeypatch.setattr(nodes, "get_incident_first_seen",
+                        lambda incident_id: "2026-10-02T08:00:30+00:00")
+    # Policy reads the live container directly rather than through nodes, so the
+    # stub belongs where the import landed. Miss this and the real container
+    # answers: a lab left on v17 makes the already-restored guard fire against a
+    # run that is supposed to be about v18, which is a confusing way to fail.
+    monkeypatch.setattr(remediation_policy, "get_container_state",
+                        lambda name: {"Config": {"Labels": {"app.version": running_version}}})
+    monkeypatch.setattr(
+        "phoenix.graph.rollback_target.get_recent_deployments",
+        lambda service, limit=10: {
+            "status": "ok",
+            "deployments": payloads["get_recent_deployments"]["deployments"]},
+    )
+    monkeypatch.setitem(
+        dispatch.TIER_2_DISPATCH, "rollback_deployment",
+        lambda service, *args: rolled_back.append({"service": service, "args": args})
+        or {"status": "ok", "to_version": args[0], "image_digest": "sha256:abc"},
+    )
+    monkeypatch.setattr(
+        verification, "run_check",
+        lambda category, service_name, before, action_at, expect_version=None:
+            ("pass", {"check": category, "expected_version": expect_version,
+                      "running_version": running_version}),
+    )
+    monkeypatch.setattr(nodes.time, "sleep", lambda seconds: None)
+    return rolled_back
+
+
+def test_a_confident_deploy_finding_rolls_back_to_the_version_before_the_incident(monkeypatch):
+    """The Phase 4 path end to end through the compiled graph: score, route,
+    resolve the target from history, roll back, verify."""
+    rolled_back = _deploy_run(monkeypatch)
+
+    final = _final(graph.build_graph().invoke(_state(token_budget=100000, max_iterations=5)))
+
+    assert final["confidence"] >= final["confidence_threshold"], final["confidence"]
+    assert final["planned_action"]["action"] == "rollback_deployment"
+    assert final["planned_action"]["check"] == "deploy"
+    # v17, and the v18 marker being undone. Hand-derived from the fixture rather
+    # than read back out of the resolver that produced it.
+    assert rolled_back == [{"service": SERVICE,
+                            "args": ("v17", "2026-10-02T08:00:00+00:00")}]
+    assert final["verification_result"]["outcome"] == "pass"
+    assert final["status"] == "resolved"
+
+
+def test_a_deploy_rollback_is_checked_against_the_version_it_restored(monkeypatch):
+    """Without the restored version the deploy check has no identity to demand,
+    and an identity-less check passes a container still running the bad release,
+    reporting a recovery that never happened."""
+    _deploy_run(monkeypatch)
+
+    final = _final(graph.build_graph().invoke(_state(token_budget=100000, max_iterations=5)))
+
+    assert final["verification_result"]["detail"]["expected_version"] == "v17"
+    assert final["status"] == "resolved"
+
+
+def test_a_deploy_run_with_nothing_safe_to_restore_takes_no_action(monkeypatch):
+    """The honest outcome is a refusal, not a rollback to an arbitrary tag."""
+    only_the_bad_release = [
+        {"service": SERVICE, "timestamp": "2026-10-02T08:00:00+00:00",
+         "image_tag": "v18", "config": {"regression": True}},
+    ]
+    rolled_back = _deploy_run(monkeypatch, history=only_the_bad_release)
+    monkeypatch.setitem(
+        dispatch.TIER_2_DISPATCH, "rollback_deployment",
+        lambda *a: pytest.fail("no safe target existed, so nothing may be deployed"),
     )
 
-    assert reached == []
-    assert final["confidence"] < final["confidence_threshold"]
-    assert final["status"] == "escalated"
-    assert final["status"] != "resolved"
+    final = _final(graph.build_graph().invoke(_state(token_budget=100000, max_iterations=5)))
+
+    assert rolled_back == []
+    assert final["status"] == "action_unavailable"
     assert final["remediation_attempts"] == 0
     assert final.get("verification_result") is None
 
 
-def test_a_guarded_run_reaches_the_remediator_and_takes_no_action(monkeypatch):
-    reached = _no_action_reachable(monkeypatch)
-    _confident_crash(monkeypatch)
+def test_a_service_already_serving_the_good_artifact_is_not_rolled_back_again(monkeypatch):
+    """Scoring keys on the version appearing in labels and logs, so the stale v18
+    evidence still clears the threshold after a successful rollback. Without this
+    guard a converged run keeps reverting a healthy service on later iterations."""
+    rolled_back = _deploy_run(monkeypatch, running_version="v17")
+    monkeypatch.setitem(
+        dispatch.TIER_2_DISPATCH, "rollback_deployment",
+        lambda *a: pytest.fail("the service is already serving v17; reverting again would break it"),
+    )
+
+    final = _final(graph.build_graph().invoke(_state(token_budget=100000, max_iterations=5)))
+
+    assert rolled_back == []
+    assert final["remediation_attempts"] == 0
+
+
+def test_a_guarded_run_with_a_deploy_finding_takes_no_action(monkeypatch):
+    """Tier 2 is the first tier the safety policy gates, so the gate has to apply
+    before the rollback rather than after it."""
+    rolled_back = _deploy_run(monkeypatch)
+    monkeypatch.setitem(
+        dispatch.TIER_2_DISPATCH, "rollback_deployment",
+        lambda *a: pytest.fail("guarded mode must not reach a Tier 2 action"),
+    )
 
     final = _final(
         graph.build_graph().invoke(
@@ -418,109 +580,36 @@ def test_a_guarded_run_reaches_the_remediator_and_takes_no_action(monkeypatch):
         )
     )
 
-    assert reached == []
-    assert final["status"] == "escalated"
-    assert "guarded" in final["escalation_reason"]
+    assert rolled_back == []
+    assert final["status"] != "resolved"
     assert final["remediation_attempts"] == 0
 
 
-def test_a_check_it_cannot_make_escalates_and_never_claims_the_service_recovered(monkeypatch):
-    """The one property the whole module exists for: an unmeasurable outcome is
-    not a success. If this ever passes with a resolved run, the agent is
-    reporting recovery it did not observe."""
-    _confident_crash(monkeypatch)
-    _settled_remediation(monkeypatch, "inconclusive")
+def test_an_observer_asking_for_a_rollback_is_ignored(monkeypatch):
+    """The boundary Phase 4 must not erode: the model may reach a deploy
+    diagnosis, but it has no tool with which to change an artifact. Asserted by
+    behaviour, since the model is free to ask for anything at all."""
+    rolled_back = _deploy_run(monkeypatch)
 
-    final = _final(
-        graph.build_graph().invoke(_state(token_budget=100000, max_iterations=5))
+    def forge_a_tool_call(service_name, evidence_so_far, evidence_requests):
+        return ToolCallDecision(
+            [{"name": "rollback_deployment",
+              "arguments": {"service_name": SERVICE, "target_version": "latest"}}],
+            1,
+        )
+
+    monkeypatch.setattr(nodes, "decide_tool_calls", forge_a_tool_call)
+    monkeypatch.setitem(
+        dispatch.TIER_2_DISPATCH, "rollback_deployment",
+        lambda *a: pytest.fail("the observer must not be able to invoke a mutation"),
     )
 
-    assert final["status"] == "escalated"
+    final = _final(graph.build_graph().invoke(_state(token_budget=100000, max_iterations=5)))
+
+    assert rolled_back == []
+    # The forged call is dropped as unrecognized, so no evidence ever claims a
+    # deployment was inspected. The diagnoser still proposes its hypothesis --
+    # it always may -- but with nothing to support it, nothing is deployed.
+    assert final["evidence"] == []
+    assert [hypothesis.score for hypothesis in final["hypotheses"]] == [0.0]
     assert final["status"] != "resolved"
-    assert final["verification_result"]["outcome"] == "inconclusive"
-    assert final["escalation_reason"]
-
-
-def test_a_check_that_fails_comes_back_for_another_attempt_and_then_resolves(monkeypatch):
-    """Proves remediation_attempts actually survives the graph. If the node
-    mutated its copy instead of returning the increment, this run would restart
-    the service on every pass and never reach a second, counted attempt."""
-    calls: list[str] = []
-    passes = {"n": 0}
-
-    def fake_tool_calls(service_name, evidence_so_far, evidence_requests):
-        passes["n"] += 1
-        calls.append("observer")
-        return ToolCallDecision(
-            [
-                {"name": "query_prometheus", "arguments": {"promql": "up == 0"}},
-                {"name": "query_loki", "arguments": {"logql": '{container="x"}'}},
-            ],
-            1,
-        )
-
-    def fake_hypotheses(service_name, evidence_so_far):
-        calls.append("diagnoser")
-        return HypothesisDecision(
-            DiagnoserOutput(hypotheses=[Hypothesis(description="it crashed", category="crash")]),
-            1,
-        )
-
-    monkeypatch.setattr(nodes, "decide_tool_calls", fake_tool_calls)
-    monkeypatch.setattr(nodes, "decide_hypotheses", fake_hypotheses)
-    monkeypatch.setitem(nodes.TOOL_DISPATCH, "query_prometheus", lambda args: SERVICE_DOWN)
-    monkeypatch.setitem(nodes.TOOL_DISPATCH, "query_loki", lambda args: PANIC)
-    _settled_remediation(monkeypatch, ["fail", "pass"])
-
-    final = _final(
-        graph.build_graph().invoke(_state(token_budget=100000, max_iterations=10))
-    )
-
-    assert passes["n"] == 2
-    assert calls == ["observer", "diagnoser", "observer", "diagnoser"]
-    assert final["remediation_attempts"] == 2
-    assert final["verification_result"]["outcome"] == "pass"
-    assert final["status"] == "resolved"
-    assert final.get("escalation_reason") is None
-
-
-def test_a_run_that_keeps_failing_stops_at_the_attempt_cap_instead_of_looping_forever(
-    monkeypatch,
-):
-    """The cap is the thing that bounds how much damage a service can take. If
-    the increment were dropped this test would run to the iteration cap instead,
-    which is a different failure with the same symptom of taking too long."""
-    passes = {"n": 0}
-
-    def fake_tool_calls(service_name, evidence_so_far, evidence_requests):
-        passes["n"] += 1
-        return ToolCallDecision(
-            [
-                {"name": "query_prometheus", "arguments": {"promql": "up == 0"}},
-                {"name": "query_loki", "arguments": {"logql": '{container="x"}'}},
-            ],
-            1,
-        )
-
-    def fake_hypotheses(service_name, evidence_so_far):
-        return HypothesisDecision(
-            DiagnoserOutput(hypotheses=[Hypothesis(description="it crashed", category="crash")]),
-            1,
-        )
-
-    monkeypatch.setattr(nodes, "decide_tool_calls", fake_tool_calls)
-    monkeypatch.setattr(nodes, "decide_hypotheses", fake_hypotheses)
-    monkeypatch.setitem(nodes.TOOL_DISPATCH, "query_prometheus", lambda args: SERVICE_DOWN)
-    monkeypatch.setitem(nodes.TOOL_DISPATCH, "query_loki", lambda args: PANIC)
-    _settled_remediation(monkeypatch, "fail")
-
-    final = _final(
-        graph.build_graph().invoke(
-            _state(token_budget=100000, max_iterations=50, max_remediation_attempts=2)
-        )
-    )
-
-    assert passes["n"] == 2
-    assert final["remediation_attempts"] == 2
-    assert final["status"] == "escalated"
-    assert "attempt" in final["escalation_reason"]

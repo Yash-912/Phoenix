@@ -1,4 +1,5 @@
 import re
+import sys
 import time
 from datetime import datetime, timezone
 
@@ -7,16 +8,44 @@ from langgraph.types import Command
 
 from phoenix.graph import scoring, verification
 from phoenix.graph.llm_client import decide_hypotheses, decide_tool_calls
-from phoenix.graph.persist import record_audit, record_evidence, record_hypotheses
-from phoenix.graph.remediation_dispatch import REMEDIATION_DISPATCH
-from phoenix.graph.remediation_policy import plan_action
+from phoenix.graph.persist import (
+    get_incident_first_seen,
+    record_audit,
+    record_evidence,
+    record_hypotheses,
+)
+from phoenix.graph.remediation_dispatch import dispatch
+from phoenix.graph.remediation_policy import TIER_2_ACTIONS, plan_action
 from phoenix.graph.schemas import ScoredHypothesis
 from phoenix.graph.state import AgentState
+from phoenix.tools import deploy_tool
 from phoenix.tools.deploy_tool import get_recent_deployments
 from phoenix.tools.docker_tool import get_container_state
 from phoenix.tools.health_tool import inspect_health
 from phoenix.tools.loki_tool import query_loki
 from phoenix.tools.prometheus_tool import query_prometheus
+
+
+def _say(message: str = "") -> None:
+    """Print progress, losing only the characters this console cannot encode.
+
+    Most of what gets printed here is the model's own words: hypothesis
+    descriptions, tool arguments, plan reasoning. A live model writes typographic
+    hyphens and em dashes as a matter of course, and a stock Windows console
+    (cp1252) raises UnicodeEncodeError on them from inside the node -- which
+    aborts the whole run over a character no operator could act on. The diagnosis
+    is worth far more than the punctuation, so the odd character is escaped and
+    the run continues.
+    """
+    encoding = getattr(sys.stdout, "encoding", None) or "ascii"
+    # pyflakes: noqa - the fallback below is the readable path for a stdout that
+    # claims an encoding it cannot honour.
+    try:
+        rendered = message.encode(encoding, "backslashreplace").decode(encoding, "replace")
+    except (LookupError, UnicodeError):
+        rendered = message.encode("ascii", "backslashreplace").decode("ascii")
+    print(rendered)
+
 
 # The ONLY tools the LLM's decisions can ever result in executing.
 # Observer stays read-only: remediation actions (restart/pause/cache)
@@ -197,6 +226,13 @@ def observer_node(state: AgentState) -> AgentState:
     """
     state.iteration += 1
 
+    # The incident's onset is read once per pass and handed to the tools that
+    # compare timestamps against it. Read here rather than inside deploy_tool
+    # because persist is this layer's concern, and because a failure to read it
+    # must not stop the run: the correlation degrades to "unknown" and the rest
+    # of the investigation proceeds on the evidence that is readable.
+    deploy_tool.set_incident_started_at(get_incident_first_seen(state.incident_id))
+
     decision = decide_tool_calls(
         state.service_name, state.evidence, state.needs_evidence
     )
@@ -206,13 +242,13 @@ def observer_node(state: AgentState) -> AgentState:
     failed: list[str] = []
 
     if not requested_calls:
-        print(f"[observer] iteration {state.iteration}: LLM requested no tool calls")
+        _say(f"[observer] iteration {state.iteration}: LLM requested no tool calls")
 
     for call in requested_calls:
         tool_name = call["name"]
         tool_fn = TOOL_DISPATCH.get(tool_name)
         if tool_fn is None:
-            print(f"[observer] iteration {state.iteration}: ignoring unrecognized tool '{tool_name}'")
+            _say(f"[observer] iteration {state.iteration}: ignoring unrecognized tool '{tool_name}'")
             continue
 
         failure = None
@@ -234,9 +270,9 @@ def observer_node(state: AgentState) -> AgentState:
         record_evidence(state.incident_id, item)
         dispatched.append(tool_name)
         if failure is None:
-            print(f"[observer] iteration {state.iteration}: called {tool_name}({call['arguments']})")
+            _say(f"[observer] iteration {state.iteration}: called {tool_name}({call['arguments']})")
         else:
-            print(
+            _say(
                 f"[observer] iteration {state.iteration}: {tool_name}({call['arguments']}) "
                 f"failed: {failure}"
             )
@@ -282,7 +318,7 @@ def diagnoser_node(state: AgentState) -> AgentState:
     proposed = decision.output.hypotheses
 
     if not proposed:
-        print(f"[diagnoser] iteration {state.iteration}: LLM proposed no hypotheses")
+        _say(f"[diagnoser] iteration {state.iteration}: LLM proposed no hypotheses")
         state.hypotheses = []
         state.needs_evidence = []
         state.confidence = 0.0
@@ -295,8 +331,8 @@ def diagnoser_node(state: AgentState) -> AgentState:
         state.confidence = scoring.top_confidence(state.evidence, proposed)
 
         for scored in state.hypotheses:
-            print(f"[diagnoser] iteration {state.iteration}: {_diagnosis_line(scored)}")
-        print(f"[diagnoser] iteration {state.iteration}: confidence={state.confidence:.2f}")
+            _say(f"[diagnoser] iteration {state.iteration}: {_diagnosis_line(scored)}")
+        _say(f"[diagnoser] iteration {state.iteration}: confidence={state.confidence:.2f}")
 
     record_hypotheses(state.incident_id, state.hypotheses, iteration=state.iteration)
     record_audit(
@@ -351,7 +387,7 @@ def _escalate(
     correctly attributed to itself -- a trail that contradicts itself about who
     did what, which is the one thing a trail exists to prevent.
     """
-    print(f"[{node}] {print_line} -> end (escalate)")
+    _say(f"[{node}] {print_line} -> end (escalate)")
     record_audit(
         state.incident_id,
         node,
@@ -427,7 +463,7 @@ def remediator_node(state: AgentState) -> Command:
 
     plan = plan_action(state)
     if not plan.available:
-        print(f"[remediator] {plan.reasoning} -> end (action_unavailable)")
+        _say(f"[remediator] {plan.reasoning} -> end (action_unavailable)")
         record_audit(
             state.incident_id,
             "remediator",
@@ -444,9 +480,9 @@ def remediator_node(state: AgentState) -> Command:
     pre_action_signal = verification.read_signal(plan.check, plan.container)
     action_at = datetime.now(timezone.utc).isoformat()
 
-    print(f"[remediator] taking {plan.action} on {plan.container} ({plan.reasoning})")
+    _say(f"[remediator] taking {plan.action} on {plan.container} ({plan.reasoning})")
     try:
-        result = REMEDIATION_DISPATCH[plan.action](plan.container)
+        result = dispatch(plan.action, plan.container, plan.args)
     except Exception as exc:
         reason = f"{plan.action} on {plan.container} raised {type(exc).__name__}: {exc}"
         return _escalate(state, "action_failed", reason, reason)
@@ -466,6 +502,10 @@ def remediator_node(state: AgentState) -> Command:
         "check": plan.check,
         "pre_action_signal": pre_action_signal,
         "action_at": action_at,
+        # What the action was supposed to achieve, so verification can check the
+        # thing that was planned rather than inferring intent from the category.
+        # A rollback names the artifact it restored; Tier 1 has no such target.
+        "expected_version": result.get("to_version") if plan.action in TIER_2_ACTIONS else None,
     }
     record_audit(
         state.incident_id,
@@ -483,7 +523,7 @@ def remediator_node(state: AgentState) -> Command:
         },
         f"{plan.reasoning}; snapshot taken at {action_at}",
     )
-    print(
+    _say(
         f"[remediator] {plan.action} completed "
         f"(attempt {state.remediation_attempts + 1}/{state.max_remediation_attempts}) "
         f"-> verifier"
@@ -542,11 +582,15 @@ def verifier_node(state: AgentState) -> Command:
     time.sleep(state.verification_delay_seconds)
 
     category = planned.get("check")
+    # Positional, including for categories that ignore the fifth argument: the
+    # existing test doubles stand in for run_check as a single callable, and a
+    # keyword here would be a change to their contract rather than to this one.
     outcome, detail = verification.run_check(
         category,
         state.service_name,
         planned.get("pre_action_signal") or {},
         planned.get("action_at"),
+        planned.get("expected_version"),
     )
 
     verification_result = {
@@ -566,7 +610,7 @@ def verifier_node(state: AgentState) -> Command:
     )
 
     if outcome == verification.OUTCOME_PASS:
-        print(f"[verifier] {category} check passed -> end (resolved)")
+        _say(f"[verifier] {category} check passed -> end (resolved)")
         return Command(
             goto=END,
             update={"status": "resolved", "verification_result": verification_result},
@@ -574,7 +618,7 @@ def verifier_node(state: AgentState) -> Command:
 
     if outcome == verification.OUTCOME_FAIL:
         if state.remediation_attempts < state.max_remediation_attempts:
-            print(
+            _say(
                 f"[verifier] {category} check failed "
                 f"(attempt {state.remediation_attempts}/{state.max_remediation_attempts}) "
                 f"-> back to observer"

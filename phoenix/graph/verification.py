@@ -21,6 +21,20 @@ from what it was seconds ago". That is a comparison against the snapshot
 remediator_node took immediately before the action, over a short slope window to
 catch a leak that starts again straight away.
 
+**A deploy is verified by identity and behaviour, never by liveness.** The
+service's own /health endpoint reports "ok" in both artifacts, because a release
+that rejects every order is still a perfectly live process. A check that trusted
+it would grade the broken release healthy and the rollback as having changed
+nothing. So the deploy check asks two things liveness cannot: is the running
+container the artifact we meant to restore, and does the business endpoint work.
+
+**Both are required, because either alone is forgeable by accident.** The
+container label says which image is running; the HTTP response says the process
+inside it behaves correctly. If only the label were checked, a redeploy that
+started the right tag but wedged before serving would pass. If only behaviour
+were checked, a healthy service that happened to recover on its own would pass
+and be credited to the rollback.
+
 Every PromQL here is authored by this module. Nothing in this file consults the
 model, which is what keeps the observer's five read-only tools the whole read
 surface: verification adds a new kind of question without adding a new tool.
@@ -32,7 +46,10 @@ from phoenix.tools.health_tool import inspect_health
 from phoenix.tools.prometheus_tool import query_prometheus
 
 import math
+import time
 from datetime import datetime, timezone
+
+import requests
 
 OUTCOME_PASS = "pass"
 OUTCOME_FAIL = "fail"
@@ -160,6 +177,8 @@ def read_signal(category: str, service_name: str) -> dict:
                 "state": get_container_state(service_name),
                 "health": inspect_health(service_name),
             }
+        if category == "deploy":
+            return _read_deploy(service_name)
     except Exception as exc:
         return {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
 
@@ -196,11 +215,87 @@ def _read_memory(service_name: str) -> dict:
     return {"bytes": bytes_now, "slope": slope_value}
 
 
+# Where each service's business endpoint lives. A fixed map rather than a
+# convention, because "guess a port from the service name" would send traffic at
+# whatever happens to be listening and read someone else's answer as this
+# service's. Absence is treated as an unreadable signal, never as a pass.
+BUSINESS_ENDPOINTS = {
+    "checkout-service": "http://localhost:8001/checkout",
+}
+
+# A redeploy needs a moment before the new process answers. Bounded rather than
+# retried indefinitely: an endpoint still failing after this is a real failure,
+# not a slow start, and retrying longer would only delay saying so.
+DEPLOY_SETTLE_SECONDS = 5
+DEPLOY_SETTLE_ATTEMPTS = 12
+
+
+def _probe_business_endpoint(service_name: str) -> dict:
+    """Call the service's real endpoint and report what came back.
+
+    A 500 is data, not an exception: it is precisely the failure being verified,
+    so it is returned as an observation. Only an unreachable endpoint is an
+    unreadable signal.
+    """
+    url = BUSINESS_ENDPOINTS.get(service_name)
+    if not url:
+        return {"status": "error", "error": f"no business endpoint known for {service_name!r}"}
+
+    last_error = None
+    for _ in range(DEPLOY_SETTLE_ATTEMPTS):
+        try:
+            response = requests.get(url, timeout=5)
+            return {
+                "status": "ok",
+                "url": url,
+                "http_status": response.status_code,
+                "body": _truncate_body(response.text),
+                "serving": response.status_code < 500,
+            }
+        except requests.RequestException as exc:
+            last_error = exc
+            time.sleep(DEPLOY_SETTLE_SECONDS)
+
+    return {"status": "error", "url": url, "error": str(last_error)}
+
+
+def _truncate_body(text: str, limit: int = 300) -> str:
+    """First `limit` characters of a response body, for the audit trail.
+
+    An error page can be arbitrarily large and the trail does not need all of
+    it; the first line is what identifies the failure.
+    """
+    return text[:limit]
+
+
+def _read_deploy(service_name: str) -> dict:
+    """Which artifact is running, and whether it actually serves, or the envelope."""
+    state = get_container_state(service_name)
+    if not isinstance(state, dict) or state.get("status") == "error":
+        return {"status": "error", "error": "the container state could not be read"}
+
+    labels = (state.get("Config") or {}).get("Labels") or {}
+    running_version = labels.get("app.version")
+    if not running_version:
+        return {
+            "status": "error",
+            "error": "the running container carries no app.version label, so its identity is unknown",
+        }
+
+    return {
+        "status": "ok",
+        "running_version": running_version,
+        "image_digest": state.get("Image"),
+        "endpoint": _probe_business_endpoint(service_name),
+    }
+
+
 def run_check(
     category: str,
     service_name: str,
     before: dict,
     action_at: str | None,
+    expect_version: str | None = None,
 ) -> tuple[str, dict]:
     """Judge the signal against the snapshot taken before the action.
 
@@ -224,10 +319,71 @@ def run_check(
         return _check_overload(signal, before or {})
     if category == "crash":
         return _check_crash(signal, action_at)
+    if category == "deploy":
+        return _check_deploy(signal, expect_version)
 
     return OUTCOME_INCONCLUSIVE, {
         "check": category,
         "reason": f"no verification check for category {category!r}",
+    }
+
+
+def _check_deploy(signal: dict, expect_version: str | None) -> tuple[str, dict]:
+    """Is the expected artifact running, and does it serve?
+
+    Identity first: a redeploy that left the old image running has not rolled
+    anything back, and reporting that as a pass would be the worst outcome in
+    this module -- it would claim a recovery that did not happen. Behaviour
+    second, since a correctly-tagged container that never came up serving is
+    equally not a recovery.
+    """
+    running_version = signal.get("running_version")
+    endpoint = signal.get("endpoint") or {}
+    detail = {
+        "check": "deploy",
+        "running_version": running_version,
+        "expected_version": expect_version,
+        "image_digest": signal.get("image_digest"),
+        "http_status": endpoint.get("http_status"),
+        "endpoint_body": endpoint.get("body"),
+    }
+
+    if expect_version is None:
+        return OUTCOME_INCONCLUSIVE, {
+            **detail,
+            "reason": (
+                "no target version was recorded for this action, so there is no "
+                "artifact to confirm is running"
+            ),
+        }
+
+    if running_version != expect_version:
+        return OUTCOME_FAIL, {
+            **detail,
+            "reason": (
+                f"the running container reports {running_version!r}, not the "
+                f"{expect_version!r} the rollback deployed, so the artifact was "
+                f"not replaced"
+            ),
+        }
+
+    if not endpoint.get("serving"):
+        return OUTCOME_FAIL, {
+            **detail,
+            "reason": (
+                f"{expect_version} is running but its business endpoint returned "
+                f"HTTP {endpoint.get('http_status')}, so the service still rejects "
+                f"traffic"
+            ),
+        }
+
+    return OUTCOME_PASS, {
+        **detail,
+        "reason": (
+            f"the running container reports {expect_version} and its business "
+            f"endpoint answered HTTP {endpoint.get('http_status')}, so the bad "
+            f"release was genuinely reverted"
+        ),
     }
 
 

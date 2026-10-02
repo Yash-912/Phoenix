@@ -149,8 +149,25 @@ class Recorder:
         return [params for _, params in self.statements]
 
     @property
+    def writes(self) -> list[tuple[str, dict]]:
+        """(table, params) for each INSERT, in order.
+
+        Phase 4 added one read -- the incident's first_seen_at -- so `statements`
+        is no longer all writes. Every assertion about *the trail* wants the
+        writes; pairing `tables` against the unfiltered `params` would silently
+        shift them by one, which is how an order assertion ends up passing for
+        the wrong reason.
+        """
+        out = []
+        for sql, params in self.statements:
+            if sql.strip().upper().startswith("INSERT INTO"):
+                out.append((sql.split()[2], params))
+        return out
+
+    @property
     def tables(self) -> list[str]:
-        return [sql.split()[2] for sql in self.sql]
+        """Tables touched by writes, in order."""
+        return [table for table, _ in self.writes]
 
 
 @pytest.fixture(autouse=True)
@@ -552,8 +569,36 @@ def test_every_statement_a_whole_run_issues_is_an_insert(monkeypatch):
 
     assert recorder.tables
     assert set(recorder.tables) == {"evidence", "hypotheses", "audit_log"}
-    for sql in recorder.sql:
+    writes = [sql for sql in recorder.sql if sql.strip().upper().startswith("INSERT INTO")]
+    # Phase 4 added one read: the incident's first_seen_at, needed to decide
+    # whether a deployment preceded it. It touches no table the writers own, so
+    # the invariant is restated as "every WRITE is an insert into a trail table"
+    # rather than dropped -- the point of the original assertion was that the run
+    # never issues DDL or an UPDATE, and that still has to hold.
+    assert writes
+    for sql in writes:
         assert sql.strip().upper().startswith("INSERT INTO")
+
+
+def test_the_incident_onset_read_touches_no_trail_table(monkeypatch):
+    """The one SELECT Phase 4 introduces must not write or mutate anything."""
+    recorder = _live(monkeypatch)
+    monkeypatch.setattr(
+        nodes,
+        "decide_tool_calls",
+        _tool_calls([{"name": "query_prometheus", "arguments": {"promql": "up == 0"}}], 940),
+    )
+    monkeypatch.setattr(nodes, "decide_hypotheses", _hypotheses([CRASH], 1350))
+    monkeypatch.setitem(nodes.TOOL_DISPATCH, "query_prometheus", lambda args: SERVICE_DOWN)
+
+    graph.build_graph().invoke(_state())
+
+    reads = [sql for sql in recorder.sql if sql.strip().upper().startswith("SELECT")]
+    assert reads, "expected the observer to read the incident's onset"
+    for sql in reads:
+        assert "incidents" in sql
+        assert "FROM incidents" in sql
+        assert not sql.strip().upper().startswith(("UPDATE", "DELETE"))
 
 
 def test_the_evidence_source_the_module_writes_is_a_name_the_widened_check_allows():
@@ -1141,7 +1186,7 @@ def test_a_whole_run_writes_its_trail_in_the_order_the_nodes_happened(monkeypatc
     graph.build_graph().invoke(_state())
 
     assert [
-        (table, params.get("event_type")) for table, params in zip(recorder.tables, recorder.params)
+        (table, params.get("event_type")) for table, params in recorder.writes
     ] == [
         ("evidence", None),
         ("evidence", None),
@@ -1152,10 +1197,12 @@ def test_a_whole_run_writes_its_trail_in_the_order_the_nodes_happened(monkeypatc
         ("audit_log", "action_executed"),
         ("audit_log", "verification"),
     ]
-    assert {params["incident_id"] for params in recorder.params} == {INCIDENT}
-    threshold_row = recorder.params[5]["detail"].obj
+    assert {params["incident_id"] for _, params in recorder.writes} == {INCIDENT}
+    threshold_row = recorder.writes[5][1]["detail"].obj
     assert threshold_row["destination"] == "remediator"
     assert threshold_row["escalation_reason"] is None
+    # One commit per insert. The incident-onset SELECT does not commit: it is a
+    # read, and it shares no transaction with the trail.
     assert recorder.commits == 8
 
 
@@ -1216,7 +1263,9 @@ def test_a_database_that_refuses_every_row_costs_a_run_nothing_but_its_trail(mon
         _settled_remediation(monkeypatch)
 
         final = graph.build_graph().invoke(_state())
-        outcomes.append((len(recorder.statements), final))
+        # Writes, not statements: the incident-onset SELECT succeeds in both
+        # cases, so counting it would mask the thing this test compares.
+        outcomes.append((len(recorder.writes), final))
 
     refused_count, refused = outcomes[0]
     written_count, written = outcomes[1]

@@ -6,7 +6,7 @@ os.environ.setdefault("LLM_MODEL", "test-model")
 
 from phoenix.graph import nodes
 from phoenix.graph.llm_client import TOOL_SCHEMAS
-from phoenix.graph.remediation_dispatch import REMEDIATION_DISPATCH
+from phoenix.graph.remediation_dispatch import REMEDIATION_DISPATCH, TIER_2_DISPATCH
 
 # Spelled out as a literal rather than derived from either table it checks.
 # Deriving it would make the assertions tautological: a mutating action added to
@@ -27,11 +27,18 @@ def test_no_mutating_action_is_reachable_from_the_observer():
 
 
 def test_every_action_the_policy_can_plan_is_dispatchable():
+    """Both tiers are checked, since Phase 4 routes deploy to the Tier 2 table."""
+    from phoenix.graph.remediation_dispatch import TIER_2_DISPATCH
     from phoenix.graph.remediation_policy import CATEGORY_ACTIONS
 
     for actions in CATEGORY_ACTIONS.values():
         for action in actions:
-            assert action in REMEDIATION_DISPATCH, action
+            assert action in REMEDIATION_DISPATCH | TIER_2_DISPATCH, action
+
+
+def test_the_two_dispatch_tables_do_not_overlap():
+    """An action in both tables would be reachable through the cheaper path."""
+    assert set(REMEDIATION_DISPATCH) & set(TIER_2_DISPATCH) == set()
 
 
 def test_the_llm_is_offered_exactly_the_five_read_only_tools():
