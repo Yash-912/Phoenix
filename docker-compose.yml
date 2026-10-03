@@ -65,6 +65,7 @@ services:
     container_name: payment-service
     environment:
       - CHAOS_ENABLED=true
+      - DATABASE_URL=postgresql://payment_app:${PAYMENT_APP_PASSWORD}@postgres:5432/phoenix
     ports:
       - "8003:8000"
     networks:
@@ -196,6 +197,7 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: phoenix
       PHOENIX_APP_PASSWORD: ${PHOENIX_APP_PASSWORD}
+      PAYMENT_APP_PASSWORD: ${PAYMENT_APP_PASSWORD}
     ports:
       - "5432:5432"
     volumes:
