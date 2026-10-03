@@ -15,7 +15,7 @@ from phoenix.graph.persist import (
     record_hypotheses,
 )
 from phoenix.graph.remediation_dispatch import dispatch
-from phoenix.graph.remediation_policy import TIER_2_ACTIONS, plan_action
+from phoenix.graph.remediation_policy import TIER_2_ACTIONS, is_tier3_eligible, plan_action
 from phoenix.graph.schemas import ScoredHypothesis
 from phoenix.graph.state import AgentState
 from phoenix.tools import deploy_tool
@@ -463,6 +463,21 @@ def remediator_node(state: AgentState) -> Command:
 
     plan = plan_action(state)
     if not plan.available:
+        category = state.hypotheses[0].hypothesis.category if state.hypotheses else None
+        if is_tier3_eligible(category):
+            # slow_query's whole reason to exist in CATEGORY_ACTIONS as ():
+            # there is no Tier 1/2 action, so the only honest next step is
+            # handing the run to the Tier 3 subgraph rather than reporting
+            # action_unavailable on a root cause that is in fact actionable,
+            # just not by this table.
+            reason = f"top hypothesis is {category}; no Tier 1/2 action applies, handing off to Tier 3"
+            _say(f"[remediator] {reason} -> code_investigator")
+            record_audit(
+                state.incident_id, "remediator", "tier3_handoff",
+                {"iteration": state.iteration, "category": category}, reason,
+            )
+            return Command(goto="code_investigator", update={"status": "tier3_investigating"})
+
         _say(f"[remediator] {plan.reasoning} -> end (action_unavailable)")
         record_audit(
             state.incident_id,
@@ -470,7 +485,7 @@ def remediator_node(state: AgentState) -> Command:
             "action_unavailable",
             {
                 "iteration": state.iteration,
-                "category": state.hypotheses[0].hypothesis.category if state.hypotheses else None,
+                "category": category,
                 "remediation_attempts": state.remediation_attempts,
             },
             plan.reasoning,
@@ -615,6 +630,23 @@ def verifier_node(state: AgentState) -> Command:
     )
 
     if outcome == verification.OUTCOME_PASS:
+        if is_tier3_eligible(category):
+            # Scenario 3's exact shape: the restart genuinely mitigated the
+            # symptom, but memory_leak's root cause is still an unbounded
+            # cache in worker-service's own code, which no restart touches.
+            # tier1_mitigation preserves this pass as its own fact before
+            # Tier 3 starts writing its own outcome onto the same state, so
+            # the final record shows the mitigation AND the permanent fix,
+            # never just the second overwriting the first.
+            _say(f"[verifier] {category} check passed (Tier 1 mitigation) -> code_investigator for a permanent fix")
+            return Command(
+                goto="code_investigator",
+                update={
+                    "status": "tier3_investigating",
+                    "verification_result": verification_result,
+                    "tier1_mitigation": verification_result,
+                },
+            )
         _say(f"[verifier] {category} check passed -> end (resolved)")
         return Command(
             goto=END,

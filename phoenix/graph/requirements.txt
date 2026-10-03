@@ -4,3 +4,5 @@ requests==2.32.3
 openai==1.51.0
 httpx<0.28
 psycopg[binary,pool]==3.2.3
+pytest
+pyflakes==4.0.1

@@ -37,9 +37,64 @@ class AgentState(BaseModel):
         description="Hard ceiling on tokens_spent for one investigation, in tokens.",
     )
     status: Literal[
-        "investigating", "confident", "resolved", "action_unavailable", "escalated"
+        "investigating", "confident", "resolved", "action_unavailable", "escalated",
+        # Tier 3 terminal/transit states. "tier3_investigating" is set the
+        # moment the run hands off to the Tier 3 subgraph (either straight
+        # from the router for slow_query, or after a passing memory_leak
+        # Tier 1 verification) -- a run in this state has not stopped, it has
+        # changed which subgraph owns it. "pr_opened" is Tier 3's own success
+        # terminal, kept distinct from "resolved" because a PR is not a
+        # closed incident: PRD section 6 requires it to stop for human
+        # review, and "resolved" would read as nothing further being needed.
+        "tier3_investigating", "pr_opened",
     ] = "investigating"
     escalation_reason: Optional[str] = None
+
+    # --- Tier 3: code investigation -> patch -> validate -> PR -------------
+    # Kept on a separate status axis from the top-level `status` above
+    # because Tier 1/2's state machine and Tier 3's are two different
+    # workflows that happen to share one incident: a Tier 1 restart's
+    # attempt count must not gate a Tier 3 patch attempt, and a Tier 3
+    # rejection must not look like a Tier 1 action failure in the trail.
+    tier3_status: Literal[
+        "not_started", "investigating", "no_defect_found", "patch_generated",
+        "patch_rejected", "validated", "validation_failed", "pr_opened", "pr_failed",
+    ] = "not_started"
+    tier3_iteration: int = 0
+    max_tier3_iterations: int = Field(
+        default=5,
+        description="Hard cap on the code investigator's own tool-call loop, independent of the Tier 1/2 iteration cap.",
+    )
+    tier3_evidence: list[dict] = Field(
+        default_factory=list,
+        description="search_repository/read_file/get_git_commits/get_git_diff results gathered during Tier 3 investigation.",
+    )
+    tier3_defect: Optional[dict] = Field(
+        default=None,
+        description="The code_investigator's conclusion: file_path, function_name, description, fix_approach -- never a patch.",
+    )
+    patch_candidate: Optional[dict] = Field(
+        default=None,
+        description="patch_generator's proposed diff before validation: file_path, diff, new_content, scope verdict.",
+    )
+    patch_validation: Optional[dict] = Field(
+        default=None,
+        description="patch_validator's real results: applied, tests_passed, lint_passed, diff_in_scope, and the raw outputs.",
+    )
+    tier1_mitigation: Optional[dict] = Field(
+        default=None,
+        description=(
+            "The Tier 1 verification_result snapshot taken before handing a memory_leak "
+            "run to Tier 3, so the final state records the mitigation and the permanent "
+            "fix as two separate facts rather than the second overwriting the first."
+        ),
+    )
+    pr_result: Optional[dict] = Field(
+        default=None,
+        description="open_pull_request's real response: url, branch, base -- or the error envelope on failure.",
+    )
+    worktree_path: Optional[str] = None
+    worktree_branch: Optional[str] = None
     remediation_attempts: int = Field(
         default=0,
         ge=0,

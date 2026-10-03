@@ -11,6 +11,12 @@ from phoenix.graph.nodes import (
 )
 from phoenix.graph.persist import close_persistence, record_audit
 from phoenix.graph.state import AgentState
+from phoenix.graph.tier3_nodes import (
+    code_investigator_node,
+    patch_generator_node,
+    patch_validator_node,
+    pr_opener_node,
+)
 
 ROUTER_DESTINATIONS: tuple[str, ...] = ("observer", "remediator", END)
 
@@ -157,15 +163,22 @@ def build_graph():
     graph.add_node("router", should_continue, destinations=ROUTER_DESTINATIONS)
     graph.add_node("remediator", remediator_node)
     graph.add_node("verifier", verifier_node)
+    # Tier 3 subgraph. Reached only via a Command from remediator_node
+    # (slow_query, no Tier 1/2 action) or verifier_node (memory_leak, after a
+    # passing Tier 1 check) -- never a static edge, so ordinary Tier 1/2
+    # incidents never pass through any of these four nodes.
+    graph.add_node("code_investigator", code_investigator_node)
+    graph.add_node("patch_generator", patch_generator_node)
+    graph.add_node("patch_validator", patch_validator_node)
+    graph.add_node("pr_opener", pr_opener_node)
 
     graph.set_entry_point("observer")
     graph.add_edge("observer", "diagnoser")
     graph.add_edge("diagnoser", "router")
-    # No static edge out of remediator or verifier. Both return a Command that
-    # names its own destination -- the remediator either hands on to the
-    # verifier or refuses and ends, the verifier either ends or loops back to
-    # the observer -- and a static edge alongside a Command would be a second,
-    # competing claim about where the run goes next.
+    # No static edge out of remediator, verifier, or any Tier 3 node. Every
+    # one of them returns a Command that names its own destination, and a
+    # static edge alongside a Command would be a second, competing claim
+    # about where the run goes next.
 
     return graph.compile()
 

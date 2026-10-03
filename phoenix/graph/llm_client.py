@@ -14,7 +14,7 @@ from openai import (
 from openai.types.chat import ChatCompletion
 from pydantic import ValidationError
 
-from phoenix.graph.schemas import DiagnoserOutput, Hypothesis
+from phoenix.graph.schemas import CodeDefect, DiagnoserOutput, Hypothesis, PatchProposal
 
 LLM_BASE_URL = os.environ["LLM_BASE_URL"]
 LLM_API_KEY = os.environ["LLM_API_KEY"]
@@ -63,16 +63,75 @@ def _tokens(response: ChatCompletion) -> int:
     return int(usage.total_tokens or 0)
 
 
+MAX_RESULT_CHARS = 2500
+# Explicit output ceiling: some providers apply a small default that reasoning
+# tokens consume first, which cuts a reply off mid-JSON on a large prompt.
+MAX_OUTPUT_TOKENS = 8192
+
+
+TIER3_RESULT_CHARS = 14000
+
+
+def _extract_json(text: str) -> str:
+    """The first complete JSON object in a model reply, or the text unchanged.
+
+    Providers differ in whether they wrap a requested JSON object in a
+    ```json fence or a sentence of prose. Both are harmless to a human and
+    fatal to a strict parser, so the object is located with the JSON decoder
+    itself (which knows where a balanced object ends) rather than by regex.
+    Anything that is not recoverable is returned untouched, so the callers'
+    validation still rejects it rather than this function guessing.
+    """
+    start = text.find("{")
+    if start == -1:
+        return text
+    try:
+        _, end = json.JSONDecoder().raw_decode(text[start:])
+    except json.JSONDecodeError:
+        return text
+    return text[start:start + end]
+
+
+def _compact_result(raw, limit: int = MAX_RESULT_CHARS) -> str:
+    """One tool result as bounded text for the Diagnoser's prompt.
+
+    Loki's response carries a large per-query `stats` block (chunk/cache
+    counters) that describes the query engine, not the logs, and a raw
+    Prometheus dump can run to thousands of series. Sending either whole cost
+    ~17k tokens an iteration and buried the lines that mattered. The stats
+    block is dropped and the rest truncated with an explicit marker, so the
+    model is told it is looking at a partial result rather than a complete one.
+    """
+    if isinstance(raw, dict) and isinstance(raw.get("data"), dict):
+        raw = {**raw, "data": {k: v for k, v in raw["data"].items() if k != "stats"}}
+    text = json.dumps(raw, default=str)
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "...[truncated]"
+
+
 TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
             "name": "query_prometheus",
-            "description": "Run a PromQL query against Prometheus for metrics evidence (CPU, memory, latency, error rate, service up/down).",
+            "description": (
+                "Run a PromQL query against Prometheus for metrics evidence (CPU, memory, "
+                "latency, error rate, service up/down). Every target is scraped under the "
+                "label job=\"<service-name>\" (e.g. job=\"payment-service\"), never "
+                "service=\"...\" -- a query using the wrong label name returns an empty "
+                "result, not an error, so it looks like a clean read of 'nothing wrong' when "
+                "it actually measured nothing at all. Services export "
+                "http_request_duration_seconds (histogram), http_requests_total, "
+                "process_resident_memory_bytes, process_cpu_seconds_total and up; "
+                "aggregating with sum()/rate() drops the metric name from the result, "
+                "so an instant selector such as http_request_duration_seconds_count"
+                "{job=\"<service>\"} is the form that records which series was read."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "promql": {"type": "string", "description": "A valid PromQL query string."},
+                    "promql": {"type": "string", "description": "A valid PromQL query string, labeled by job, e.g. up{job=\"payment-service\"}."},
                 },
                 "required": ["promql"],
             },
@@ -179,6 +238,7 @@ def decide_tool_calls(
 
     response = client.chat.completions.create(
         model=LLM_MODEL,
+        max_tokens=MAX_OUTPUT_TOKENS,
         messages=[
             {
                 "role": "system",
@@ -260,8 +320,15 @@ def decide_hypotheses(
     because it could not read the evidence, and the run would end looking like a
     clean all-clear.
     """
+    # Unlike decide_tool_calls' own summary (call signature only -- it is
+    # choosing what to read next, not judging what was read), the Diagnoser's
+    # job is to propose a root cause FROM the evidence, so it has to see what
+    # each call actually returned, not merely that it was made. raw_data is
+    # the same payload record_evidence persists and scoring.py independently
+    # scores from; the LLM never receives anything scoring.py does not, so a
+    # category it proposes but evidence does not support still scores 0.
     summary = [
-        {"source": e["source"], "iteration": e["iteration"], "summary": e["summary"]}
+        {"source": e["source"], "iteration": e["iteration"], "summary": e["summary"], "result": _compact_result(e.get("raw_data"))}
         for e in evidence_so_far
     ]
 
@@ -274,7 +341,10 @@ def decide_hypotheses(
                 "propose the root causes that evidence most plausibly supports, best "
                 "first, at most 4 of them. For each one give a one-sentence "
                 "description, the failure category (crash, overload, deploy, config, "
-                "network, or unknown), and the signals that would confirm or refute "
+                "network, slow_query, memory_leak, or unknown -- slow_query and "
+                "memory_leak are for a code-level defect in the application itself, "
+                "distinct from overload's infrastructure resource pressure), and the "
+                "signals that would confirm or refute "
                 "it. Describe only, never state a score, a confidence, or a "
                 "likelihood; those are computed in code from the evidence. You cannot "
                 "take any remediation action."
@@ -318,6 +388,7 @@ def decide_hypotheses(
     try:
         fallback = client.chat.completions.create(
             model=LLM_MODEL,
+            max_tokens=MAX_OUTPUT_TOKENS,
             messages=[
                 *messages,
                 {
@@ -325,7 +396,7 @@ def decide_hypotheses(
                     "content": (
                         "Reply with a single JSON object and nothing else, shaped as "
                         '{"hypotheses": [{"description": "<one sentence>", "category": '
-                        '"crash|overload|deploy|config|network|unknown", '
+                        '"crash|overload|deploy|config|network|slow_query|memory_leak|unknown", '
                         '"needs_evidence": ["<signal>"]}]} holding 1 to 4 entries, best '
                         "first."
                     ),
@@ -341,7 +412,7 @@ def decide_hypotheses(
         print("[llm_client] prompt-JSON fallback carried no choices, discarding the hypothesis batch")
         return HypothesisDecision(DiagnoserOutput.model_construct(hypotheses=[]), tokens)
 
-    content = fallback.choices[0].message.content or ""
+    content = _extract_json(fallback.choices[0].message.content or "")
 
     try:
         return HypothesisDecision(DiagnoserOutput.model_validate_json(content), tokens)
@@ -366,3 +437,321 @@ def decide_hypotheses(
         return HypothesisDecision(DiagnoserOutput.model_construct(hypotheses=[]), tokens)
 
     return HypothesisDecision(DiagnoserOutput(hypotheses=hypotheses[:4]), tokens)
+
+
+# --- Tier 3: code investigation, defect, and patch -----------------------
+
+TOOL_SCHEMAS_TIER3 = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_repository",
+            "description": "Case-insensitive literal search across the repository's text files for a string (e.g. a function name, an endpoint path, a log message). Returns matching files and line numbers.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Text to search for."},
+                    "path": {"type": "string", "description": "Optional repo-relative directory/file to scope the search to."},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read a repo-relative file's text, optionally a specific line range.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Repo-relative file path."},
+                    "start_line": {"type": "integer", "description": "1-based first line to read."},
+                    "end_line": {"type": "integer", "description": "1-based last line to read."},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_git_commits",
+            "description": "Recent real commit history (sha, author, date, subject), optionally scoped to one file/directory.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Optional repo-relative path to scope history to."},
+                    "limit": {"type": "integer", "description": "Max commits, newest first. Defaults to 10."},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_git_diff",
+            "description": "The real unified diff between two git refs (default HEAD~1..HEAD), optionally scoped to one file/directory.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "base": {"type": "string", "description": "Base ref. Defaults to HEAD~1."},
+                    "head": {"type": "string", "description": "Head ref. Defaults to HEAD."},
+                    "path": {"type": "string", "description": "Optional repo-relative path to scope the diff to."},
+                },
+                "required": [],
+            },
+        },
+    },
+]
+
+
+def decide_code_investigation_calls(
+    service_name: str, hypothesis_description: str, evidence_so_far: list[dict]
+) -> ToolCallDecision:
+    """Ask the LLM which of the 4 read-only repo/git tools to call next, to
+    track a runtime hypothesis down to the code that causes it.
+
+    Same shape as decide_tool_calls, same discipline: the LLM is offered only
+    TOOL_SCHEMAS_TIER3 and its calls are returned, never executed here. The
+    runtime hypothesis is handed in as context the model investigates from,
+    never as an instruction naming a file -- this function does not know
+    whether the investigation will land on payment-service or worker-service,
+    only what the diagnoser already found at the infrastructure layer.
+    """
+    summary = [
+        {
+            "source": e["source"], "iteration": e.get("iteration"), "summary": e.get("summary"),
+            "result": _compact_result(e.get("raw_data"), TIER3_RESULT_CHARS),
+        }
+        for e in evidence_so_far
+    ]
+
+    response = client.chat.completions.create(
+        model=LLM_MODEL,
+        max_tokens=MAX_OUTPUT_TOKENS,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are the Tier 3 Code Investigator in an incident response system. "
+                    f"A runtime diagnosis for service '{service_name}' has already concluded: "
+                    f"'{hypothesis_description}'. Your job is to find the specific file and "
+                    "function in the repository responsible, using only the repository/git "
+                    "tools available to you. Do not guess a file -- search for it, then read "
+                    "the candidate files with read_file before concluding, because a search "
+                    "hit only locates code and does not show what it does. Each earlier "
+                    "result is included below. Call only the tools you genuinely need next; "
+                    "reply with no tool calls once you have read enough to name the defect."
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"Code investigation evidence gathered so far: {summary}\n\nWhich tool(s) do you want to call next?",
+            },
+        ],
+        tools=TOOL_SCHEMAS_TIER3,
+        tool_choice="auto",
+    )
+
+    tokens = _tokens(response)
+    if not response.choices:
+        return ToolCallDecision([], tokens)
+    message = response.choices[0].message
+    if not message.tool_calls:
+        return ToolCallDecision([], tokens)
+
+    decided_calls = []
+    for tc in message.tool_calls:
+        try:
+            arguments = json.loads(tc.function.arguments)
+        except json.JSONDecodeError as exc:
+            print(f"[llm_client] discarding malformed tier3 tool call '{tc.function.name}': {exc}")
+            continue
+        decided_calls.append({"name": tc.function.name, "arguments": arguments})
+
+    return ToolCallDecision(decided_calls, tokens)
+
+
+class DefectDecision(NamedTuple):
+    output: CodeDefect
+    tokens: int
+
+
+_NO_DEFECT = CodeDefect(
+    defect_found=False,
+    description="the investigation produced no usable conclusion",
+    fix_approach="n/a",
+    confidence_rationale="no response could be parsed",
+)
+
+
+def decide_defect(service_name: str, hypothesis_description: str, evidence: list[dict]) -> DefectDecision:
+    """Ask the LLM to conclude the code investigation: which file/function,
+    described only -- never a patch. Mirrors decide_hypotheses' structured
+    output with prompt-JSON fallback.
+    """
+    summary = [
+        {
+            "source": e["source"], "iteration": e.get("iteration"), "summary": e.get("summary"),
+            "result": _compact_result(e.get("raw_data"), TIER3_RESULT_CHARS),
+        }
+        for e in evidence
+    ]
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are the Tier 3 Code Investigator concluding your investigation of "
+                f"service '{service_name}'. The runtime diagnosis was: "
+                f"'{hypothesis_description}'. Based only on the repository/git evidence "
+                "gathered, state whether you found the specific defect, which file and "
+                "function it is in, what the defect is, and the minimal fix approach -- "
+                "describe the fix, do not write code. If the evidence does not pin down one "
+                "file, set defect_found to false rather than guessing."
+            ),
+        },
+        {
+            "role": "user",
+            "content": f"Code investigation evidence: {summary}\n\nWhat is the defect?",
+        },
+    ]
+
+    tokens = 0
+    try:
+        completion = client.beta.chat.completions.parse(
+            model=LLM_MODEL, messages=messages, response_format=CodeDefect,
+        )
+    except (
+        BadRequestError, NotFoundError, UnprocessableEntityError,
+        LengthFinishReasonError, ContentFilterFinishReasonError, ValidationError,
+    ) as exc:
+        print(f"[llm_client] structured defect rejected, falling back to prompt JSON: {exc}")
+    except OpenAIError as exc:
+        print(f"[llm_client] defect decision failed, LLM call failed: {exc}")
+        return DefectDecision(_NO_DEFECT, tokens)
+    else:
+        tokens = _tokens(completion)
+        parsed = completion.choices[0].message.parsed if completion.choices else None
+        if parsed is not None:
+            return DefectDecision(parsed, tokens)
+        print("[llm_client] structured defect came back unparsed, falling back to prompt JSON")
+
+    try:
+        fallback = client.chat.completions.create(
+            model=LLM_MODEL,
+            max_tokens=MAX_OUTPUT_TOKENS,
+            messages=[
+                *messages,
+                {
+                    "role": "user",
+                    "content": (
+                        'Reply with a single JSON object and nothing else, shaped as '
+                        '{"defect_found": bool, "file_path": "<repo-relative path or null>", '
+                        '"function_name": "<name or null>", "description": "<one sentence>", '
+                        '"fix_approach": "<one or two sentences>", "confidence_rationale": '
+                        '"<one sentence>"}.'
+                    ),
+                },
+            ],
+        )
+    except OpenAIError as exc:
+        print(f"[llm_client] discarding defect decision, LLM call failed: {exc}")
+        return DefectDecision(_NO_DEFECT, tokens)
+
+    tokens += _tokens(fallback)
+    content = _extract_json(fallback.choices[0].message.content or "") if fallback.choices else None
+    if not content:
+        return DefectDecision(_NO_DEFECT, tokens)
+
+    try:
+        return DefectDecision(CodeDefect.model_validate_json(content), tokens)
+    except ValidationError as exc:
+        print(f"[llm_client] defect response failed validation: {exc}")
+        return DefectDecision(_NO_DEFECT, tokens)
+
+
+class PatchDecision(NamedTuple):
+    output: PatchProposal | None
+    tokens: int
+
+
+_PATCH_MARK_START = "---PHOENIX-PATCH-START---"
+_PATCH_MARK_END = "---PHOENIX-PATCH-END---"
+_RATIONALE_MARK_START = "---PHOENIX-RATIONALE-START---"
+_RATIONALE_MARK_END = "---PHOENIX-RATIONALE-END---"
+
+
+def decide_patch(
+    file_path: str, old_content: str, defect_description: str, fix_approach: str, feedback: str | None = None
+) -> PatchDecision:
+    """Ask the LLM for the whole new content of `file_path` implementing the
+    minimal fix. Uses marker-delimited plain text rather than JSON: asking a
+    model to JSON-escape an entire source file's quotes/backslashes/newlines
+    correctly is a reliability problem this sidesteps entirely, and
+    phoenix.tools.patch_tool is the deterministic code that turns this text
+    into an actual diff -- nothing here applies anything.
+    """
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are the Tier 3 Patch Generator. You will be shown one file's current "
+                "content and a defect description. Produce the complete new content of "
+                "the file with the minimal fix applied -- change only what the defect "
+                "requires. The fix must make the defective function itself correct: edit "
+                "that function's body. Never bypass the defect by deleting, rewriting or "
+                "short-circuiting the code that selects between implementations (a feature "
+                "flag, toggle or dispatcher), and never touch chaos/test/flag code -- a "
+                "patch that merely stops calling the defective function hides the symptom "
+                "and is rejected. Do not reformat unrelated code and do not add features. "
+                "Reply with exactly this shape and nothing else:\n"
+                f"{_PATCH_MARK_START}\n<the file's full new content>\n{_PATCH_MARK_END}\n"
+                f"{_RATIONALE_MARK_START}\n<one or two sentences on what changed and why>\n{_RATIONALE_MARK_END}"
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"File: {file_path}\n\nDefect: {defect_description}\n\nFix approach: {fix_approach}\n\n"
+                f"Current content:\n{old_content}"
+                + (
+                    f"\n\nYour previous patch was rejected by the safety gate: {feedback}. "
+                    "Propose a different patch that fixes the defective function itself."
+                    if feedback else ""
+                )
+            ),
+        },
+    ]
+
+    try:
+        response = client.chat.completions.create(model=LLM_MODEL, messages=messages, max_tokens=MAX_OUTPUT_TOKENS)
+    except OpenAIError as exc:
+        print(f"[llm_client] patch generation failed, LLM call failed: {exc}")
+        return PatchDecision(None, 0)
+
+    tokens = _tokens(response)
+    content = response.choices[0].message.content if response.choices else None
+    if not content:
+        return PatchDecision(None, tokens)
+
+    if _PATCH_MARK_START not in content or _PATCH_MARK_END not in content:
+        print("[llm_client] patch response missing the expected markers, discarding")
+        return PatchDecision(None, tokens)
+
+    new_content = content.split(_PATCH_MARK_START, 1)[1].split(_PATCH_MARK_END, 1)[0].strip("\n")
+    if new_content.strip():
+        new_content += "\n"
+    rationale = "no rationale given"
+    if _RATIONALE_MARK_START in content and _RATIONALE_MARK_END in content:
+        rationale = content.split(_RATIONALE_MARK_START, 1)[1].split(_RATIONALE_MARK_END, 1)[0].strip()
+
+    if not new_content.strip():
+        return PatchDecision(None, tokens)
+
+    try:
+        return PatchDecision(PatchProposal(new_content=new_content, rationale=rationale), tokens)
+    except ValidationError as exc:
+        print(f"[llm_client] patch proposal failed validation: {exc}")
+        return PatchDecision(None, tokens)

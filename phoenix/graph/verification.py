@@ -51,6 +51,12 @@ from datetime import datetime, timezone
 
 import requests
 
+# Categories whose Tier 1 action is verified by the resident-memory check. A
+# memory_leak is a growing working set exactly as overload's memory case is, so
+# the question after a restart is the same: did it come down and stay down.
+# Keyed on what was wrong, not on which hypothesis family named it.
+MEMORY_CATEGORIES = ("overload", "memory_leak")
+
 OUTCOME_PASS = "pass"
 OUTCOME_FAIL = "fail"
 OUTCOME_INCONCLUSIVE = "inconclusive"
@@ -95,8 +101,9 @@ def _memory_promql(service_name: str) -> str:
     return f'{MEMORY_METRIC}{{job="{service_name}"}}'
 
 
-def _slope_promql(service_name: str) -> str:
-    return f'deriv({MEMORY_METRIC}{{job="{service_name}"}}[{SLOPE_WINDOW_MINUTES}m])'
+def _slope_promql(service_name: str, window_seconds: int | None = None) -> str:
+    window = f"{window_seconds}s" if window_seconds else f"{SLOPE_WINDOW_MINUTES}m"
+    return f'deriv({MEMORY_METRIC}{{job="{service_name}"}}[{window}])'
 
 
 def _single_sample(payload) -> float | None:
@@ -160,7 +167,7 @@ def _as_instant(moment: str | None) -> datetime | None:
     return parsed if parsed.tzinfo else None
 
 
-def read_signal(category: str, service_name: str) -> dict:
+def read_signal(category: str, service_name: str, window_seconds: int | None = None) -> dict:
     """One reading of whatever proves or disproves this category.
 
     Returns either a usable payload or the failure envelope, and never raises.
@@ -170,8 +177,10 @@ def read_signal(category: str, service_name: str) -> dict:
     all -- the one thing the operator cannot reconstruct.
     """
     try:
-        if category == "overload":
-            return _read_memory(service_name)
+        if category in MEMORY_CATEGORIES:
+            if window_seconds is None:
+                return _read_memory(service_name)
+            return _read_memory(service_name, window_seconds)
         if category == "crash":
             return {
                 "state": get_container_state(service_name),
@@ -190,7 +199,7 @@ def read_signal(category: str, service_name: str) -> dict:
     }
 
 
-def _read_memory(service_name: str) -> dict:
+def _read_memory(service_name: str, window_seconds: int | None = None) -> dict:
     """Working set now, and its short-window slope, or the failure envelope.
 
     Both are needed and they answer different questions. The level says the
@@ -202,7 +211,7 @@ def _read_memory(service_name: str) -> dict:
     if not scoring._is_usable({"raw_data": level}):
         return {"status": "error", "error": "the working-set query did not return data"}
 
-    slope = query_prometheus(_slope_promql(service_name))
+    slope = query_prometheus(_slope_promql(service_name, window_seconds))
     if not scoring._is_usable({"raw_data": slope}):
         return {"status": "error", "error": "the working-set slope query did not return data"}
 
@@ -214,7 +223,7 @@ def _read_memory(service_name: str) -> dict:
     if slope_value is None:
         return {"status": "error", "error": "the working-set slope vector carried no sample"}
 
-    return {"bytes": bytes_now, "slope": slope_value}
+    return {"bytes": bytes_now, "slope": slope_value, "window_seconds": window_seconds}
 
 
 # Where each service's business endpoint lives. A fixed map rather than a
@@ -336,6 +345,48 @@ def _read_config(service_name: str) -> dict:
     return {"status": "ok", "key": spec["key"], "value": str(value)}
 
 
+# A slope needs at least two scrapes, and the scrape interval is 15s, so the
+# window it is measured over must hold two post-action samples.
+MIN_POST_ACTION_SECONDS = 90
+SLOPE_WINDOW_MARGIN_SECONDS = 5
+
+# A freshly restarted process does not hold a perfectly flat working set: the
+# allocator moves in steps of a few hundred KiB, which a regression over a
+# window of a minute or two reads as tens of KB/s. SLOPE_TOLERANCE is the
+# paging threshold for a 30m window and is orders of magnitude tighter than
+# that noise, so applied to a post-action window it fails a restart that
+# worked. What the check is really asking is whether the freed memory is
+# coming back, i.e. whether the process grew by more than allocator noise over
+# the window -- so the tolerance is the larger of the paging threshold and a
+# 1 MiB growth budget spread across the window. A real leak (megabytes over the
+# same window) is still well outside it.
+NOISE_FLOOR_BYTES = 1024 * 1024
+
+
+def _post_action_window(action_at: str | None) -> int | None:
+    """Seconds of history after the action to measure the slope over, or None.
+
+    The default slope window is 5m, which reaches back past the action: after a
+    restart it still contains the leak's own ramp from before it, and a
+    regression over a ramp-then-drop reads as a rising slope on a process that
+    is in fact flat. The slope that answers "is the freed memory staying
+    freed" can only come from samples taken after the action, so the window is
+    the time elapsed since it (less a small margin so the pre-action sample
+    cannot fall inside), capped at the default. If too little time has passed
+    for two scrapes to exist, this waits rather than reading a window with one
+    point in it. No usable action time means no basis for a window, so the
+    caller falls back to the default rather than guessing.
+    """
+    moment = _as_instant(action_at)
+    if moment is None:
+        return None
+    elapsed = (datetime.now(timezone.utc) - moment).total_seconds()
+    if elapsed < MIN_POST_ACTION_SECONDS:
+        time.sleep(MIN_POST_ACTION_SECONDS - elapsed)
+        elapsed = MIN_POST_ACTION_SECONDS
+    return int(min(elapsed - SLOPE_WINDOW_MARGIN_SECONDS, SLOPE_WINDOW_MINUTES * 60))
+
+
 def run_check(
     category: str,
     service_name: str,
@@ -349,7 +400,13 @@ def run_check(
     and inconclusive is the honest answer whenever the signal could not be read
     -- never a pass, and never a silent absence.
     """
-    signal = read_signal(category, service_name)
+    window_seconds = None
+    if category in MEMORY_CATEGORIES:
+        window_seconds = _post_action_window(action_at)
+    if window_seconds is None:
+        signal = read_signal(category, service_name)
+    else:
+        signal = read_signal(category, service_name, window_seconds)
 
     if not scoring._is_usable({"raw_data": signal}):
         return OUTCOME_INCONCLUSIVE, {
@@ -361,7 +418,7 @@ def run_check(
             "signal": signal,
         }
 
-    if category == "overload":
+    if category in MEMORY_CATEGORIES:
         return _check_overload(signal, before or {})
     if category == "crash":
         return _check_crash(signal, action_at)
@@ -507,14 +564,16 @@ def _check_overload(signal: dict, before: dict) -> tuple[str, dict]:
             ),
         }
 
-    if signal["slope"] > SLOPE_TOLERANCE:
+    window = signal.get("window_seconds")
+    tolerance = max(SLOPE_TOLERANCE, NOISE_FLOOR_BYTES / window) if window else SLOPE_TOLERANCE
+    if signal["slope"] > tolerance:
         return OUTCOME_FAIL, {
             **detail,
             "reason": (
                 f"working set did come down to {int(signal['bytes'])} but its "
-                f"slope over {SLOPE_WINDOW_MINUTES}m is {signal['slope']:.0f} B/s, "
-                f"above the {SLOPE_TOLERANCE} B/s the alert would page on, so the "
-                f"restart bought time rather than a fix"
+                f"slope over the {window or SLOPE_WINDOW_MINUTES * 60}s after the action "
+                f"is {signal['slope']:.0f} B/s, above the {tolerance:.0f} B/s this "
+                f"window allows, so the restart bought time rather than a fix"
             ),
         }
 
