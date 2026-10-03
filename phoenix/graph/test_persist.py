@@ -1401,17 +1401,33 @@ def test_no_unhandled_incidents_is_an_empty_list_not_none(monkeypatch):
     assert persist.list_unhandled_incidents() == []
 
 
-def test_the_query_excludes_anything_with_an_audit_row_and_anything_not_active(monkeypatch):
+def test_the_query_excludes_anything_with_an_audit_row_and_anything_at_or_below_the_floor(monkeypatch):
     """Pins the two clauses rather than just the result: a query that happened
-    to return the right rows today could still be wrong about why."""
+    to return the right rows today could still be wrong about why.
+
+    Deliberately not status = 'active': an incident that resolves itself
+    before a poll ever sees it active would be invisible forever under that
+    filter (see the module docstring). after_id is the guard against flooding
+    old history instead.
+    """
     recorder = _live(monkeypatch, query_results=[[]])
 
-    persist.list_unhandled_incidents()
+    persist.list_unhandled_incidents(after_id=22)
 
     sql = recorder.sql[0]
-    assert "status = 'active'" in sql
+    assert "status" not in sql
+    assert "id > %(after_id)s" in sql
     assert "NOT IN" in sql
     assert "audit_log" in sql
+    assert recorder.params[0] == {"after_id": 22}
+
+
+def test_an_incident_already_resolved_before_being_polled_is_still_returned(monkeypatch):
+    """The exact race this function exists to survive: Alertmanager can flip a
+    row to 'resolved' faster than any poll interval catches it 'active'."""
+    _live(monkeypatch, query_results=[[(23, "payment-service")]])
+
+    assert persist.list_unhandled_incidents(after_id=22) == [(23, "payment-service")]
 
 
 def test_a_run_with_no_database_lists_no_unhandled_incidents(monkeypatch):
@@ -1424,3 +1440,28 @@ def test_an_unreadable_table_lists_no_unhandled_incidents_rather_than_raising(mo
     _live(monkeypatch, execute_error=RuntimeError("relation \"audit_log\" does not exist"))
 
     assert persist.list_unhandled_incidents() == []
+
+
+# --- max_incident_id: the watcher's one-time floor ---------------------------
+
+
+def test_max_incident_id_reads_the_highest_id_present(monkeypatch):
+    _live(monkeypatch, query_results=[[(22,)]])
+
+    assert persist.max_incident_id() == 22
+
+
+def test_max_incident_id_is_zero_with_no_incidents_at_all(monkeypatch):
+    _live(monkeypatch, query_results=[[(0,)]])
+
+    assert persist.max_incident_id() == 0
+
+
+def test_max_incident_id_is_zero_with_no_database(monkeypatch):
+    assert persist.max_incident_id() == 0
+
+
+def test_max_incident_id_is_zero_rather_than_raising_when_unreadable(monkeypatch):
+    _live(monkeypatch, execute_error=RuntimeError("connection reset"))
+
+    assert persist.max_incident_id() == 0

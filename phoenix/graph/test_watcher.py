@@ -31,15 +31,24 @@ class _FakeApp:
 
 
 def _patch(monkeypatch, incidents: list[tuple[int, str]], results_by_incident: dict[int, object]):
-    monkeypatch.setattr(watcher, "list_unhandled_incidents", lambda: incidents)
+    monkeypatch.setattr(watcher, "list_unhandled_incidents", lambda after_id=0: incidents)
     fake_app = _FakeApp(results_by_incident)
     monkeypatch.setattr(watcher, "build_graph", lambda: fake_app)
     return fake_app
 
 
+def test_poll_once_forwards_after_id_to_list_unhandled_incidents(monkeypatch):
+    seen = []
+    monkeypatch.setattr(watcher, "list_unhandled_incidents", lambda after_id=0: seen.append(after_id) or [])
+
+    watcher.poll_once(after_id=22)
+
+    assert seen == [22]
+
+
 def test_no_unhandled_incidents_calls_the_graph_not_at_all(monkeypatch):
     calls = []
-    monkeypatch.setattr(watcher, "list_unhandled_incidents", lambda: [])
+    monkeypatch.setattr(watcher, "list_unhandled_incidents", lambda after_id=0: [])
     monkeypatch.setattr(watcher, "build_graph", lambda: calls.append("built") or pytest.fail("must not build"))
 
     started = watcher.poll_once()
@@ -108,8 +117,9 @@ def test_run_forever_polls_then_sleeps_then_polls_again(monkeypatch):
     """Pins the loop shape without actually looping forever: the third sleep
     call raises to end the test, so the assertion is that two polls happened
     first, not that the loop never terminates."""
+    monkeypatch.setattr(watcher, "max_incident_id", lambda: 0)
     poll_calls = []
-    monkeypatch.setattr(watcher, "poll_once", lambda: poll_calls.append(1) or [])
+    monkeypatch.setattr(watcher, "poll_once", lambda after_id=0: poll_calls.append(after_id) or [])
 
     sleeps = []
 
@@ -123,8 +133,23 @@ def test_run_forever_polls_then_sleeps_then_polls_again(monkeypatch):
     with pytest.raises(KeyboardInterrupt):
         watcher.run_forever()
 
-    assert len(poll_calls) == 2
+    assert poll_calls == [0, 0]
     assert sleeps == [watcher.POLL_INTERVAL_SECONDS, watcher.POLL_INTERVAL_SECONDS]
+
+
+def test_run_forever_polls_with_the_floor_it_read_at_startup(monkeypatch):
+    """The floor is read once, not re-read per poll -- an incident that gets
+    investigated between polls must not need the floor raised to stay excluded;
+    it is excluded because it now has an audit_log row."""
+    monkeypatch.setattr(watcher, "max_incident_id", lambda: 22)
+    poll_calls = []
+    monkeypatch.setattr(watcher, "poll_once", lambda after_id=0: poll_calls.append(after_id) or [])
+    monkeypatch.setattr(watcher.time, "sleep", lambda seconds: (_ for _ in ()).throw(KeyboardInterrupt))
+
+    with pytest.raises(KeyboardInterrupt):
+        watcher.run_forever()
+
+    assert poll_calls == [22]
 
 
 def test_the_poll_interval_is_configurable_by_environment(monkeypatch):
