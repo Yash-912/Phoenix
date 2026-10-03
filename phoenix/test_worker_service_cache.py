@@ -1,12 +1,22 @@
-"""Scenario 3's mechanism: a real cache lifecycle bug, not a raw list.
+"""Scenario 3: the worker-service job-result cache.
 
-_cache_store_unbounded (the bug) and _cache_store_bounded (the fix) share
-the same dict and the same lookup semantics -- the only difference is
-whether old entries are ever evicted. These tests pin that difference
-directly, pin that the dispatch in _process_job actually routes on
-LEAK_ENABLED, and pin that _consume_one_tick -- the piece that makes the
-leak grow on its own, without needing an external load generator -- calls
-into that same real path rather than a separate one nothing else tests.
+Two kinds of test live here, kept apart on purpose.
+
+NORMAL APPLICATION TESTS describe the production contract: the cache is
+bounded at _CACHE_MAX_SIZE, the oldest entry is evicted once it is full,
+refreshing a key is not growth, and the ordinary job path -- both /process and
+the background consumer tick -- stores through that bounded policy and so
+never grows without limit. None of them depends on the injected leak existing,
+so a correct fix to the unbounded store keeps them green.
+
+CHAOS ROUTING TESTS cover only the injector's wiring: LEAK_ENABLED must send
+_process_job's storage through _cache_store_unbounded, and clearing it must
+send it back through _cache_store_bounded. They deliberately say nothing about
+what _cache_store_unbounded does inside, so they hold before and after the leak
+is repaired -- and they fail a "fix" that merely disconnects the injector
+instead of repairing the store. That the injected leak really grows the cache
+and the process's memory is proven against the live worker by
+chaos/test_live_memory_leak.py, not here.
 """
 
 import importlib.util
@@ -27,7 +37,7 @@ def module(monkeypatch):
     stub = types.ModuleType("prometheus_fastapi_instrumentator")
 
     class _Instrumentator:
-        def instrument(self, app):
+        def instrument(self, app, **kwargs):
             return self
 
         def expose(self, app, **kwargs):
@@ -42,12 +52,11 @@ def module(monkeypatch):
     return mod
 
 
-def test_unbounded_store_never_evicts_past_the_cap(module):
-    module._CACHE_MAX_SIZE = 5
-    for i in range(20):
-        module._cache_store_unbounded(f"job-{i}", {"status": "processed"})
+# ---- normal application behaviour -----------------------------------------
 
-    assert len(module._cache) == 20
+
+def test_leak_chaos_is_off_by_default(module):
+    assert module.LEAK_ENABLED is False
 
 
 def test_bounded_store_evicts_the_oldest_entry_once_full(module):
@@ -73,42 +82,111 @@ def test_bounded_store_refreshing_an_existing_key_does_not_evict(module):
     assert module._cache["job-0"]["status"] == "reprocessed"
 
 
-def test_process_job_routes_to_unbounded_when_leak_enabled(module):
-    module.LEAK_ENABLED = True
-    module._CACHE_MAX_SIZE = 1
-    module._process_job("a")
-    module._process_job("b")
+def test_process_job_keeps_the_cache_within_its_cap(module):
+    module._CACHE_MAX_SIZE = 10
+    peak = 0
+    for i in range(200):
+        module._process_job(f"job-{i}")
+        peak = max(peak, len(module._cache))
 
-    assert len(module._cache) == 2
-
-
-def test_process_job_routes_to_bounded_when_leak_disabled(module):
-    module.LEAK_ENABLED = False
-    module._CACHE_MAX_SIZE = 1
-    module._process_job("a")
-    module._process_job("b")
-
-    assert len(module._cache) == 1
+    assert peak <= 10
+    assert len(module._cache) == 10
 
 
-def test_consume_one_tick_grows_the_real_cache_when_leak_enabled(module):
-    """The piece that replaces an external load generator: ticking the
-    consumer must exercise the same _process_job path /process does, so the
-    leak genuinely grows from the service's own simulated traffic."""
-    module.LEAK_ENABLED = True
-    for _ in range(10):
+def test_process_job_evicts_the_oldest_job_first(module):
+    module._CACHE_MAX_SIZE = 3
+    for i in range(6):
+        module._process_job(f"job-{i}")
+
+    assert list(module._cache) == ["job-3", "job-4", "job-5"]
+
+
+def test_process_job_returns_the_processed_result_and_caches_it(module):
+    result = module._process_job("job-a")
+
+    assert result["status"] == "processed"
+    assert result["job_id"] == "job-a"
+    assert module._cache["job-a"] is result
+
+
+def test_consume_one_tick_keeps_the_cache_within_its_cap(module):
+    """The background consumer is the service's own steady traffic, so it is
+    what decides whether memory stays flat in production: it must stay bounded."""
+    module._CACHE_MAX_SIZE = 5
+    for _ in range(50):
         module._consume_one_tick()
 
-    assert len(module._cache) == 10
+    assert len(module._cache) == 5
 
 
 def test_consume_one_tick_does_nothing_while_paused(module):
     module.PAUSED = True
-    module.LEAK_ENABLED = True
 
     module._consume_one_tick()
 
     assert len(module._cache) == 0
+
+
+def test_process_endpoint_keeps_the_cache_within_its_cap(module):
+    module._CACHE_MAX_SIZE = 4
+    for _ in range(25):
+        assert module.process() == {"status": "processed"}
+
+    assert len(module._cache) == 4
+
+
+def test_health_reports_the_real_cache_size(module):
+    module._cache["a"] = {}
+    module._cache["b"] = {}
+
+    assert module.health()["cache_size"] == 2
+
+
+# ---- chaos injector wiring -------------------------------------------------
+
+
+def _record_storage_route(module, monkeypatch):
+    calls = []
+    monkeypatch.setattr(module, "_cache_store_unbounded", lambda job_id, result: calls.append("unbounded"))
+    monkeypatch.setattr(module, "_cache_store_bounded", lambda job_id, result: calls.append("bounded"))
+    return calls
+
+
+def test_chaos_enabled_routes_job_storage_through_the_unbounded_store(module, monkeypatch):
+    calls = _record_storage_route(module, monkeypatch)
+    module.LEAK_ENABLED = True
+
+    module._process_job("a")
+
+    assert calls == ["unbounded"]
+
+
+def test_chaos_disabled_routes_job_storage_through_the_bounded_store(module, monkeypatch):
+    calls = _record_storage_route(module, monkeypatch)
+    module.LEAK_ENABLED = False
+
+    module._process_job("a")
+
+    assert calls == ["bounded"]
+
+
+def test_chaos_enabled_consumer_ticks_use_the_unbounded_store(module, monkeypatch):
+    """The piece that replaces an external load generator: ticking the
+    consumer must exercise the same _process_job path /process does, so a
+    leak genuinely accrues from the service's own simulated traffic."""
+    calls = _record_storage_route(module, monkeypatch)
+    module.LEAK_ENABLED = True
+
+    for _ in range(3):
+        module._consume_one_tick()
+
+    assert calls == ["unbounded"] * 3
+
+
+def test_chaos_leak_start_enables_the_flag(module):
+    module.chaos_leak_start()
+
+    assert module.LEAK_ENABLED is True
 
 
 def test_chaos_leak_stop_disables_the_flag_and_clears_the_cache(module):
@@ -128,10 +206,3 @@ def test_chaos_leak_start_is_refused_when_chaos_disabled(module, monkeypatch):
 
     assert result == {"error": "chaos disabled"}
     assert module.LEAK_ENABLED is False
-
-
-def test_health_reports_the_real_cache_size(module):
-    module._cache["a"] = {}
-    module._cache["b"] = {}
-
-    assert module.health()["cache_size"] == 2
