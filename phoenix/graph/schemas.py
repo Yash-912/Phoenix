@@ -53,7 +53,11 @@ class CodeDefect(BaseModel):
         default=None, description="Repo-relative path of the file believed to hold the defect."
     )
     function_name: Optional[str] = Field(
-        default=None, description="The function/endpoint believed to hold the defect, if identifiable."
+        default=None,
+        description=(
+            "The exact identifier, as written after `def` in the source, of the one function "
+            "whose body is defective. Null only when no single function can be named."
+        ),
     )
     description: str = Field(
         min_length=1, description="What the defect is, grounded in the evidence gathered."
@@ -68,6 +72,21 @@ class CodeDefect(BaseModel):
     )
 
 
+class PatchTarget(BaseModel):
+    """What the patch generator is allowed to work on, derived from the code
+    investigator's CodeDefect rather than invented here. It names one function
+    in one file, says what is wrong and what has to change, and lists what is
+    off limits; patch_tool.validate_patch_scope enforces the same boundary in
+    code, so the model is told the rule and the gate does not rely on it.
+    """
+
+    target_file: str = Field(description="Repo-relative path of the only file that may change.")
+    target_function: str = Field(description="The one function whose body holds the defect.")
+    defect_summary: str = Field(description="What the defect is, from the investigation.")
+    required_change: str = Field(description="What has to change inside the target function.")
+    forbidden_areas: list[str] = Field(description="Code the patch must leave exactly as it is.")
+
+
 class PatchProposal(BaseModel):
     """The whole proposed replacement for one file. Never a raw diff -- the
     model is bad at hand-writing unified-diff hunks that apply cleanly, so it
@@ -77,3 +96,7 @@ class PatchProposal(BaseModel):
 
     new_content: str = Field(min_length=1, description="The file's complete proposed content.")
     rationale: str = Field(min_length=1, description="What changed and why, for the PR body.")
+    target_function: str = Field(
+        default="",
+        description="The function the model says it changed, declared before the content so it can be checked against the investigation's target.",
+    )

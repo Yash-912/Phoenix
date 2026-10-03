@@ -19,6 +19,7 @@ from langgraph.types import Command
 
 from phoenix.graph.llm_client import decide_code_investigation_calls, decide_defect, decide_patch
 from phoenix.graph.persist import record_audit
+from phoenix.graph.schemas import PatchTarget
 from phoenix.graph.state import AgentState
 from phoenix.tools import git_tool, patch_tool, repo_tool, test_runner_tool, worktree_tool
 from phoenix.tools.github_tool import open_pull_request
@@ -116,7 +117,11 @@ def code_investigator_node(state: AgentState) -> Command:
 
     record_audit(
         state.incident_id, "code_investigator", "investigation_concluded",
-        {"iteration": iteration, "defect_found": defect.defect_found, "file_path": defect.file_path, "evidence_collected": len(evidence)},
+        {
+            "iteration": iteration, "defect_found": defect.defect_found, "file_path": defect.file_path,
+            "function_name": defect.function_name, "fix_approach": defect.fix_approach,
+            "evidence_collected": len(evidence),
+        },
         defect.description,
     )
 
@@ -141,10 +146,35 @@ def code_investigator_node(state: AgentState) -> Command:
     )
 
 
+def _patch_target(defect: dict, file_path: str, committed_content: str) -> tuple[PatchTarget | None, str | None]:
+    """Build the patch target from the investigator's conclusion, or say why
+    there is none. The target function has to be one the investigation named
+    and that really exists in the file: with nothing to tie the patch to, the
+    gate has nothing to check it against, so the run stops here instead.
+    """
+    function_name = (defect.get("function_name") or "").strip()
+    if not function_name:
+        return None, "the investigation did not name a target function, so a patch cannot be tied to the defect"
+    if not patch_tool.function_exists(committed_content, function_name):
+        return None, f"the investigation's target function '{function_name}' is not defined in '{file_path}'"
+    return PatchTarget(
+        target_file=file_path,
+        target_function=function_name,
+        defect_summary=defect.get("description", ""),
+        required_change=defect.get("fix_approach", ""),
+        forbidden_areas=list(patch_tool.FORBIDDEN_AREAS),
+    ), None
+
+
 def patch_generator_node(state: AgentState) -> Command:
     """LLM proposes the whole new content of one file; this code turns that
     into a diff and runs the deterministic scope gate -- the LLM never
     decides whether its own patch is acceptable.
+
+    The proposal is tied to the function the investigation named: the model
+    is given that function as its target and must declare it before patching,
+    and the gate rejects a patch that does not change it or that changes any
+    other function.
     """
     defect = state.tier3_defect or {}
     file_path = defect.get("file_path")
@@ -163,6 +193,14 @@ def patch_generator_node(state: AgentState) -> Command:
             {"tier3_status": "patch_rejected"},
         )
 
+    target, target_error = _patch_target(defect, file_path, current["content"])
+    if target is None:
+        return _escalate(
+            state, "patch_generator", "patch_generation_failed", target_error,
+            {"tier3_status": "patch_rejected"},
+        )
+    record_audit(state.incident_id, "patch_generator", "patch_target", target.model_dump(), None)
+
     # The gate's verdict is fed back to the model so a rejected patch can be
     # corrected rather than abandoned, but only a bounded number of times, and
     # every attempt (not just the last) is written to the audit trail: a
@@ -171,9 +209,7 @@ def patch_generator_node(state: AgentState) -> Command:
     feedback = None
     tokens_spent = state.tokens_spent
     for attempt in range(1, MAX_PATCH_ATTEMPTS + 1):
-        patch_decision = decide_patch(
-            file_path, current["content"], defect.get("description", ""), defect.get("fix_approach", ""), feedback
-        )
+        patch_decision = decide_patch(current["content"], target, feedback)
         tokens_spent += patch_decision.tokens
         if patch_decision.output is None:
             return _escalate(
@@ -191,11 +227,25 @@ def patch_generator_node(state: AgentState) -> Command:
             )
 
         scope_ok, scope_reason = patch_tool.validate_patch_scope(
-            candidate["file_path"], candidate["diff"], candidate["changed_lines"], candidate["hunks"]
+            candidate["file_path"], candidate["diff"], candidate["changed_lines"], candidate["hunks"],
+            target_function=target.target_function,
+            old_content=candidate["old_content"],
+            new_content=candidate["new_content"],
         )
+        declared = patch_decision.output.target_function
+        if scope_ok and not patch_tool.same_target(declared, target.target_function):
+            scope_ok = False
+            scope_reason = (
+                f"the patch declares that it changes '{declared or 'no function'}', but the "
+                f"investigation's target function is '{target.target_function}'"
+            )
         record_audit(
             state.incident_id, "patch_generator", "patch_proposed",
-            {"attempt": attempt, "file_path": candidate["file_path"], "changed_lines": candidate["changed_lines"], "hunks": candidate["hunks"], "scope_ok": scope_ok, "diff": candidate["diff"]},
+            {
+                "attempt": attempt, "file_path": candidate["file_path"], "changed_lines": candidate["changed_lines"],
+                "hunks": candidate["hunks"], "scope_ok": scope_ok, "diff": candidate["diff"],
+                "target_function": target.target_function, "declared_target_function": declared,
+            },
             scope_reason,
         )
         if scope_ok:
@@ -226,6 +276,7 @@ def patch_generator_node(state: AgentState) -> Command:
                 "changed_lines": candidate["changed_lines"],
                 "hunks": candidate["hunks"],
                 "rationale": patch_decision.output.rationale,
+                "target_function": target.target_function,
                 "scope_ok": True,
                 "scope_reason": scope_reason,
             },
@@ -282,10 +333,19 @@ def patch_validator_node(state: AgentState) -> Command:
             {"applied": True, "commit_sha": commit_sha, "diff_valid": False},
         )
 
+    base = patch_tool.read_committed(file_path)
+    if base.get("status") != "ok":
+        return _fail(
+            f"could not read the committed base of '{file_path}' to re-check the patch: {base.get('error')}",
+            {"applied": True, "commit_sha": commit_sha, "diff_valid": False},
+        )
     rescoped_ok, rescoped_reason = patch_tool.validate_patch_scope(
         file_path, diff_check["diff"],
         sum(1 for l in diff_check["diff"].splitlines() if l.startswith(("+", "-")) and not l.startswith(("+++", "---"))),
         sum(1 for l in diff_check["diff"].splitlines() if l.startswith("@@")),
+        target_function=candidate.get("target_function"),
+        old_content=base["content"],
+        new_content=candidate["new_content"],
     )
     if not rescoped_ok:
         return _fail(

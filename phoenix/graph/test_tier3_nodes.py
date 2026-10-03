@@ -133,7 +133,7 @@ def test_llm_produces_no_usable_patch_proposal(monkeypatch):
     monkeypatch.setattr(tier3_nodes, "decide_patch", lambda *a: PatchDecision(None, 3))
     monkeypatch.setattr(tier3_nodes, "record_audit", lambda *a, **k: None)
     state = _state(tier3_defect={
-        "defect_found": True, "file_path": "services/payment-service/app.py",
+        "defect_found": True, "file_path": "services/payment-service/app.py", "function_name": "_find_charge_slow",
         "description": "x", "fix_approach": "y",
     })
 
@@ -151,10 +151,10 @@ def test_model_proposes_a_chaos_toggle_change_instead_of_the_defect(monkeypatch)
     current = patch_tool.read_committed("services/payment-service/app.py")["content"]
     sabotage = current.replace("SLOW_QUERY = False", "SLOW_QUERY = True")
 
-    monkeypatch.setattr(tier3_nodes, "decide_patch", lambda *a: PatchDecision(PatchProposal(new_content=sabotage, rationale="flip the flag"), 3))
+    monkeypatch.setattr(tier3_nodes, "decide_patch", lambda *a: PatchDecision(PatchProposal(new_content=sabotage, rationale="flip the flag", target_function="_find_charge_slow"), 3))
     monkeypatch.setattr(tier3_nodes, "record_audit", lambda *a, **k: None)
     state = _state(tier3_defect={
-        "defect_found": True, "file_path": "services/payment-service/app.py",
+        "defect_found": True, "file_path": "services/payment-service/app.py", "function_name": "_find_charge_slow",
         "description": "slow query", "fix_approach": "fix it",
     })
 
@@ -176,10 +176,10 @@ def test_a_minimal_in_scope_patch_proceeds_to_the_validator(monkeypatch):
     )
     assert fixed != current
 
-    monkeypatch.setattr(tier3_nodes, "decide_patch", lambda *a: PatchDecision(PatchProposal(new_content=fixed, rationale="use the indexed lookup"), 3))
+    monkeypatch.setattr(tier3_nodes, "decide_patch", lambda *a: PatchDecision(PatchProposal(new_content=fixed, rationale="use the indexed lookup", target_function="_find_charge_slow"), 3))
     monkeypatch.setattr(tier3_nodes, "record_audit", lambda *a, **k: None)
     state = _state(tier3_defect={
-        "defect_found": True, "file_path": "services/payment-service/app.py",
+        "defect_found": True, "file_path": "services/payment-service/app.py", "function_name": "_find_charge_slow",
         "description": "slow query", "fix_approach": "fix it",
     })
 
@@ -188,6 +188,7 @@ def test_a_minimal_in_scope_patch_proceeds_to_the_validator(monkeypatch):
 
     assert command.goto == "patch_validator"
     assert update["patch_candidate"]["scope_ok"] is True
+    assert update["patch_candidate"]["target_function"] == "_find_charge_slow"
 
 
 # --- patch_validator_node ------------------------------------------------
@@ -201,6 +202,7 @@ def _candidate_state(**overrides):
         "changed_lines": 2,
         "hunks": 1,
         "rationale": "test",
+        "target_function": "_find_charge_slow",
     }}
     fields.update(overrides)
     return _state(**fields)
@@ -266,7 +268,7 @@ def test_failing_tests_reject_the_patch(monkeypatch):
         tier3_nodes.worktree_tool, "diff_against_base",
         lambda *a, **k: {"status": "ok", "diff": "@@ -1 +1 @@\n-a\n+b\n", "changed_files": ["services/payment-service/app.py"]},
     )
-    monkeypatch.setattr(tier3_nodes.patch_tool, "validate_patch_scope", lambda *a: (True, "ok"))
+    monkeypatch.setattr(tier3_nodes.patch_tool, "validate_patch_scope", lambda *a, **k: (True, "ok"))
     monkeypatch.setattr(tier3_nodes.test_runner_tool, "discover_tests_for", lambda *a: ["phoenix/test_payment_service_charge.py"])
     monkeypatch.setattr(tier3_nodes.test_runner_tool, "run_tests", lambda *a: {"status": "failed", "returncode": 1, "stdout": "2 failed"})
     monkeypatch.setattr(tier3_nodes.test_runner_tool, "run_linter", lambda *a: {"status": "ok", "returncode": 0})
@@ -292,7 +294,7 @@ def test_failing_lint_rejects_the_patch(monkeypatch):
         tier3_nodes.worktree_tool, "diff_against_base",
         lambda *a, **k: {"status": "ok", "diff": "@@ -1 +1 @@\n-a\n+b\n", "changed_files": ["services/payment-service/app.py"]},
     )
-    monkeypatch.setattr(tier3_nodes.patch_tool, "validate_patch_scope", lambda *a: (True, "ok"))
+    monkeypatch.setattr(tier3_nodes.patch_tool, "validate_patch_scope", lambda *a, **k: (True, "ok"))
     monkeypatch.setattr(tier3_nodes.test_runner_tool, "discover_tests_for", lambda *a: ["phoenix/test_payment_service_charge.py"])
     monkeypatch.setattr(tier3_nodes.test_runner_tool, "run_tests", lambda *a: {"status": "ok", "returncode": 0})
     monkeypatch.setattr(tier3_nodes.test_runner_tool, "run_linter", lambda *a: {"status": "failed", "returncode": 1, "stdout": "undefined name 'x'"})
@@ -318,7 +320,7 @@ def test_a_fully_passing_patch_pushes_and_hands_off_to_pr_opener(monkeypatch):
         tier3_nodes.worktree_tool, "diff_against_base",
         lambda *a, **k: {"status": "ok", "diff": "@@ -1 +1 @@\n-a\n+b\n", "changed_files": ["services/payment-service/app.py"]},
     )
-    monkeypatch.setattr(tier3_nodes.patch_tool, "validate_patch_scope", lambda *a: (True, "ok"))
+    monkeypatch.setattr(tier3_nodes.patch_tool, "validate_patch_scope", lambda *a, **k: (True, "ok"))
     monkeypatch.setattr(tier3_nodes.test_runner_tool, "discover_tests_for", lambda *a: ["phoenix/test_payment_service_charge.py"])
     monkeypatch.setattr(tier3_nodes.test_runner_tool, "run_tests", lambda *a: {"status": "ok", "returncode": 0})
     monkeypatch.setattr(tier3_nodes.test_runner_tool, "run_linter", lambda *a: {"status": "ok", "returncode": 0})
@@ -414,7 +416,7 @@ def test_no_merge_or_direct_main_push_capability_exists_anywhere_in_tier3():
 
 def _defect_state():
     return _state(tier3_defect={
-        "defect_found": True, "file_path": "services/payment-service/app.py",
+        "defect_found": True, "file_path": "services/payment-service/app.py", "function_name": "_find_charge_slow",
         "description": "slow query", "fix_approach": "fix it",
     })
 
@@ -438,9 +440,9 @@ def test_a_rejected_patch_is_retried_with_the_gates_reason_and_every_attempt_is_
     feedback_seen = []
     audit_rows = []
 
-    def fake_decide_patch(file_path, old_content, description, approach, feedback=None):
+    def fake_decide_patch(old_content, target, feedback=None):
         feedback_seen.append(feedback)
-        return PatchDecision(PatchProposal(new_content=next(proposals), rationale="r"), 1)
+        return PatchDecision(PatchProposal(new_content=next(proposals), rationale="r", target_function="_find_charge_slow"), 1)
 
     monkeypatch.setattr(tier3_nodes, "decide_patch", fake_decide_patch)
     monkeypatch.setattr(tier3_nodes, "record_audit", lambda *a, **k: audit_rows.append(a))
@@ -462,7 +464,7 @@ def test_a_patch_rejected_on_every_attempt_escalates_after_the_attempt_cap(monke
 
     def fake_decide_patch(*args):
         calls.append(args)
-        return PatchDecision(PatchProposal(new_content=sabotage, rationale="r"), 1)
+        return PatchDecision(PatchProposal(new_content=sabotage, rationale="r", target_function="_find_charge_slow"), 1)
 
     monkeypatch.setattr(tier3_nodes, "decide_patch", fake_decide_patch)
     monkeypatch.setattr(tier3_nodes, "record_audit", lambda *a, **k: audit_rows.append(a))
@@ -476,3 +478,186 @@ def test_a_patch_rejected_on_every_attempt_escalates_after_the_attempt_cap(monke
     assert "chaos toggle" in update["escalation_reason"]
     proposed = [row for row in audit_rows if row[2] == "patch_proposed"]
     assert len(proposed) == tier3_nodes.MAX_PATCH_ATTEMPTS
+
+
+# --- the patch is tied to the function the investigation named --------------
+
+
+def _real_app_source():
+    from phoenix.tools import patch_tool
+
+    return patch_tool.read_committed("services/payment-service/app.py")["content"]
+
+
+def test_the_patch_generator_is_handed_the_investigations_target(monkeypatch):
+    _sabotage, fixed = _sabotage_and_fix()
+    seen = []
+
+    def fake_decide_patch(old_content, target, feedback=None):
+        seen.append(target)
+        return PatchDecision(PatchProposal(new_content=fixed, rationale="r", target_function="_find_charge_slow"), 1)
+
+    monkeypatch.setattr(tier3_nodes, "decide_patch", fake_decide_patch)
+    monkeypatch.setattr(tier3_nodes, "record_audit", lambda *a, **k: None)
+
+    tier3_nodes.patch_generator_node(_defect_state())
+
+    target = seen[0]
+    assert target.target_file == "services/payment-service/app.py"
+    assert target.target_function == "_find_charge_slow"
+    assert target.defect_summary == "slow query"
+    assert target.required_change == "fix it"
+    assert any("dispatcher" in area for area in target.forbidden_areas)
+    assert any("toggle" in area for area in target.forbidden_areas)
+
+
+def test_a_defect_without_a_named_function_escalates_before_any_patch_is_requested(monkeypatch):
+    requested = []
+    monkeypatch.setattr(tier3_nodes, "decide_patch", lambda *a: requested.append(a))
+    monkeypatch.setattr(tier3_nodes, "record_audit", lambda *a, **k: None)
+    state = _state(tier3_defect={
+        "defect_found": True, "file_path": "services/payment-service/app.py", "function_name": None,
+        "description": "x", "fix_approach": "y",
+    })
+
+    command = tier3_nodes.patch_generator_node(state)
+    update = _update(command)
+
+    assert command.goto == END
+    assert update["tier3_status"] == "patch_rejected"
+    assert "did not name a target function" in update["escalation_reason"]
+    assert requested == []
+
+
+def test_a_named_function_that_is_not_in_the_file_escalates_before_any_patch_is_requested(monkeypatch):
+    requested = []
+    monkeypatch.setattr(tier3_nodes, "decide_patch", lambda *a: requested.append(a))
+    monkeypatch.setattr(tier3_nodes, "record_audit", lambda *a, **k: None)
+    state = _state(tier3_defect={
+        "defect_found": True, "file_path": "services/payment-service/app.py", "function_name": "no_such_function",
+        "description": "x", "fix_approach": "y",
+    })
+
+    command = tier3_nodes.patch_generator_node(state)
+    update = _update(command)
+
+    assert command.goto == END
+    assert update["tier3_status"] == "patch_rejected"
+    assert "'no_such_function' is not defined" in update["escalation_reason"]
+    assert requested == []
+
+
+def test_a_patch_that_only_changes_some_other_function_is_rejected_for_not_touching_the_target(monkeypatch):
+    elsewhere = _real_app_source().replace("VALUES (%s, %s, 'charged')", "VALUES (%s, %s, 'settled')")
+    assert elsewhere != _real_app_source()
+    calls = []
+
+    def fake_decide_patch(old_content, target, feedback=None):
+        calls.append(feedback)
+        return PatchDecision(PatchProposal(new_content=elsewhere, rationale="r", target_function="_find_charge_slow"), 1)
+
+    monkeypatch.setattr(tier3_nodes, "decide_patch", fake_decide_patch)
+    monkeypatch.setattr(tier3_nodes, "record_audit", lambda *a, **k: None)
+
+    command = tier3_nodes.patch_generator_node(_defect_state())
+    update = _update(command)
+
+    assert command.goto == END
+    assert update["tier3_status"] == "patch_rejected"
+    assert "does not modify the target function '_find_charge_slow'" in update["escalation_reason"]
+    assert "_insert_charge" in update["escalation_reason"]
+    assert len(calls) == tier3_nodes.MAX_PATCH_ATTEMPTS
+
+
+def test_fixing_the_target_while_also_editing_another_function_is_rejected(monkeypatch):
+    _sabotage, fixed = _sabotage_and_fix()
+    both = fixed.replace("VALUES (%s, %s, 'charged')", "VALUES (%s, %s, 'settled')")
+    assert both != fixed
+    monkeypatch.setattr(
+        tier3_nodes, "decide_patch",
+        lambda *a: PatchDecision(PatchProposal(new_content=both, rationale="r", target_function="_find_charge_slow"), 1),
+    )
+    monkeypatch.setattr(tier3_nodes, "record_audit", lambda *a, **k: None)
+
+    command = tier3_nodes.patch_generator_node(_defect_state())
+    update = _update(command)
+
+    assert command.goto == END
+    assert "outside the target function '_find_charge_slow'" in update["escalation_reason"]
+    assert "_insert_charge" in update["escalation_reason"]
+
+
+def test_declaring_a_different_function_than_the_target_is_rejected_and_retried(monkeypatch):
+    _sabotage, fixed = _sabotage_and_fix()
+    declared = iter(["find_charge", "_find_charge_slow"])
+    feedback_seen = []
+    audit_rows = []
+
+    def fake_decide_patch(old_content, target, feedback=None):
+        feedback_seen.append(feedback)
+        return PatchDecision(PatchProposal(new_content=fixed, rationale="r", target_function=next(declared)), 1)
+
+    monkeypatch.setattr(tier3_nodes, "decide_patch", fake_decide_patch)
+    monkeypatch.setattr(tier3_nodes, "record_audit", lambda *a, **k: audit_rows.append(a))
+
+    command = tier3_nodes.patch_generator_node(_defect_state())
+
+    assert command.goto == "patch_validator"
+    assert "investigation's target function is '_find_charge_slow'" in feedback_seen[1]
+    proposed = [row for row in audit_rows if row[2] == "patch_proposed"]
+    assert [row[3]["scope_ok"] for row in proposed] == [False, True]
+    assert proposed[0][3]["declared_target_function"] == "find_charge"
+
+
+def test_the_validator_rechecks_the_committed_diff_against_the_same_target(monkeypatch):
+    captured = {}
+
+    def capturing_scope(*a, **k):
+        captured.update(k)
+        return True, "ok"
+
+    monkeypatch.setattr(tier3_nodes.worktree_tool, "new_branch_name", lambda *a: "phoenix/test-x")
+    monkeypatch.setattr(tier3_nodes.worktree_tool, "create_worktree", lambda b: {"status": "ok", "path": "/fake/path", "branch": b})
+    monkeypatch.setattr(tier3_nodes.worktree_tool, "write_file_in_worktree", lambda *a: {"status": "ok"})
+    monkeypatch.setattr(tier3_nodes.worktree_tool, "commit_patch", lambda *a: {"status": "ok", "commit_sha": "a" * 40})
+    monkeypatch.setattr(
+        tier3_nodes.worktree_tool, "diff_against_base",
+        lambda *a, **k: {"status": "ok", "diff": "@@ -1 +1 @@\n-a\n+b\n", "changed_files": ["services/payment-service/app.py"]},
+    )
+    monkeypatch.setattr(tier3_nodes.patch_tool, "validate_patch_scope", capturing_scope)
+    monkeypatch.setattr(tier3_nodes.test_runner_tool, "discover_tests_for", lambda *a: [])
+    monkeypatch.setattr(tier3_nodes.test_runner_tool, "run_tests", lambda *a: {"status": "failed", "returncode": 1})
+    monkeypatch.setattr(tier3_nodes.test_runner_tool, "run_linter", lambda *a: {"status": "ok", "returncode": 0})
+    monkeypatch.setattr(tier3_nodes.worktree_tool, "discard_worktree", lambda p, b: None)
+    monkeypatch.setattr(tier3_nodes, "record_audit", lambda *a, **k: None)
+
+    tier3_nodes.patch_validator_node(_candidate_state())
+
+    assert captured["target_function"] == "_find_charge_slow"
+    assert captured["new_content"] == "x = 1\n"
+    assert "def _find_charge_slow" in captured["old_content"]
+
+
+def test_the_validator_fails_closed_when_the_candidate_carries_no_target(monkeypatch):
+    discarded = []
+    monkeypatch.setattr(tier3_nodes.worktree_tool, "new_branch_name", lambda *a: "phoenix/test-x")
+    monkeypatch.setattr(tier3_nodes.worktree_tool, "create_worktree", lambda b: {"status": "ok", "path": "/fake/path", "branch": b})
+    monkeypatch.setattr(tier3_nodes.worktree_tool, "write_file_in_worktree", lambda *a: {"status": "ok"})
+    monkeypatch.setattr(tier3_nodes.worktree_tool, "commit_patch", lambda *a: {"status": "ok", "commit_sha": "a" * 40})
+    monkeypatch.setattr(
+        tier3_nodes.worktree_tool, "diff_against_base",
+        lambda *a, **k: {"status": "ok", "diff": "@@ -1 +1 @@\n-a\n+b\n", "changed_files": ["services/payment-service/app.py"]},
+    )
+    monkeypatch.setattr(tier3_nodes.worktree_tool, "discard_worktree", lambda p, b: discarded.append((p, b)))
+    monkeypatch.setattr(tier3_nodes, "record_audit", lambda *a, **k: None)
+    state = _candidate_state()
+    state.patch_candidate.pop("target_function")
+
+    command = tier3_nodes.patch_validator_node(state)
+    update = _update(command)
+
+    assert command.goto == END
+    assert update["tier3_status"] == "validation_failed"
+    assert "fails scope validation" in update["escalation_reason"]
+    assert "no target function" in update["escalation_reason"]
+    assert discarded

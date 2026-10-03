@@ -14,7 +14,7 @@ from openai import (
 from openai.types.chat import ChatCompletion
 from pydantic import ValidationError
 
-from phoenix.graph.schemas import CodeDefect, DiagnoserOutput, Hypothesis, PatchProposal
+from phoenix.graph.schemas import CodeDefect, DiagnoserOutput, Hypothesis, PatchProposal, PatchTarget
 
 LLM_BASE_URL = os.environ["LLM_BASE_URL"]
 LLM_API_KEY = os.environ["LLM_API_KEY"]
@@ -606,10 +606,12 @@ def decide_defect(service_name: str, hypothesis_description: str, evidence: list
                 "You are the Tier 3 Code Investigator concluding your investigation of "
                 f"service '{service_name}'. The runtime diagnosis was: "
                 f"'{hypothesis_description}'. Based only on the repository/git evidence "
-                "gathered, state whether you found the specific defect, which file and "
-                "function it is in, what the defect is, and the minimal fix approach -- "
-                "describe the fix, do not write code. If the evidence does not pin down one "
-                "file, set defect_found to false rather than guessing."
+                "gathered, state whether you found the specific defect, which file it is in, "
+                "the exact name of the one function whose body is defective (the identifier "
+                "written after `def`, not an endpoint path or a description), what the defect "
+                "is, and the minimal change that fixes it inside that function -- describe the "
+                "fix, do not write code. If the evidence does not pin down one file and one "
+                "function, set defect_found to false rather than guessing."
             ),
         },
         {
@@ -649,7 +651,7 @@ def decide_defect(service_name: str, hypothesis_description: str, evidence: list
                     "content": (
                         'Reply with a single JSON object and nothing else, shaped as '
                         '{"defect_found": bool, "file_path": "<repo-relative path or null>", '
-                        '"function_name": "<name or null>", "description": "<one sentence>", '
+                        '"function_name": "<exact identifier after def, or null>", "description": "<one sentence>", '
                         '"fix_approach": "<one or two sentences>", "confidence_rationale": '
                         '"<one sentence>"}.'
                     ),
@@ -681,32 +683,48 @@ _PATCH_MARK_START = "---PHOENIX-PATCH-START---"
 _PATCH_MARK_END = "---PHOENIX-PATCH-END---"
 _RATIONALE_MARK_START = "---PHOENIX-RATIONALE-START---"
 _RATIONALE_MARK_END = "---PHOENIX-RATIONALE-END---"
+_TARGET_MARK_START = "---PHOENIX-TARGET-START---"
+_TARGET_MARK_END = "---PHOENIX-TARGET-END---"
 
 
-def decide_patch(
-    file_path: str, old_content: str, defect_description: str, fix_approach: str, feedback: str | None = None
-) -> PatchDecision:
-    """Ask the LLM for the whole new content of `file_path` implementing the
-    minimal fix. Uses marker-delimited plain text rather than JSON: asking a
-    model to JSON-escape an entire source file's quotes/backslashes/newlines
-    correctly is a reliability problem this sidesteps entirely, and
+def decide_patch(old_content: str, target: PatchTarget, feedback: str | None = None) -> PatchDecision:
+    """Ask the LLM for the whole new content of `target.target_file`
+    implementing the minimal fix inside `target.target_function`. Uses
+    marker-delimited plain text rather than JSON: asking a model to
+    JSON-escape an entire source file's quotes/backslashes/newlines correctly
+    is a reliability problem this sidesteps entirely, and
     phoenix.tools.patch_tool is the deterministic code that turns this text
     into an actual diff -- nothing here applies anything.
+
+    The model first declares which function it is changing, so the node can
+    check that intent against the investigation before looking at the diff;
+    patch_tool.validate_patch_scope then enforces the same boundary on the
+    code itself, so the prompt states the rule but the gate does not rely on
+    the model following it.
     """
     messages = [
         {
             "role": "system",
             "content": (
                 "You are the Tier 3 Patch Generator. You will be shown one file's current "
-                "content and a defect description. Produce the complete new content of "
-                "the file with the minimal fix applied -- change only what the defect "
-                "requires. The fix must make the defective function itself correct: edit "
-                "that function's body. Never bypass the defect by deleting, rewriting or "
-                "short-circuiting the code that selects between implementations (a feature "
-                "flag, toggle or dispatcher), and never touch chaos/test/flag code -- a "
-                "patch that merely stops calling the defective function hides the symptom "
-                "and is rejected. Do not reformat unrelated code and do not add features. "
+                "content and a patch target: the one function whose body is defective, what "
+                "the defect is, what has to change, and what is off limits. Produce the "
+                "complete new content of the file with the minimal fix applied inside the "
+                "target function.\n"
+                "Rules:\n"
+                "- Change only the body of the target function. You may add an import, a "
+                "module-level constant, or a small new helper that the fixed function uses.\n"
+                "- Leave every other function exactly as it is. Do not edit a dispatcher or any "
+                "code that selects between implementations, do not edit feature flags or chaos "
+                "toggles, do not hard-wire a healthy path, and do not bypass the target by "
+                "calling something else instead. A patch that stops calling the defective "
+                "function hides the symptom and is rejected; the defect has to be fixed inside "
+                "the target itself.\n"
+                "- Do not edit tests, Phoenix infrastructure or any other file. Do not reformat "
+                "unrelated code and do not add features.\n"
+                "First declare the function you are changing, then give the file, then say why. "
                 "Reply with exactly this shape and nothing else:\n"
+                f"{_TARGET_MARK_START}\n<the name of the one function you changed>\n{_TARGET_MARK_END}\n"
                 f"{_PATCH_MARK_START}\n<the file's full new content>\n{_PATCH_MARK_END}\n"
                 f"{_RATIONALE_MARK_START}\n<one or two sentences on what changed and why>\n{_RATIONALE_MARK_END}"
             ),
@@ -714,14 +732,14 @@ def decide_patch(
         {
             "role": "user",
             "content": (
-                f"File: {file_path}\n\nDefect: {defect_description}\n\nFix approach: {fix_approach}\n\n"
-                f"Current content:\n{old_content}"
+                f"Patch target:\n{target.model_dump_json(indent=2)}\n\n"
+                f"Current content of {target.target_file}:\n{old_content}"
                 + (
                     f"\n\nYour previous patch was rejected by the safety gate: {feedback}. "
                     "Any line quoted there must stay exactly as it is in the current content above; "
-                    "do not remove, bypass or rewrite it. Make the fix inside the body of the function "
-                    "that implements the defective behaviour, so that it returns the same result "
-                    "without the cost the defect describes."
+                    "do not remove, bypass or rewrite it. "
+                    f"Make the fix inside the body of `{target.target_function}`, so that it returns "
+                    "the same result without the cost the defect describes, and change nothing else."
                     if feedback else ""
                 )
             ),
@@ -749,12 +767,17 @@ def decide_patch(
     rationale = "no rationale given"
     if _RATIONALE_MARK_START in content and _RATIONALE_MARK_END in content:
         rationale = content.split(_RATIONALE_MARK_START, 1)[1].split(_RATIONALE_MARK_END, 1)[0].strip()
+    declared_target = ""
+    if _TARGET_MARK_START in content and _TARGET_MARK_END in content:
+        declared_target = content.split(_TARGET_MARK_START, 1)[1].split(_TARGET_MARK_END, 1)[0].strip()
 
     if not new_content.strip():
         return PatchDecision(None, tokens)
 
     try:
-        return PatchDecision(PatchProposal(new_content=new_content, rationale=rationale), tokens)
+        return PatchDecision(
+            PatchProposal(new_content=new_content, rationale=rationale, target_function=declared_target), tokens
+        )
     except ValidationError as exc:
         print(f"[llm_client] patch proposal failed validation: {exc}")
         return PatchDecision(None, tokens)

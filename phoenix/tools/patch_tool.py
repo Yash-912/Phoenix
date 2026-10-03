@@ -17,6 +17,7 @@ worktree, in phoenix.tools.worktree_tool.
 
 from __future__ import annotations
 
+import ast
 import difflib
 import re
 import subprocess
@@ -43,6 +44,119 @@ BINARY_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".ico", ".pdf", ".zip", ".
 CHAOS_TOKEN_PATTERN = re.compile(
     r"CHAOS_ENABLED|SLOW_QUERY|LEAK_ENABLED|CPU_SPIKE|BLIP_UNTIL|/chaos/|os\._exit"
 )
+
+
+# What the patch generator is told it may not touch. They mirror what
+# validate_patch_scope enforces, stated generically so the same list serves
+# every defect: whichever function the investigation names is the target, and
+# anything else -- including a dispatcher that merely selects between a good
+# and a defective implementation -- is off limits unless it is the target.
+FORBIDDEN_AREAS = (
+    "every function other than the target function, including any dispatcher that selects between implementations",
+    "feature flags and chaos toggles",
+    "test files",
+    "dependency and lock files",
+    "any file other than the target file",
+)
+
+
+def _normalise_target(target: str | None) -> str:
+    """'Store.put', 'put()' and 'put' all name the function `put`."""
+    name = (target or "").strip().split("(", 1)[0].strip()
+    return name.rsplit(".", 1)[-1].strip()
+
+
+def same_target(declared: str | None, target: str | None) -> bool:
+    """Whether two spellings name the same function (`Store.put`, `put()`, `put`)."""
+    wanted = _normalise_target(target)
+    return bool(wanted) and _normalise_target(declared) == wanted
+
+
+def _functions(tree: ast.AST) -> dict[str, ast.AST]:
+    """Every def in the module keyed by dotted qualified name, nested defs and
+    class methods included."""
+    found: dict[str, ast.AST] = {}
+
+    def visit(node: ast.AST, prefix: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                qualified = f"{prefix}{child.name}"
+                found[qualified] = child
+                visit(child, f"{qualified}.")
+            elif isinstance(child, ast.ClassDef):
+                visit(child, f"{prefix}{child.name}.")
+            else:
+                visit(child, prefix)
+
+    visit(tree, "")
+    return found
+
+
+def function_exists(content: str, target_function: str | None) -> bool:
+    name = _normalise_target(target_function)
+    if not name:
+        return False
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        return False
+    return any(q.rsplit(".", 1)[-1] == name for q in _functions(tree))
+
+
+def check_target_function(file_path: str, old_content: str, new_content: str, target_function: str | None) -> tuple[bool, str]:
+    """The patch must change the investigation's target function and no other
+    function. Compared on the AST, not on text, so reformatting or comments
+    cannot disguise a change and a cosmetic rewrite of some other function
+    cannot pass as a fix. Module-level lines (imports, constants) and brand-new
+    helper functions are left alone: only a function that already existed can
+    be altered, and only the target may be.
+    """
+    name = _normalise_target(target_function)
+    if not name:
+        return False, "no target function was identified, so the patch cannot be tied to the defect"
+    if not file_path.lower().endswith(".py"):
+        return False, f"the patch cannot be verified against target function '{name}': '{file_path}' is not a Python file"
+    try:
+        old_tree = ast.parse(old_content)
+    except SyntaxError as exc:
+        return False, f"'{file_path}' as committed does not parse as Python ({exc.msg}, line {exc.lineno})"
+    try:
+        new_tree = ast.parse(new_content)
+    except SyntaxError as exc:
+        return False, f"the patched '{file_path}' does not parse as Python ({exc.msg}, line {exc.lineno})"
+
+    old_functions = _functions(old_tree)
+    new_functions = _functions(new_tree)
+    targets = [q for q in old_functions if q.rsplit(".", 1)[-1] == name]
+    if not targets:
+        return False, f"target function '{name}' is not defined in '{file_path}' as committed"
+
+    target_changed = False
+    for qualified in targets:
+        if qualified not in new_functions:
+            return False, f"patch removes or renames the target function '{name}'"
+        if ast.dump(old_functions[qualified]) != ast.dump(new_functions[qualified]):
+            target_changed = True
+
+    target_set = set(targets)
+    altered = [
+        q for q in old_functions
+        if q not in target_set
+        and not any(t.startswith(f"{q}.") for t in target_set)
+        and (q not in new_functions or ast.dump(old_functions[q]) != ast.dump(new_functions[q]))
+    ]
+    if not target_changed:
+        instead = f"it changes {', '.join(altered)} instead" if altered else "it changes only code outside any function"
+        return False, (
+            f"patch does not modify the target function '{name}' ({instead}); "
+            f"the fix has to be made inside '{name}' itself"
+        )
+    if altered:
+        return False, (
+            f"patch also changes code outside the target function '{name}': {', '.join(altered)}; "
+            f"only '{name}' may be changed"
+        )
+    return True, f"only the target function '{name}' changed"
 
 
 def _resolve_in_repo(rel_path: str) -> Path | None:
@@ -131,10 +245,23 @@ def generate_patch(file_path: str, new_content: str) -> dict:
     }
 
 
-def validate_patch_scope(file_path: str, diff_text: str, changed_lines: int, hunks: int) -> tuple[bool, str]:
+def validate_patch_scope(
+    file_path: str,
+    diff_text: str,
+    changed_lines: int,
+    hunks: int,
+    *,
+    target_function: str | None,
+    old_content: str,
+    new_content: str,
+) -> tuple[bool, str]:
     """The deterministic gate. Returns (ok, reason) -- reason is always
     filled, whether the verdict is a pass or a specific rejection, so the
     audit trail never records a bare True/False.
+
+    target_function, old_content and new_content are required, with no
+    default, so a caller cannot skip the check that ties the patch to the
+    function the investigation named. A missing target fails closed.
     """
     rel = PurePosixPath(file_path.replace("\\", "/"))
     name = rel.name
@@ -175,4 +302,11 @@ def validate_patch_scope(file_path: str, diff_text: str, changed_lines: int, hun
             f"cap for a minimal, targeted fix"
         )
 
-    return True, f"patch to '{file_path}' changes {changed_lines} lines across {hunks} hunk(s), within scope"
+    target_ok, target_reason = check_target_function(file_path, old_content, new_content, target_function)
+    if not target_ok:
+        return False, target_reason
+
+    return True, (
+        f"patch to '{file_path}' changes {changed_lines} lines across {hunks} hunk(s), within scope "
+        f"({target_reason})"
+    )
