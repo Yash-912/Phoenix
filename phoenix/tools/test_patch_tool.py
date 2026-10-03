@@ -74,6 +74,26 @@ def test_validate_patch_scope_rejects_a_chaos_toggle_change():
     assert "chaos toggle" in reason
 
 
+def test_chaos_toggle_rejection_quotes_the_changed_lines_that_tripped_it():
+    old = "def find(x):\n    return slow(x) if SLOW_QUERY else fast(x)\n\ndef slow(x):\n    return x\n"
+    new = "def find(x):\n    return fast(x)\n\ndef slow(x):\n    return x\n"
+    diff, changed, hunks = _diff(old, new)
+    ok, reason = patch_tool.validate_patch_scope("services/payment-service/app.py", diff, changed, hunks)
+
+    assert ok is False
+    assert "chaos toggle" in reason
+    assert "return slow(x) if SLOW_QUERY else fast(x)" in reason
+
+
+def test_a_fix_inside_the_defective_function_is_not_rejected_for_sitting_next_to_the_toggle():
+    old = "def find(x):\n    return slow(x) if SLOW_QUERY else fast(x)\n\ndef slow(x):\n    return scan_all(x)\n"
+    new = "def find(x):\n    return slow(x) if SLOW_QUERY else fast(x)\n\ndef slow(x):\n    return indexed(x)\n"
+    diff, changed, hunks = _diff(old, new)
+    ok, reason = patch_tool.validate_patch_scope("services/payment-service/app.py", diff, changed, hunks)
+
+    assert ok is True, reason
+
+
 def test_validate_patch_scope_rejects_a_path_that_escapes_the_repo():
     diff, changed, hunks = _diff("a\n", "b\n")
     ok, reason = patch_tool.validate_patch_scope("../../outside/app.py", diff, changed, hunks)

@@ -718,7 +718,10 @@ def decide_patch(
                 f"Current content:\n{old_content}"
                 + (
                     f"\n\nYour previous patch was rejected by the safety gate: {feedback}. "
-                    "Propose a different patch that fixes the defective function itself."
+                    "Any line quoted there must stay exactly as it is in the current content above; "
+                    "do not remove, bypass or rewrite it. Make the fix inside the body of the function "
+                    "that implements the defective behaviour, so that it returns the same result "
+                    "without the cost the defect describes."
                     if feedback else ""
                 )
             ),

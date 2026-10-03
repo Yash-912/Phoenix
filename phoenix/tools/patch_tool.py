@@ -158,8 +158,10 @@ def validate_patch_scope(file_path: str, diff_text: str, changed_lines: int, hun
         line for line in diff_text.splitlines()
         if line.startswith(("+", "-")) and not line.startswith(("+++", "---"))
     )
-    if CHAOS_TOKEN_PATTERN.search(changed_text):
-        return False, "patch modifies a chaos toggle/flag rather than the application defect"
+    chaos_lines = [line for line in changed_text.splitlines() if CHAOS_TOKEN_PATTERN.search(line)]
+    if chaos_lines:
+        quoted = " | ".join(f"`{line[1:].strip()}`" for line in chaos_lines[:4])
+        return False, f"patch modifies a chaos toggle/flag rather than the application defect (changed lines: {quoted})"
     if changed_lines == 0:
         return False, "patch contains no changes"
     if changed_lines > MAX_CHANGED_LINES:

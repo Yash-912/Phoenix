@@ -4,6 +4,12 @@ and without ever creating a real PR or pushing a real branch -- that is the
 Tier 3 E2E integration tests' job, not this file's.
 """
 
+import os
+
+os.environ.setdefault("LLM_BASE_URL", "http://localhost:1/v1")
+os.environ.setdefault("LLM_API_KEY", "test-key")
+os.environ.setdefault("LLM_MODEL", "test-model")
+
 from langgraph.graph import END
 
 import phoenix.graph.tier3_nodes as tier3_nodes
