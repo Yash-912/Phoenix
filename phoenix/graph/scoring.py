@@ -99,16 +99,6 @@ def _is_usable(evidence_item: dict) -> bool:
     return not (sub_reads and all(_is_failure(sub_read) for sub_read in sub_reads))
 
 
-def _content_summary(evidence_item: dict) -> str:
-    """summary with its leading ``source(arguments)`` label removed."""
-    summary = str(evidence_item.get("summary", ""))
-    source = str(evidence_item.get("source", ""))
-    label = f"{source}("
-    if source and summary.startswith(label) and summary.endswith(")"):
-        return summary[len(label) : -1]
-    return summary
-
-
 def _content_values(payload) -> list[str]:
     """Scalar leaf values of a payload, field names discarded."""
     if isinstance(payload, dict):
@@ -119,20 +109,22 @@ def _content_values(payload) -> list[str]:
 
 
 def _blob(evidence_item: dict) -> str:
-    """Lowercased content of one evidence item for keyword matching: the
-    tool-name-stripped summary plus raw_data's leaf values.
+    """Lowercased content of one evidence item for keyword matching:
+    raw_data's leaf values only.
 
-    Labels are excluded on purpose — the tool name and raw_data's field names
-    appear whether or not the tool found anything, so letting them match would
-    score an observer ACTION as evidence. A label must never satisfy a category
-    keyword on its own; only returned data can.
+    ``summary`` is excluded entirely -- it is always ``f"{tool_name}({call
+    arguments})"`` (see nodes.py), so even with the tool-name label stripped
+    it still carries the LLM's own query arguments (e.g. the PromQL it chose
+    to write), never the data that came back. Letting it in would score the
+    LLM's own wording of its request as evidence, regardless of what was
+    actually observed. A label -- or the LLM's choice of what to ask for --
+    must never satisfy a category keyword on its own; only returned data can.
     """
-    summary = _content_summary(evidence_item)
     try:
         values = _content_values(evidence_item.get("raw_data", {}))
     except RecursionError:
         values = []
-    return "\n".join([summary, *values]).lower()
+    return "\n".join(values).lower()
 
 
 def _supports(blob: str, category: str) -> bool:

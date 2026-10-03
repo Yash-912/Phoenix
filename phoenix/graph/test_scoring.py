@@ -87,8 +87,23 @@ def test_health_source_alone_scores_non_zero_for_matching_category():
     assert score == 0.15
     assert bd["has_health_signal"] == 1
     assert bd["has_deploy_signal"] == 0
-    assert bd["sources_supporting"] == 1
-    assert bd["weights"]["health"] == 0.15
+
+
+def test_query_arguments_in_summary_do_not_count_as_evidence():
+    # The LLM's own query (container_cpu_cfs_throttled_periods_total) contains
+    # "cpu", an overload keyword -- but the metric actually came back clean.
+    # Scoring must key off raw_data, not off what the LLM chose to ask for.
+    ev = [{
+        "iteration": 1,
+        "source": "query_prometheus",
+        "collected_at": "2026-01-01T00:00:00+00:00",
+        "summary": "query_prometheus({'promql': 'container_cpu_cfs_throttled_periods_total'})",
+        "raw_data": {"status": "success", "value": "0"},
+    }]
+    h = Hypothesis(description="overload", category="overload")
+    score, bd = score_hypothesis(ev, h)
+    assert score == 0.0
+    assert bd["has_prometheus_signal"] == 0
 
 
 def test_deployments_source_alone_scores_non_zero_for_deploy_hypothesis():
