@@ -24,6 +24,51 @@ from phoenix.graph.scoring import CATEGORY_KEYWORDS
 APP_PATH = pathlib.Path(__file__).resolve().parents[1] / "services" / "payment-service" / "app.py"
 
 
+class _FakeCursor:
+    """Stands in for a psycopg2 cursor against an empty charges table --
+    enough for charge() to run its real logic (check, miss, insert) without
+    a live Postgres connection. See test_payment_service_charge.py for the
+    tests that actually exercise the fast/slow query logic itself."""
+
+    def __init__(self, rows: dict):
+        self._rows = rows
+        self._result = None
+
+    def execute(self, query, params=()):
+        q = " ".join(query.split())
+        if q.startswith("SELECT amount, status FROM charges WHERE order_id"):
+            row = self._rows.get(params[0])
+            self._result = (row["amount"], row["status"]) if row else None
+        elif q.startswith("SELECT order_id, amount, status FROM charges"):
+            self._result = [(oid, r["amount"], r["status"]) for oid, r in self._rows.items()]
+        elif q.startswith("INSERT INTO charges"):
+            order_id, amount = params
+            self._rows.setdefault(order_id, {"amount": amount, "status": "charged"})
+        else:
+            raise AssertionError(f"unexpected query: {query!r}")
+
+    def fetchone(self):
+        return self._result
+
+    def fetchall(self):
+        return self._result
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _FakeConn:
+    def __init__(self):
+        self.rows: dict = {}
+        self.closed = False
+
+    def cursor(self):
+        return _FakeCursor(self.rows)
+
+
 @pytest.fixture
 def service(monkeypatch):
     root = logging.getLogger()
@@ -45,6 +90,7 @@ def service(monkeypatch):
     spec = importlib.util.spec_from_file_location("payment_service_under_test", APP_PATH)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    module._get_conn = lambda: _FakeConn()
 
     emitted = io.StringIO()
     installed = [h for h in root.handlers if isinstance(h, logging.StreamHandler)]
@@ -95,6 +141,7 @@ def test_the_blip_disabled_by_chaos_enabled_does_nothing(monkeypatch):
     spec = importlib.util.spec_from_file_location("payment_service_disabled", APP_PATH)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    module._get_conn = lambda: _FakeConn()
 
     result = module.chaos_blip_start(duration_seconds=45)
 
