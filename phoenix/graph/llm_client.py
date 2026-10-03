@@ -126,7 +126,11 @@ TOOL_SCHEMAS = [
                 "process_resident_memory_bytes, process_cpu_seconds_total and up; "
                 "aggregating with sum()/rate() drops the metric name from the result, "
                 "so an instant selector such as http_request_duration_seconds_count"
-                "{job=\"<service>\"} is the form that records which series was read."
+                "{job=\"<service>\"} is the form that records which series was read. A "
+                "query that reads process_resident_memory_bytes for one job also comes back "
+                "with a memory_trend block the tool measured over the paging alert's "
+                "30-minute window (growth, slope, and a sustained_growth verdict); that "
+                "block, not a single reading, is what shows whether memory is really growing."
             ),
             "parameters": {
                 "type": "object",

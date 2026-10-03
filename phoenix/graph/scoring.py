@@ -180,8 +180,36 @@ def _supports(blob: str, category: str) -> bool:
     return any(kw in blob for kw in keywords)
 
 
+def _measured_memory_growth(usable: list[dict]) -> bool:
+    """True when a Prometheus read carries a memory_trend the tool measured and
+    judged sustained growth.
+
+    Only the typed field counts, and only on a usable query_prometheus item:
+    that is where the observer attaches the measurement
+    (phoenix/tools/memory_tool.py), so a block turning up anywhere else is not a
+    measurement and is not credited.
+    """
+    for item in usable:
+        if item.get("source") != SOURCE_PROM:
+            continue
+        raw = item.get("raw_data")
+        trend = raw.get("memory_trend") if isinstance(raw, dict) else None
+        if isinstance(trend, dict) and trend.get("sustained_growth") is True:
+            return True
+    return False
+
+
 def score_hypothesis(evidence: list[dict], hypothesis: Hypothesis) -> tuple[float, dict]:
-    """Score one hypothesis against all evidence. Returns (score, breakdown)."""
+    """Score one hypothesis against all evidence. Returns (score, breakdown).
+
+    A memory_leak hypothesis is the one category whose Prometheus signal is not
+    a keyword match. A keyword on a memory metric cannot tell a growing series
+    from a flat one -- the metric's name is in both -- and a chaos endpoint's
+    name in a request-count label says only that someone called it. So for this
+    category the Prometheus signal is the measured trend, or nothing. The other
+    sources still match on keywords as before; this only stops an unmeasured
+    claim from clearing the routing threshold on its own.
+    """
     usable = [e for e in evidence if _is_usable(e)]
     blobs_by_source: dict[str, list[str]] = {src: [] for src in SOURCE_WEIGHTS}
     for item in usable:
@@ -193,6 +221,9 @@ def score_hypothesis(evidence: list[dict], hypothesis: Hypothesis) -> tuple[floa
         src: 1 if any(_supports(b, hypothesis.category) for b in blobs) else 0
         for src, blobs in blobs_by_source.items()
     }
+
+    if hypothesis.category == "memory_leak":
+        signals[SOURCE_PROM] = 1 if _measured_memory_growth(usable) else 0
 
     sources_supporting = sum(signals.values())
     agreement_bonus = AGREEMENT_BONUS if sources_supporting >= 2 else 0.0
@@ -227,6 +258,8 @@ def score_hypothesis(evidence: list[dict], hypothesis: Hypothesis) -> tuple[floa
         },
         "category": hypothesis.category,
     }
+    if hypothesis.category == "memory_leak":
+        breakdown["prometheus_signal_basis"] = "measured_memory_trend"
     return score, breakdown
 
 
