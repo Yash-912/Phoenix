@@ -49,6 +49,27 @@ CATEGORY_KEYWORDS: dict[str, list[str]] = {
     "deploy": ["deploy", "version", "release", "image", "v18", "v17", "rollout"],
     "config": ["config", "pool", "timeout", "connection", "env var", "setting"],
     "network": ["network", "connection refused", "dns", "unreachable", "timeout"],
+    # Specific enough to separate a query regression from generic "overload":
+    # a request duration climbing on one endpoint, not system-wide CPU/memory
+    # pressure. Keywords match what query_prometheus/query_loki evidence
+    # actually carries (request duration metric names, slow-request log lines)
+    # rather than code identifiers, which scoring must never see -- the LLM
+    # names the category, the evidence has to independently support it.
+    "slow_query": [
+        "request_duration", "queryseconds", "query_seconds", "db_query", "slowquery",
+        "slow query", "slow", "p99", "full table", "fullscan", "sequential scan", "seq scan",
+        # Postgres's own slow-statement log line ("duration: 1023.4 ms  statement: ...")
+        # as shipped to Loki by log_min_duration_statement.
+        "duration:", "statement:",
+    ],
+    # Distinct from "overload" for the same reason: a monotonically growing
+    # working set over many samples is a different signal than a single
+    # high-CPU/high-latency reading, and conflating them would let a one-off
+    # spike satisfy a leak hypothesis.
+    "memory_leak": [
+        "memory leak", "leak", "leaking", "growing", "unbounded", "resident memory",
+        "resident_memory", "working set", "working_set", "rss", "monotonic", "evict",
+    ],
     "unknown": [],
 }
 
@@ -108,6 +129,31 @@ def _content_values(payload) -> list[str]:
     return [str(payload)]
 
 
+def _runtime_view(payload):
+    """A payload with each docker-inspect object reduced to its runtime State.
+
+    `docker inspect` returns the container's static configuration (HostConfig,
+    Config, Mounts, ...) next to the one subtree that says what the container
+    is doing, State. The static part is full of text that was never evidence:
+    HostConfig.MaskedPaths alone lists /proc/latency_stats and
+    /proc/timer_stats for every container ever started, and those satisfied
+    the latency and slow keywords for a service that was perfectly healthy.
+    Scoring State only keeps the crash/restart signal this tool exists to
+    provide and drops the configuration it never described.
+
+    Recognised by the pair State + HostConfig, which docker inspect always
+    returns together; any other payload is returned unchanged, so test
+    fixtures and the other tools' shapes are not affected.
+    """
+    if isinstance(payload, dict):
+        if "State" in payload and "HostConfig" in payload:
+            return payload["State"]
+        return {key: _runtime_view(value) for key, value in payload.items()}
+    if isinstance(payload, (list, tuple)):
+        return [_runtime_view(value) for value in payload]
+    return payload
+
+
 def _blob(evidence_item: dict) -> str:
     """Lowercased content of one evidence item for keyword matching:
     raw_data's leaf values only.
@@ -121,7 +167,7 @@ def _blob(evidence_item: dict) -> str:
     must never satisfy a category keyword on its own; only returned data can.
     """
     try:
-        values = _content_values(evidence_item.get("raw_data", {}))
+        values = _content_values(_runtime_view(evidence_item.get("raw_data", {})))
     except RecursionError:
         values = []
     return "\n".join(values).lower()
@@ -134,8 +180,36 @@ def _supports(blob: str, category: str) -> bool:
     return any(kw in blob for kw in keywords)
 
 
+def _measured_memory_growth(usable: list[dict]) -> bool:
+    """True when a Prometheus read carries a memory_trend the tool measured and
+    judged sustained growth.
+
+    Only the typed field counts, and only on a usable query_prometheus item:
+    that is where the observer attaches the measurement
+    (phoenix/tools/memory_tool.py), so a block turning up anywhere else is not a
+    measurement and is not credited.
+    """
+    for item in usable:
+        if item.get("source") != SOURCE_PROM:
+            continue
+        raw = item.get("raw_data")
+        trend = raw.get("memory_trend") if isinstance(raw, dict) else None
+        if isinstance(trend, dict) and trend.get("sustained_growth") is True:
+            return True
+    return False
+
+
 def score_hypothesis(evidence: list[dict], hypothesis: Hypothesis) -> tuple[float, dict]:
-    """Score one hypothesis against all evidence. Returns (score, breakdown)."""
+    """Score one hypothesis against all evidence. Returns (score, breakdown).
+
+    A memory_leak hypothesis is the one category whose Prometheus signal is not
+    a keyword match. A keyword on a memory metric cannot tell a growing series
+    from a flat one -- the metric's name is in both -- and a chaos endpoint's
+    name in a request-count label says only that someone called it. So for this
+    category the Prometheus signal is the measured trend, or nothing. The other
+    sources still match on keywords as before; this only stops an unmeasured
+    claim from clearing the routing threshold on its own.
+    """
     usable = [e for e in evidence if _is_usable(e)]
     blobs_by_source: dict[str, list[str]] = {src: [] for src in SOURCE_WEIGHTS}
     for item in usable:
@@ -147,6 +221,9 @@ def score_hypothesis(evidence: list[dict], hypothesis: Hypothesis) -> tuple[floa
         src: 1 if any(_supports(b, hypothesis.category) for b in blobs) else 0
         for src, blobs in blobs_by_source.items()
     }
+
+    if hypothesis.category == "memory_leak":
+        signals[SOURCE_PROM] = 1 if _measured_memory_growth(usable) else 0
 
     sources_supporting = sum(signals.values())
     agreement_bonus = AGREEMENT_BONUS if sources_supporting >= 2 else 0.0
@@ -181,6 +258,8 @@ def score_hypothesis(evidence: list[dict], hypothesis: Hypothesis) -> tuple[floa
         },
         "category": hypothesis.category,
     }
+    if hypothesis.category == "memory_leak":
+        breakdown["prometheus_signal_basis"] = "measured_memory_trend"
     return score, breakdown
 
 

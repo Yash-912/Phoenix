@@ -1,17 +1,26 @@
-"""Scenario 2's mechanism: a real query regression, not a sleep().
+"""Scenario 2: the payment-service charge lookup.
 
-/charge's idempotency check has two implementations behind the SLOW_QUERY
-toggle -- _find_charge_fast (the fix: an indexed WHERE) and _find_charge_slow
-(the bug: fetch every row, filter in Python). These tests pin three things a
-"fix the toggle" patch could get wrong without this coverage: that both
-paths agree on the actual result (the regression is a performance bug, not a
-different bug wearing its name), that the slow path really does fetch the
-whole table rather than secretly also filtering server-side, and that /charge
-itself stays idempotent regardless of which path is active.
+Two kinds of test live here, kept apart on purpose.
+
+NORMAL APPLICATION TESTS describe how /charge must behave once the query
+regression is fixed: the idempotency lookup finds the right row (or none)
+whichever implementation answers it, and it asks the database for one row
+rather than pulling the whole table across the wire. None of them depends on
+the injected defect existing, so a correct fix to the slow lookup keeps them
+green.
+
+CHAOS ROUTING TESTS cover only the injector's wiring: SLOW_QUERY must dispatch
+find_charge to _find_charge_slow, and clearing it must dispatch back to
+_find_charge_fast. They deliberately say nothing about what _find_charge_slow
+does inside, so they hold before and after the defect is repaired -- and they
+fail a "fix" that merely disconnects the injector instead of repairing the
+query. That the injected regression is genuinely slow against real Postgres is
+proven by chaos/test_live_slow_query.py, not here.
 """
 
 import importlib.util
 import pathlib
+import re
 import sys
 import types
 
@@ -24,19 +33,30 @@ APP_PATH = pathlib.Path(__file__).resolve().parents[1] / "services" / "payment-s
 
 
 class _FakeCursor:
-    def __init__(self, rows: dict, queries: list):
+    """Just enough SQL for this service's statements. Counts the rows it hands
+    back to the client (stats["rows_sent"]) so a test can assert how much of
+    the table a lookup dragged across the wire."""
+
+    _SELECT = re.compile(r"^select (?P<cols>.+?) from charges", re.IGNORECASE)
+
+    def __init__(self, rows: dict, queries: list, stats: dict):
         self._rows = rows
         self._queries = queries
+        self._stats = stats
         self._result = None
 
     def execute(self, query, params=()):
         q = " ".join(query.split())
         self._queries.append(q)
-        if q.startswith("SELECT amount, status FROM charges WHERE order_id"):
-            row = self._rows.get(params[0])
-            self._result = (row["amount"], row["status"]) if row else None
-        elif q.startswith("SELECT order_id, amount, status FROM charges"):
-            self._result = [(oid, r["amount"], r["status"]) for oid, r in self._rows.items()]
+        select = self._SELECT.match(q)
+        if select:
+            cols = [c.strip() for c in select.group("cols").split(",")]
+            filtered = "where" in q.lower()
+            self._result = [
+                tuple(oid if c == "order_id" else row[c] for c in cols)
+                for oid, row in self._rows.items()
+                if not filtered or oid == params[0]
+            ]
         elif q.startswith("INSERT INTO charges"):
             order_id, amount = params
             self._rows.setdefault(order_id, {"amount": amount, "status": "charged"})
@@ -44,9 +64,13 @@ class _FakeCursor:
             raise AssertionError(f"unexpected query: {query!r}")
 
     def fetchone(self):
-        return self._result
+        if not self._result:
+            return None
+        self._stats["rows_sent"] += 1
+        return self._result[0]
 
     def fetchall(self):
+        self._stats["rows_sent"] += len(self._result)
         return self._result
 
     def __enter__(self):
@@ -60,10 +84,11 @@ class _FakeConn:
     def __init__(self, rows: dict | None = None):
         self.rows = rows if rows is not None else {}
         self.queries: list = []
+        self.stats = {"rows_sent": 0}
         self.closed = False
 
     def cursor(self):
-        return _FakeCursor(self.rows, self.queries)
+        return _FakeCursor(self.rows, self.queries, self.stats)
 
 
 @pytest.fixture
@@ -72,7 +97,7 @@ def module(monkeypatch):
     stub = types.ModuleType("prometheus_fastapi_instrumentator")
 
     class _Instrumentator:
-        def instrument(self, app):
+        def instrument(self, app, **kwargs):
             return self
 
         def expose(self, app, **kwargs):
@@ -91,45 +116,55 @@ def _seeded_conn() -> _FakeConn:
     return _FakeConn(rows={"existing-order": {"amount": "42.00", "status": "charged"}})
 
 
-def test_fast_path_finds_an_existing_charge_by_indexed_lookup(module):
-    conn = _seeded_conn()
+def _many_orders_conn(count: int = 500) -> _FakeConn:
+    return _FakeConn(rows={f"order-{i}": {"amount": f"{i}.00", "status": "charged"} for i in range(count)})
+
+
+# ---- normal application behaviour -----------------------------------------
+
+
+def test_slow_query_chaos_is_off_by_default(module):
+    assert module.SLOW_QUERY is False
+
+
+def test_find_charge_returns_amount_and_status_of_an_existing_order(module):
+    module._get_conn = lambda: _seeded_conn()
+
+    assert module.find_charge("existing-order") == ("42.00", "charged")
+
+
+def test_find_charge_returns_none_for_an_unknown_order(module):
+    module._get_conn = lambda: _seeded_conn()
+
+    assert module.find_charge("never-charged") is None
+
+
+def test_find_charge_picks_the_right_order_among_many(module):
+    conn = _many_orders_conn()
     module._get_conn = lambda: conn
-    module.SLOW_QUERY = False
 
-    result = module.find_charge("existing-order")
-
-    assert result == ("42.00", "charged")
-    assert conn.queries == ["SELECT amount, status FROM charges WHERE order_id = %s"]
+    assert module.find_charge("order-17") == ("17.00", "charged")
+    assert module.find_charge("order-499") == ("499.00", "charged")
+    assert module.find_charge("order-500") is None
 
 
-def test_slow_path_finds_the_same_charge_but_by_fetching_every_row(module):
-    """The regression is purely a performance one: same result, worse query."""
-    conn = _seeded_conn()
+def test_find_charge_does_not_pull_the_table_to_find_one_order(module):
+    """The performance contract behind Scenario 2: answering "has this order
+    been charged?" must cost one row, not every row in a ~1M-row table."""
+    conn = _many_orders_conn(500)
     module._get_conn = lambda: conn
-    module.SLOW_QUERY = True
 
-    result = module.find_charge("existing-order")
+    result = module.find_charge("order-250")
 
-    assert result == ("42.00", "charged")
-    assert conn.queries == ["SELECT order_id, amount, status FROM charges"]
-
-
-def test_slow_path_has_no_where_clause_at_all(module):
-    """Pins the actual bug mechanism -- not "it's slow", but "it fetches the
-    whole table and filters in Python instead of asking Postgres to."""
-    conn = _seeded_conn()
-    module._get_conn = lambda: conn
-    module.SLOW_QUERY = True
-
-    module.find_charge("existing-order")
-
-    assert "where" not in conn.queries[0].lower()
+    assert result == ("250.00", "charged")
+    assert conn.stats["rows_sent"] <= 1
 
 
 @pytest.mark.parametrize("slow_query", [False, True])
-def test_charge_is_idempotent_on_both_paths(module, slow_query):
+def test_charge_is_idempotent_whichever_lookup_answers(module, slow_query):
     """A repeated order_id must return the original charge, not double-insert
-    or double-charge, regardless of which query path answered the lookup."""
+    or double-charge. Holds whichever lookup implementation is active -- the
+    toggle may change how fast the lookup is, never what it answers."""
     conn = _FakeConn()
     module._get_conn = lambda: conn
     module.SLOW_QUERY = slow_query
@@ -143,6 +178,16 @@ def test_charge_is_idempotent_on_both_paths(module, slow_query):
     assert conn.rows["repeat-me"]["amount"] == 5.0
 
 
+@pytest.mark.parametrize("slow_query", [False, True])
+def test_both_lookups_agree_on_found_and_missing_orders(module, slow_query):
+    conn = _many_orders_conn(20)
+    module._get_conn = lambda: conn
+    module.SLOW_QUERY = slow_query
+
+    assert module.find_charge("order-7") == ("7.00", "charged")
+    assert module.find_charge("order-404") is None
+
+
 def test_a_new_order_id_gets_inserted_and_charged(module):
     conn = _FakeConn()
     module._get_conn = lambda: conn
@@ -152,6 +197,25 @@ def test_a_new_order_id_gets_inserted_and_charged(module):
 
     assert result == {"order_id": "brand-new", "amount": 12.5, "status": "charged"}
     assert conn.rows["brand-new"] == {"amount": 12.5, "status": "charged"}
+
+
+# ---- chaos injector wiring -------------------------------------------------
+
+
+def test_chaos_enabled_routes_the_lookup_through_the_slow_implementation(module):
+    module._find_charge_slow = lambda order_id: ("via-slow", order_id)
+    module._find_charge_fast = lambda order_id: ("via-fast", order_id)
+    module.SLOW_QUERY = True
+
+    assert module.find_charge("x") == ("via-slow", "x")
+
+
+def test_chaos_disabled_routes_the_lookup_through_the_fast_implementation(module):
+    module._find_charge_slow = lambda order_id: ("via-slow", order_id)
+    module._find_charge_fast = lambda order_id: ("via-fast", order_id)
+    module.SLOW_QUERY = False
+
+    assert module.find_charge("x") == ("via-fast", "x")
 
 
 def test_chaos_slow_enable_and_disable_toggle_the_flag(module):

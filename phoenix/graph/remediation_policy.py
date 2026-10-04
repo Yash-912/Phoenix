@@ -58,8 +58,31 @@ CATEGORY_ACTIONS: dict[str, tuple[str, ...]] = {
     "deploy": ("rollback_deployment",),
     "config": ("rollback_config",),
     "network": (),
+    # memory_leak keeps a Tier 1 action: a restart genuinely mitigates a
+    # growing working set, right now, for real -- the PRD's own Scenario 3
+    # shape is Tier 1 then Tier 3, not Tier 3 instead of Tier 1. The
+    # permanent fix is a separate decision made in nodes.py/graph.py after
+    # this action verifies, not by this table.
+    "memory_leak": ("restart_service",),
+    # slow_query has no Tier 1/2 action: restarting payment-service does not
+    # make an unindexed query fast again, and there is no config value or
+    # deployment to roll back to. Mapping it to () is what makes it route
+    # straight to Tier 3 rather than this module inventing an action to take.
+    "slow_query": (),
     "unknown": (),
 }
+
+# Categories whose root cause is application code, not infrastructure state.
+# Belonging to this set never authorizes a mutation by itself -- it only
+# tells remediator_node/verifier_node to hand the run to the Tier 3 subgraph
+# instead of ending it, the same way TIER_2_ACTIONS only tells dispatch which
+# signature to use. The LLM picks the category; this table, not the LLM,
+# decides what that category is allowed to trigger next.
+TIER3_CATEGORIES: frozenset[str] = frozenset({"slow_query", "memory_leak"})
+
+
+def is_tier3_eligible(category: str | None) -> bool:
+    return category in TIER3_CATEGORIES
 
 # Actions that replace an artifact or a config value rather than perturbing a
 # running one. They are Tier 2 by construction: not idempotent, not reversible

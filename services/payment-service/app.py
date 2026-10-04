@@ -184,4 +184,12 @@ def chaos_crash():
     os._exit(1)
 
 
-Instrumentator().instrument(app).expose(app)
+# latency_lowr_buckets is widened past the library default of (0.1, 0.5, 1):
+# with no bucket above 1s, histogram_quantile(0.95, ...) can never report
+# anything above exactly 1.0 once p95 exceeds it (Prometheus returns the
+# unbounded last bucket's lower edge rather than extrapolating), which makes
+# observability/prometheus/alert.rules.yml's HighLatency alert structurally
+# unable to fire no matter how slow the real query regression gets. This adds
+# resolution, not a new signal -- it does not touch SLOW_QUERY or either query
+# implementation.
+Instrumentator().instrument(app, latency_lowr_buckets=(0.1, 0.5, 1, 1.5, 2, 3, 5, 10)).expose(app)

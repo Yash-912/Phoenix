@@ -249,7 +249,7 @@ def test_the_compiled_graph_returns_to_the_observer_when_the_router_loops_back(m
     calls = []
     observer_passes = 0
 
-    def fake_tool_calls(service_name, evidence_so_far, evidence_requests):
+    def fake_tool_calls(service_name, evidence_so_far, evidence_requests, evidence_state=None):
         nonlocal observer_passes
         calls.append("observer")
         observer_passes += 1
@@ -591,7 +591,7 @@ def test_an_observer_asking_for_a_rollback_is_ignored(monkeypatch):
     behaviour, since the model is free to ask for anything at all."""
     rolled_back = _deploy_run(monkeypatch)
 
-    def forge_a_tool_call(service_name, evidence_so_far, evidence_requests):
+    def forge_a_tool_call(service_name, evidence_so_far, evidence_requests, evidence_state=None):
         return ToolCallDecision(
             [{"name": "rollback_deployment",
               "arguments": {"service_name": SERVICE, "target_version": "latest"}}],

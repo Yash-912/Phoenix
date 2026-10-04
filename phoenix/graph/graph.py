@@ -3,6 +3,7 @@ import sys
 from langgraph.graph import END, StateGraph
 from langgraph.types import Command
 
+from phoenix.graph import investigation
 from phoenix.graph.nodes import (
     diagnoser_node,
     observer_node,
@@ -11,6 +12,12 @@ from phoenix.graph.nodes import (
 )
 from phoenix.graph.persist import close_persistence, record_audit
 from phoenix.graph.state import AgentState
+from phoenix.graph.tier3_nodes import (
+    code_investigator_node,
+    patch_generator_node,
+    patch_validator_node,
+    pr_opener_node,
+)
 
 ROUTER_DESTINATIONS: tuple[str, ...] = ("observer", "remediator", END)
 
@@ -104,7 +111,10 @@ def should_continue(state: AgentState) -> Command:
     stops, the budget comes first: it is the harder ceiling, and naming it is
     more useful than naming the iteration cap it happens to be sitting under.
     Looping back is the last resort, so no run that has spent its budget can
-    return to the observer.
+    return to the observer. A fourth stop sits after the other three: a run
+    still below the threshold whose last passes changed nothing the scorer sees
+    (investigation.stagnation_reason) ends with that stated as its reason, so a
+    run is not left to spend its budget on observations that cannot move it.
 
     Each of the four decisions is written to audit_log on its way out. That is
     the same audit table the observer and the diagnoser append to, so a run's
@@ -140,6 +150,18 @@ def should_continue(state: AgentState) -> Command:
                 ),
             },
         )
+    # Last of the stops, after the threshold, the budget and the cap have all
+    # been ruled out: a run still below the threshold whose passes have stopped
+    # changing what the scorer sees. Without it such a run keeps observing until
+    # the budget is gone, and says only that the budget ran out.
+    stagnation = investigation.stagnation_reason(state)
+    if stagnation is not None:
+        print(f"[router] {stagnation} -> end (escalate)")
+        _record_route(state, "escalated", END, stagnation, stagnation)
+        return Command(
+            goto=END,
+            update={"status": "escalated", "escalation_reason": stagnation},
+        )
     print(f"[router] confidence too low ({state.confidence:.2f}) -> loop back to observer")
     _record_route(
         state,
@@ -157,15 +179,22 @@ def build_graph():
     graph.add_node("router", should_continue, destinations=ROUTER_DESTINATIONS)
     graph.add_node("remediator", remediator_node)
     graph.add_node("verifier", verifier_node)
+    # Tier 3 subgraph. Reached only via a Command from remediator_node
+    # (slow_query, no Tier 1/2 action) or verifier_node (memory_leak, after a
+    # passing Tier 1 check) -- never a static edge, so ordinary Tier 1/2
+    # incidents never pass through any of these four nodes.
+    graph.add_node("code_investigator", code_investigator_node)
+    graph.add_node("patch_generator", patch_generator_node)
+    graph.add_node("patch_validator", patch_validator_node)
+    graph.add_node("pr_opener", pr_opener_node)
 
     graph.set_entry_point("observer")
     graph.add_edge("observer", "diagnoser")
     graph.add_edge("diagnoser", "router")
-    # No static edge out of remediator or verifier. Both return a Command that
-    # names its own destination -- the remediator either hands on to the
-    # verifier or refuses and ends, the verifier either ends or loops back to
-    # the observer -- and a static edge alongside a Command would be a second,
-    # competing claim about where the run goes next.
+    # No static edge out of remediator, verifier, or any Tier 3 node. Every
+    # one of them returns a Command that names its own destination, and a
+    # static edge alongside a Command would be a second, competing claim
+    # about where the run goes next.
 
     return graph.compile()
 

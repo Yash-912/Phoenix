@@ -383,7 +383,7 @@ def _audit_spy(monkeypatch, module) -> list[dict]:
 
 
 def _tool_calls(requested, tokens: int = 0):
-    return lambda service_name, evidence_so_far, evidence_requests: ToolCallDecision(
+    return lambda service_name, evidence_so_far, evidence_requests, evidence_state=None: ToolCallDecision(
         requested, tokens
     )
 
@@ -988,6 +988,8 @@ def test_the_observer_audits_the_pass_with_what_was_asked_and_what_ran(monkeypat
         "requested_tools": ["restart_service", "query_prometheus"],
         "dispatched_tools": ["query_prometheus"],
         "failed_tools": [],
+        "skipped_duplicates": [],
+        "observation_exhausted": False,
         "evidence_collected": 1,
         "tokens_spent": 940,
     }
@@ -1064,11 +1066,19 @@ def test_the_diagnoser_audits_the_confidence_and_the_categories_the_table_has_no
         "confidence": returned.confidence,
         "confidence_threshold": 0.75,
         "tokens_spent": 1350,
+        "progress": {
+            "progressed": True,
+            "reasons": ["first diagnosis"],
+            "stagnant_passes": 0,
+            "signature": returned.progress_signature,
+        },
         "hypotheses": [
             {"description": CRASH.description, "category": "crash", "score": 0.4},
             {"description": DEPLOY.description, "category": "deploy", "score": 0.0},
         ],
     }
+    assert returned.progress_signature["leader_category"] == "crash"
+    assert returned.progress_signature["leader_score"] == 0.4
     assert audit[0]["reasoning_text"] == (
         "crash scores 0.40: checkout-service is crash looping\n"
         "deploy scores 0.00: the v18 rollout broke checkout-service"
@@ -1332,7 +1342,7 @@ def test_a_second_iteration_is_recorded_under_its_own_number(monkeypatch):
     recorder = _live(monkeypatch)
     passes = {"n": 0}
 
-    def fake_tool_calls(service_name, evidence_so_far, evidence_requests):
+    def fake_tool_calls(service_name, evidence_so_far, evidence_requests, evidence_state=None):
         passes["n"] += 1
         if passes["n"] == 1:
             return ToolCallDecision([], 940)

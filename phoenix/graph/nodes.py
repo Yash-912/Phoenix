@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from langgraph.graph import END
 from langgraph.types import Command
 
-from phoenix.graph import scoring, verification
+from phoenix.graph import investigation, scoring, verification
 from phoenix.graph.llm_client import decide_hypotheses, decide_tool_calls
 from phoenix.graph.persist import (
     get_incident_first_seen,
@@ -15,7 +15,7 @@ from phoenix.graph.persist import (
     record_hypotheses,
 )
 from phoenix.graph.remediation_dispatch import dispatch
-from phoenix.graph.remediation_policy import TIER_2_ACTIONS, plan_action
+from phoenix.graph.remediation_policy import TIER_2_ACTIONS, is_tier3_eligible, plan_action
 from phoenix.graph.schemas import ScoredHypothesis
 from phoenix.graph.state import AgentState
 from phoenix.tools import deploy_tool
@@ -23,7 +23,7 @@ from phoenix.tools.deploy_tool import get_recent_deployments
 from phoenix.tools.docker_tool import get_container_state
 from phoenix.tools.health_tool import inspect_health
 from phoenix.tools.loki_tool import query_loki
-from phoenix.tools.prometheus_tool import query_prometheus
+from phoenix.tools.memory_tool import query_prometheus_with_memory_trend
 
 
 def _say(message: str = "") -> None:
@@ -51,7 +51,7 @@ def _say(message: str = "") -> None:
 # Observer stays read-only: remediation actions (restart/pause/cache)
 # live in remediation_tool.py and are executor-only, never dispatched here.
 TOOL_DISPATCH = {
-    "query_prometheus": lambda args: query_prometheus(args["promql"]),
+    "query_prometheus": lambda args: query_prometheus_with_memory_trend(args["promql"]),
     "query_loki": lambda args: query_loki(args["logql"], args.get("minutes", 15)),
     "get_container_state": lambda args: get_container_state(args["container_name"]),
     "inspect_health": lambda args: inspect_health(args["service_name"]),
@@ -233,13 +233,22 @@ def observer_node(state: AgentState) -> AgentState:
     # of the investigation proceeds on the evidence that is readable.
     deploy_tool.set_incident_started_at(get_incident_first_seen(state.incident_id))
 
+    # What the leading hypothesis rests on and what has not been tried, computed
+    # in code. The first pass has no leader to report on, so its call is exactly
+    # the one it always was.
+    evidence_state = investigation.build_evidence_state(state)
     decision = decide_tool_calls(
-        state.service_name, state.evidence, state.needs_evidence
+        state.service_name,
+        state.evidence,
+        state.needs_evidence,
+        **({"evidence_state": evidence_state} if evidence_state else {}),
     )
     state.tokens_spent += decision.tokens
     requested_calls = decision.calls
     dispatched: list[str] = []
     failed: list[str] = []
+    skipped: list[str] = []
+    already_run = {item["summary"] for item in state.evidence}
 
     if not requested_calls:
         _say(f"[observer] iteration {state.iteration}: LLM requested no tool calls")
@@ -250,6 +259,18 @@ def observer_node(state: AgentState) -> AgentState:
         if tool_fn is None:
             _say(f"[observer] iteration {state.iteration}: ignoring unrecognized tool '{tool_name}'")
             continue
+
+        # The same string the evidence row's summary carries, so a call counts as
+        # a repeat exactly when an identical one has already been recorded --
+        # including one proposed twice in this very pass. Exact repeats only: a
+        # different query that returns the same nothing is judged by the
+        # diagnoser's progress check, not here.
+        call_summary = f"{tool_name}({call['arguments']})"
+        if call_summary in already_run:
+            skipped.append(call_summary)
+            _say(f"[observer] iteration {state.iteration}: skipping {call_summary}, already run")
+            continue
+        already_run.add(call_summary)
 
         failure = None
         try:
@@ -286,11 +307,18 @@ def observer_node(state: AgentState) -> AgentState:
             "requested_tools": [call["name"] for call in requested_calls],
             "dispatched_tools": dispatched,
             "failed_tools": failed,
+            "skipped_duplicates": skipped,
+            "observation_exhausted": not dispatched,
             "evidence_collected": len(state.evidence),
             "tokens_spent": state.tokens_spent,
         },
         None,
     )
+
+    # No call this pass was one it had not already run: either the model asked
+    # for nothing or only for repeats. The router reads this after a stagnant
+    # pass as "there is nothing further to observe".
+    state.observation_exhausted = not dispatched
 
     return state
 
@@ -334,6 +362,19 @@ def diagnoser_node(state: AgentState) -> AgentState:
             _say(f"[diagnoser] iteration {state.iteration}: {_diagnosis_line(scored)}")
         _say(f"[diagnoser] iteration {state.iteration}: confidence={state.confidence:.2f}")
 
+    # Did this pass change anything the scorer sees about the leader? Read off
+    # the scores just computed, never recomputed, and kept apart from them: it
+    # decides nothing here, it only counts, and the router acts on the count.
+    signature = investigation.progress_signature(state.hypotheses)
+    progressed, progress_reasons = investigation.assess_progress(state.progress_signature, signature)
+    state.stagnant_passes = 0 if progressed else state.stagnant_passes + 1
+    state.progress_signature = signature
+    if not progressed:
+        _say(
+            f"[diagnoser] iteration {state.iteration}: evidence state unchanged "
+            f"(stagnant pass {state.stagnant_passes})"
+        )
+
     record_hypotheses(state.incident_id, state.hypotheses, iteration=state.iteration)
     record_audit(
         state.incident_id,
@@ -344,6 +385,12 @@ def diagnoser_node(state: AgentState) -> AgentState:
             "confidence": state.confidence,
             "confidence_threshold": state.confidence_threshold,
             "tokens_spent": state.tokens_spent,
+            "progress": {
+                "progressed": progressed,
+                "reasons": progress_reasons,
+                "stagnant_passes": state.stagnant_passes,
+                "signature": signature,
+            },
             "hypotheses": [
                 {
                     "description": scored.hypothesis.description,
@@ -407,6 +454,42 @@ def _escalate(
     )
 
 
+def _restart_already_applied(state: AgentState, plan, pre_action_signal) -> dict | None:
+    """Evidence that repeating this action cannot free anything more, or None.
+
+    A failed verification records the level the action left the process at. If
+    the same action is about to be taken again and the process is still at that
+    level -- it has not grown past the allocator noise the verifier itself
+    tolerates -- then the process is already in the state the action produces,
+    and a second identical action would only reproduce it: the next
+    verification would compare that state with itself.
+
+    This decides nothing about whether the first attempt worked; the verifier's
+    verdict stands and the run is never called recovered here. It only declines
+    to repeat an action that has nothing left to do. Memory that has grown past
+    the noise since, or a previous result that recorded no level (any check that
+    does not read one), leaves the retry exactly as it was.
+    """
+    prior = state.verification_result
+    if not isinstance(prior, dict) or prior.get("outcome") != verification.OUTCOME_FAIL:
+        return None
+    if prior.get("action") != plan.action or prior.get("check") != plan.check:
+        return None
+    detail = prior.get("detail")
+    after = detail.get("after") if isinstance(detail, dict) else None
+    current = pre_action_signal.get("bytes") if isinstance(pre_action_signal, dict) else None
+    for value in (after, current):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+    if current > after + verification.NOISE_FLOOR_BYTES:
+        return None
+    return {
+        "post_action_bytes": after,
+        "current_bytes": current,
+        "tolerance_bytes": verification.NOISE_FLOOR_BYTES,
+    }
+
+
 def remediator_node(state: AgentState) -> Command:
     """Take the one Tier 1 action this diagnosis allows, then hand off to verify.
 
@@ -463,6 +546,21 @@ def remediator_node(state: AgentState) -> Command:
 
     plan = plan_action(state)
     if not plan.available:
+        category = state.hypotheses[0].hypothesis.category if state.hypotheses else None
+        if is_tier3_eligible(category):
+            # slow_query's whole reason to exist in CATEGORY_ACTIONS as ():
+            # there is no Tier 1/2 action, so the only honest next step is
+            # handing the run to the Tier 3 subgraph rather than reporting
+            # action_unavailable on a root cause that is in fact actionable,
+            # just not by this table.
+            reason = f"top hypothesis is {category}; no Tier 1/2 action applies, handing off to Tier 3"
+            _say(f"[remediator] {reason} -> code_investigator")
+            record_audit(
+                state.incident_id, "remediator", "tier3_handoff",
+                {"iteration": state.iteration, "category": category}, reason,
+            )
+            return Command(goto="code_investigator", update={"status": "tier3_investigating"})
+
         _say(f"[remediator] {plan.reasoning} -> end (action_unavailable)")
         record_audit(
             state.incident_id,
@@ -470,7 +568,7 @@ def remediator_node(state: AgentState) -> Command:
             "action_unavailable",
             {
                 "iteration": state.iteration,
-                "category": state.hypotheses[0].hypothesis.category if state.hypotheses else None,
+                "category": category,
                 "remediation_attempts": state.remediation_attempts,
             },
             plan.reasoning,
@@ -478,6 +576,33 @@ def remediator_node(state: AgentState) -> Command:
         return Command(goto=END, update={"status": "action_unavailable"})
 
     pre_action_signal = verification.read_signal(plan.check, plan.container)
+
+    # Declined before the dispatch, never after: a restart that was not taken
+    # costs the world nothing, and the verifier's earlier verdict stays on the
+    # state as it was. The category decides where the run goes next, through the
+    # same policy that already routes a finding no Tier 1 action can fix.
+    applied = _restart_already_applied(state, plan, pre_action_signal)
+    if applied is not None:
+        category = state.hypotheses[0].hypothesis.category if state.hypotheses else None
+        reason = (
+            f"{plan.action} on {plan.container} would repeat the last attempt: the process is "
+            f"still at the {applied['post_action_bytes']:.0f} that attempt left "
+            f"({applied['current_bytes']:.0f} now, within {applied['tolerance_bytes']} of it), "
+            f"so another {plan.action} has nothing further to free"
+        )
+        if is_tier3_eligible(category):
+            _say(f"[remediator] {reason} -> code_investigator")
+            record_audit(
+                state.incident_id, "remediator", "tier3_handoff",
+                {"iteration": state.iteration, "category": category, "redundant_action": plan.action, **applied},
+                reason,
+            )
+            return Command(
+                goto="code_investigator",
+                update={"status": "tier3_investigating", "tier1_mitigation": state.verification_result},
+            )
+        return _escalate(state, "action_redundant", reason, reason)
+
     action_at = datetime.now(timezone.utc).isoformat()
 
     _say(f"[remediator] taking {plan.action} on {plan.container} ({plan.reasoning})")
@@ -615,6 +740,23 @@ def verifier_node(state: AgentState) -> Command:
     )
 
     if outcome == verification.OUTCOME_PASS:
+        if is_tier3_eligible(category):
+            # Scenario 3's exact shape: the restart genuinely mitigated the
+            # symptom, but memory_leak's root cause is still an unbounded
+            # cache in worker-service's own code, which no restart touches.
+            # tier1_mitigation preserves this pass as its own fact before
+            # Tier 3 starts writing its own outcome onto the same state, so
+            # the final record shows the mitigation AND the permanent fix,
+            # never just the second overwriting the first.
+            _say(f"[verifier] {category} check passed (Tier 1 mitigation) -> code_investigator for a permanent fix")
+            return Command(
+                goto="code_investigator",
+                update={
+                    "status": "tier3_investigating",
+                    "verification_result": verification_result,
+                    "tier1_mitigation": verification_result,
+                },
+            )
         _say(f"[verifier] {category} check passed -> end (resolved)")
         return Command(
             goto=END,

@@ -15,7 +15,7 @@ SERVICE = "checkout-service"
 # Phase 4 routes deploy to rollback_deployment and config to rollback_config;
 # network and unknown still have no action, which is the honest answer while
 # their tiers are unbuilt.
-NO_ACTION_CATEGORIES = ("network", "unknown")
+NO_ACTION_CATEGORIES = ("network", "unknown", "slow_query")
 
 _DEPLOY_TARGET = RollbackTarget(
     version="v17",

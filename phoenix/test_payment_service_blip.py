@@ -78,7 +78,7 @@ def service(monkeypatch):
     stub = types.ModuleType("prometheus_fastapi_instrumentator")
 
     class _Instrumentator:
-        def instrument(self, app):
+        def instrument(self, app, **kwargs):
             return self
 
         def expose(self, app, **kwargs):
@@ -130,7 +130,7 @@ def test_the_blip_disabled_by_chaos_enabled_does_nothing(monkeypatch):
     stub = types.ModuleType("prometheus_fastapi_instrumentator")
 
     class _Instrumentator:
-        def instrument(self, app):
+        def instrument(self, app, **kwargs):
             return self
 
         def expose(self, app, **kwargs):
