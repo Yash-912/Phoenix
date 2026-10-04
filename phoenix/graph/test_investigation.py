@@ -473,6 +473,8 @@ def test_the_report_and_the_instructions_reach_the_observers_prompt(monkeypatch)
     assert "computed in code" in user
     assert "does not yet support it" in user
     assert "has already been run" in user
+    assert "query it again for a different target" in user
+    assert "near-identical searches against the same target" in user
     assert "call no tools" in user
 
 

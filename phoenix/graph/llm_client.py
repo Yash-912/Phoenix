@@ -257,10 +257,13 @@ def decide_tool_calls(
             "a model:\n"
             f"{json.dumps(evidence_state, default=str)}\n\n"
             "The leading hypothesis has not reached the confidence threshold. Seek independent "
-            "evidence from a source that does not yet support it. Do not repeat a query that "
-            "has already been run, and do not keep searching a source that has returned nothing "
-            "for different queries: evidence this system cannot observe will not appear on the "
-            "next attempt. If no available read could plausibly add independent evidence, "
+            "evidence from a source that does not yet support it. A source that has not "
+            "supported the leader can still hold the evidence somewhere else: query it again "
+            "for a different target (another container, another metric or label, another time "
+            "range) when that is where the missing evidence would be. Do not repeat a query "
+            "that has already been run, and do not keep issuing near-identical searches against "
+            "the same target: evidence this system cannot observe will not appear on the next "
+            "attempt. If no available read could plausibly add independent evidence, "
             "call no tools.\n\n"
         )
 
