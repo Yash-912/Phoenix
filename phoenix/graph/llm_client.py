@@ -203,9 +203,19 @@ TOOL_SCHEMAS = [
 
 
 def decide_tool_calls(
-    service_name: str, evidence_so_far: list[dict], evidence_requests: list[str]
+    service_name: str,
+    evidence_so_far: list[dict],
+    evidence_requests: list[str],
+    evidence_state: dict | None = None,
 ) -> ToolCallDecision:
     """Ask the LLM which of the 5 allowlisted read-only tools to call next.
+
+    evidence_state, when given, is the report investigation.build_evidence_state
+    computed in code: what the leading hypothesis rests on, which sources have
+    answered without supporting it, which have not been read, and what has already
+    been run. It is data for choosing the next read, never an instruction to run
+    one; the tool allowlist and the stagnation guard in the router do not depend
+    on the model acting on it.
 
     evidence_requests are the outstanding confirm/refute signals the diagnoser named
     on its surviving hypotheses, capped and framed by the caller. They only steer
@@ -240,6 +250,20 @@ def decide_tool_calls(
             "and do not re-run a read you have already made.\n\n"
         )
 
+    standing = ""
+    if evidence_state:
+        standing = (
+            "Where the investigation stands, computed in code from the scorer and not by "
+            "a model:\n"
+            f"{json.dumps(evidence_state, default=str)}\n\n"
+            "The leading hypothesis has not reached the confidence threshold. Seek independent "
+            "evidence from a source that does not yet support it. Do not repeat a query that "
+            "has already been run, and do not keep searching a source that has returned nothing "
+            "for different queries: evidence this system cannot observe will not appear on the "
+            "next attempt. If no available read could plausibly add independent evidence, "
+            "call no tools.\n\n"
+        )
+
     response = client.chat.completions.create(
         model=LLM_MODEL,
         max_tokens=MAX_OUTPUT_TOKENS,
@@ -259,7 +283,7 @@ def decide_tool_calls(
                 "role": "user",
                 "content": (
                     f"Evidence collected so far: {summary}\n\n"
-                    f"{outstanding}Which tool(s) do you want to call next?"
+                    f"{outstanding}{standing}Which tool(s) do you want to call next?"
                 ),
             },
         ],

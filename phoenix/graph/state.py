@@ -36,6 +36,22 @@ class AgentState(BaseModel):
         default=20000,
         description="Hard ceiling on tokens_spent for one investigation, in tokens.",
     )
+    progress_signature: Optional[dict] = Field(
+        default=None,
+        description=(
+            "What the last diagnosis rested on for its leading hypothesis (leader, score, "
+            "supporting sources, contradicted), compared with the next one to tell whether "
+            "a pass learned anything. None until the first diagnosis."
+        ),
+    )
+    stagnant_passes: int = Field(
+        default=0,
+        description="Consecutive diagnoser passes whose progress_signature did not change. Reset by any change.",
+    )
+    observation_exhausted: bool = Field(
+        default=False,
+        description="True when the last observer pass executed no call it had not already run.",
+    )
     status: Literal[
         "investigating", "confident", "resolved", "action_unavailable", "escalated",
         # Tier 3 terminal/transit states. "tier3_investigating" is set the

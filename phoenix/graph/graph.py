@@ -3,6 +3,7 @@ import sys
 from langgraph.graph import END, StateGraph
 from langgraph.types import Command
 
+from phoenix.graph import investigation
 from phoenix.graph.nodes import (
     diagnoser_node,
     observer_node,
@@ -110,7 +111,10 @@ def should_continue(state: AgentState) -> Command:
     stops, the budget comes first: it is the harder ceiling, and naming it is
     more useful than naming the iteration cap it happens to be sitting under.
     Looping back is the last resort, so no run that has spent its budget can
-    return to the observer.
+    return to the observer. A fourth stop sits after the other three: a run
+    still below the threshold whose last passes changed nothing the scorer sees
+    (investigation.stagnation_reason) ends with that stated as its reason, so a
+    run is not left to spend its budget on observations that cannot move it.
 
     Each of the four decisions is written to audit_log on its way out. That is
     the same audit table the observer and the diagnoser append to, so a run's
@@ -145,6 +149,18 @@ def should_continue(state: AgentState) -> Command:
                     f"iteration cap reached ({state.iteration}/{state.max_iterations})"
                 ),
             },
+        )
+    # Last of the stops, after the threshold, the budget and the cap have all
+    # been ruled out: a run still below the threshold whose passes have stopped
+    # changing what the scorer sees. Without it such a run keeps observing until
+    # the budget is gone, and says only that the budget ran out.
+    stagnation = investigation.stagnation_reason(state)
+    if stagnation is not None:
+        print(f"[router] {stagnation} -> end (escalate)")
+        _record_route(state, "escalated", END, stagnation, stagnation)
+        return Command(
+            goto=END,
+            update={"status": "escalated", "escalation_reason": stagnation},
         )
     print(f"[router] confidence too low ({state.confidence:.2f}) -> loop back to observer")
     _record_route(

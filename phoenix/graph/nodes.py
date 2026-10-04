@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from langgraph.graph import END
 from langgraph.types import Command
 
-from phoenix.graph import scoring, verification
+from phoenix.graph import investigation, scoring, verification
 from phoenix.graph.llm_client import decide_hypotheses, decide_tool_calls
 from phoenix.graph.persist import (
     get_incident_first_seen,
@@ -233,13 +233,22 @@ def observer_node(state: AgentState) -> AgentState:
     # of the investigation proceeds on the evidence that is readable.
     deploy_tool.set_incident_started_at(get_incident_first_seen(state.incident_id))
 
+    # What the leading hypothesis rests on and what has not been tried, computed
+    # in code. The first pass has no leader to report on, so its call is exactly
+    # the one it always was.
+    evidence_state = investigation.build_evidence_state(state)
     decision = decide_tool_calls(
-        state.service_name, state.evidence, state.needs_evidence
+        state.service_name,
+        state.evidence,
+        state.needs_evidence,
+        **({"evidence_state": evidence_state} if evidence_state else {}),
     )
     state.tokens_spent += decision.tokens
     requested_calls = decision.calls
     dispatched: list[str] = []
     failed: list[str] = []
+    skipped: list[str] = []
+    already_run = {item["summary"] for item in state.evidence}
 
     if not requested_calls:
         _say(f"[observer] iteration {state.iteration}: LLM requested no tool calls")
@@ -250,6 +259,18 @@ def observer_node(state: AgentState) -> AgentState:
         if tool_fn is None:
             _say(f"[observer] iteration {state.iteration}: ignoring unrecognized tool '{tool_name}'")
             continue
+
+        # The same string the evidence row's summary carries, so a call counts as
+        # a repeat exactly when an identical one has already been recorded --
+        # including one proposed twice in this very pass. Exact repeats only: a
+        # different query that returns the same nothing is judged by the
+        # diagnoser's progress check, not here.
+        call_summary = f"{tool_name}({call['arguments']})"
+        if call_summary in already_run:
+            skipped.append(call_summary)
+            _say(f"[observer] iteration {state.iteration}: skipping {call_summary}, already run")
+            continue
+        already_run.add(call_summary)
 
         failure = None
         try:
@@ -286,11 +307,18 @@ def observer_node(state: AgentState) -> AgentState:
             "requested_tools": [call["name"] for call in requested_calls],
             "dispatched_tools": dispatched,
             "failed_tools": failed,
+            "skipped_duplicates": skipped,
+            "observation_exhausted": not dispatched,
             "evidence_collected": len(state.evidence),
             "tokens_spent": state.tokens_spent,
         },
         None,
     )
+
+    # No call this pass was one it had not already run: either the model asked
+    # for nothing or only for repeats. The router reads this after a stagnant
+    # pass as "there is nothing further to observe".
+    state.observation_exhausted = not dispatched
 
     return state
 
@@ -334,6 +362,19 @@ def diagnoser_node(state: AgentState) -> AgentState:
             _say(f"[diagnoser] iteration {state.iteration}: {_diagnosis_line(scored)}")
         _say(f"[diagnoser] iteration {state.iteration}: confidence={state.confidence:.2f}")
 
+    # Did this pass change anything the scorer sees about the leader? Read off
+    # the scores just computed, never recomputed, and kept apart from them: it
+    # decides nothing here, it only counts, and the router acts on the count.
+    signature = investigation.progress_signature(state.hypotheses)
+    progressed, progress_reasons = investigation.assess_progress(state.progress_signature, signature)
+    state.stagnant_passes = 0 if progressed else state.stagnant_passes + 1
+    state.progress_signature = signature
+    if not progressed:
+        _say(
+            f"[diagnoser] iteration {state.iteration}: evidence state unchanged "
+            f"(stagnant pass {state.stagnant_passes})"
+        )
+
     record_hypotheses(state.incident_id, state.hypotheses, iteration=state.iteration)
     record_audit(
         state.incident_id,
@@ -344,6 +385,12 @@ def diagnoser_node(state: AgentState) -> AgentState:
             "confidence": state.confidence,
             "confidence_threshold": state.confidence_threshold,
             "tokens_spent": state.tokens_spent,
+            "progress": {
+                "progressed": progressed,
+                "reasons": progress_reasons,
+                "stagnant_passes": state.stagnant_passes,
+                "signature": signature,
+            },
             "hypotheses": [
                 {
                     "description": scored.hypothesis.description,

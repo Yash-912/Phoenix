@@ -82,7 +82,7 @@ def _stub_tool_calls(
     """Replace the Observer's LLM boundary with a recorder returning `requested`."""
     calls: list[tuple[str, list[dict], list[str]]] = []
 
-    def fake_decide_tool_calls(service_name, evidence_so_far, evidence_requests):
+    def fake_decide_tool_calls(service_name, evidence_so_far, evidence_requests, evidence_state=None):
         calls.append((service_name, evidence_so_far, evidence_requests))
         return llm_client.ToolCallDecision(requested, tokens)
 
