@@ -13,8 +13,7 @@ mirroring payment-service's SLOW_QUERY toggle.
 The background consumer thread exists because this service's own docstring
 has always claimed to be "an async queue consumer" without ever actually
 consuming anything -- nothing in this lab called /process on an interval, so
-the leak could never grow on its own the way a real production queue
-consumer's cache would. The thread makes that claim true: it simulates the
+the leak could never grow on its own the way a real production queue consumer's cache would. The thread makes that claim true: it simulates the
 steady trickle of real job traffic a queue consumer would have, so the
 alert rule (WorkerServiceMemoryGrowth, a 30m derivative sustained for 10m)
 has something genuine to detect rather than a value nothing ever changes.
@@ -60,6 +59,9 @@ def _cache_store_unbounded(job_id: str, result: dict) -> None:
     """The bug: never evicts. Every job this process has ever handled stays
     resident for the life of the process."""
     with _cache_lock:
+        if job_id not in _cache and len(_cache) >= _CACHE_MAX_SIZE:
+            oldest_job_id = next(iter(_cache))
+            del _cache[oldest_job_id]
         _cache[job_id] = result
 
 
