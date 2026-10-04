@@ -454,6 +454,42 @@ def _escalate(
     )
 
 
+def _restart_already_applied(state: AgentState, plan, pre_action_signal) -> dict | None:
+    """Evidence that repeating this action cannot free anything more, or None.
+
+    A failed verification records the level the action left the process at. If
+    the same action is about to be taken again and the process is still at that
+    level -- it has not grown past the allocator noise the verifier itself
+    tolerates -- then the process is already in the state the action produces,
+    and a second identical action would only reproduce it: the next
+    verification would compare that state with itself.
+
+    This decides nothing about whether the first attempt worked; the verifier's
+    verdict stands and the run is never called recovered here. It only declines
+    to repeat an action that has nothing left to do. Memory that has grown past
+    the noise since, or a previous result that recorded no level (any check that
+    does not read one), leaves the retry exactly as it was.
+    """
+    prior = state.verification_result
+    if not isinstance(prior, dict) or prior.get("outcome") != verification.OUTCOME_FAIL:
+        return None
+    if prior.get("action") != plan.action or prior.get("check") != plan.check:
+        return None
+    detail = prior.get("detail")
+    after = detail.get("after") if isinstance(detail, dict) else None
+    current = pre_action_signal.get("bytes") if isinstance(pre_action_signal, dict) else None
+    for value in (after, current):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+    if current > after + verification.NOISE_FLOOR_BYTES:
+        return None
+    return {
+        "post_action_bytes": after,
+        "current_bytes": current,
+        "tolerance_bytes": verification.NOISE_FLOOR_BYTES,
+    }
+
+
 def remediator_node(state: AgentState) -> Command:
     """Take the one Tier 1 action this diagnosis allows, then hand off to verify.
 
@@ -540,6 +576,33 @@ def remediator_node(state: AgentState) -> Command:
         return Command(goto=END, update={"status": "action_unavailable"})
 
     pre_action_signal = verification.read_signal(plan.check, plan.container)
+
+    # Declined before the dispatch, never after: a restart that was not taken
+    # costs the world nothing, and the verifier's earlier verdict stays on the
+    # state as it was. The category decides where the run goes next, through the
+    # same policy that already routes a finding no Tier 1 action can fix.
+    applied = _restart_already_applied(state, plan, pre_action_signal)
+    if applied is not None:
+        category = state.hypotheses[0].hypothesis.category if state.hypotheses else None
+        reason = (
+            f"{plan.action} on {plan.container} would repeat the last attempt: the process is "
+            f"still at the {applied['post_action_bytes']:.0f} that attempt left "
+            f"({applied['current_bytes']:.0f} now, within {applied['tolerance_bytes']} of it), "
+            f"so another {plan.action} has nothing further to free"
+        )
+        if is_tier3_eligible(category):
+            _say(f"[remediator] {reason} -> code_investigator")
+            record_audit(
+                state.incident_id, "remediator", "tier3_handoff",
+                {"iteration": state.iteration, "category": category, "redundant_action": plan.action, **applied},
+                reason,
+            )
+            return Command(
+                goto="code_investigator",
+                update={"status": "tier3_investigating", "tier1_mitigation": state.verification_result},
+            )
+        return _escalate(state, "action_redundant", reason, reason)
+
     action_at = datetime.now(timezone.utc).isoformat()
 
     _say(f"[remediator] taking {plan.action} on {plan.container} ({plan.reasoning})")
