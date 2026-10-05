@@ -83,6 +83,25 @@ def test_every_unhandled_incident_is_run_in_the_order_polled(monkeypatch):
     assert fake_app.invoked_with == [(7, "auth-service"), (9, "payment-service")]
 
 
+def test_an_insufficient_evidence_run_logs_why_it_stopped(monkeypatch, capsys):
+    _patch(
+        monkeypatch,
+        [(23, "payment-service")],
+        {23: {
+            "status": "insufficient_evidence",
+            "escalation_reason": "investigation_stagnant: no change",
+            "evidence_report": {"summary": "Insufficient evidence after 3 pass(es): none supported."},
+        }},
+    )
+
+    watcher.poll_once()
+
+    out = capsys.readouterr().out
+    assert "status=insufficient_evidence" in out
+    assert "reason=investigation_stagnant: no change" in out
+    assert "Insufficient evidence after 3 pass(es)" in out
+
+
 def test_one_incidents_exception_does_not_cancel_the_rest_of_the_batch(monkeypatch):
     """The failure mode this module exists to avoid: one bad run silently
     starving every incident behind it in the same poll."""

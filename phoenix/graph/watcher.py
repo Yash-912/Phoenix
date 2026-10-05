@@ -70,6 +70,12 @@ def poll_once(after_id: int = 0) -> list[int]:
             result = app.invoke(AgentState(incident_id=incident_id, service_name=service_name))
             status = result.get("status") if isinstance(result, dict) else getattr(result, "status", None)
             print(f"[watcher] incident {incident_id} finished: status={status}")
+            if status in ("escalated", "insufficient_evidence"):
+                get = result.get if isinstance(result, dict) else lambda key: getattr(result, key, None)
+                print(f"[watcher] incident {incident_id} reason={get('escalation_reason')}")
+                report = get("evidence_report") or {}
+                if report.get("summary"):
+                    print(f"[watcher] incident {incident_id} {report['summary']}")
         except Exception as exc:
             print(f"[watcher] incident {incident_id} raised {type(exc).__name__}: {exc}")
     return started

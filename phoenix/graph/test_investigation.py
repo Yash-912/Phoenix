@@ -219,10 +219,11 @@ def test_case_4_two_stagnant_passes_escalate_with_an_explicit_reason(monkeypatch
     reason = command.update["escalation_reason"]
     assert reason.startswith("investigation_stagnant: no change in diagnoser evidence state for 2 consecutive passes")
     assert "leader crash at 0.40" in reason and "query_prometheus" in reason
-    assert command.update["status"] == "escalated"
-    assert rows[0][0] == "escalated"
+    assert command.update["status"] == "insufficient_evidence"
+    assert rows[0][0] == "insufficient_evidence"
     assert rows[0][1]["escalation_reason"] == reason
-    assert rows[0][2] == reason
+    assert rows[0][1]["evidence_report"] == command.update["evidence_report"]
+    assert rows[0][2].startswith("Insufficient evidence after")
 
 
 def test_case_5_one_stagnant_pass_with_nothing_further_to_observe_escalates(monkeypatch):
@@ -232,7 +233,7 @@ def test_case_5_one_stagnant_pass_with_nothing_further_to_observe_escalates(monk
     assert command.update["escalation_reason"].startswith(
         "observation_exhausted: no new observable evidence could be collected after a stagnant pass"
     )
-    assert rows[0][0] == "escalated"
+    assert rows[0][0] == "insufficient_evidence"
 
 
 def test_one_stagnant_pass_alone_still_gets_another_directed_attempt(monkeypatch):
@@ -533,7 +534,9 @@ def test_case_5_a_run_with_nothing_further_to_observe_stops_deliberately(monkeyp
     _wire(monkeypatch, observer)
     final = _run()
 
-    assert final["status"] == "escalated"
+    assert final["status"] == "insufficient_evidence"
+    assert "query_loki" in final["evidence_report"]["sources_never_read"]
+    assert final["evidence_report"]["sources_supporting_any_hypothesis"] == ["query_prometheus"]
     assert final["escalation_reason"].startswith("observation_exhausted:")
     assert final["iteration"] == 2
     assert final["tokens_spent"] < 100000
@@ -554,7 +557,7 @@ def test_case_4_a_run_that_keeps_reading_without_learning_stops_after_two_stagna
     _wire(monkeypatch, observer)
     final = _run()
 
-    assert final["status"] == "escalated"
+    assert final["status"] == "insufficient_evidence"
     assert final["escalation_reason"].startswith(
         "investigation_stagnant: no change in diagnoser evidence state for 2 consecutive passes"
     )

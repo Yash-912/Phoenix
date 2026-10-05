@@ -28,6 +28,7 @@ def _record_route(
     destination: str,
     reasoning_text: str,
     escalation_reason: str | None = None,
+    extra: dict | None = None,
 ) -> None:
     """Append this router pass's decision to the trail, then let it route.
 
@@ -63,9 +64,36 @@ def _record_route(
             "token_budget": state.token_budget,
             "destination": destination,
             "escalation_reason": escalation_reason,
+            **(extra or {}),
         },
         reasoning_text,
     )
+
+
+def _end_without_finding(state: AgentState, reason: str) -> Command:
+    """End a run that stopped below the threshold, for `reason`.
+
+    The budget and the cap name why the run stopped; neither says whether it was
+    still learning. A run whose last passes changed nothing, and in which no
+    hypothesis has two independent sources, has run out of evidence, not of room,
+    whichever limit it happened to meet first -- so that is checked here, for all
+    three stops, and ends as insufficient_evidence with the report of what was
+    tried. A run that was still moving when it hit a limit stays escalated. The
+    reason is kept as the stop that fired; the report carries the stagnation
+    that made it an absence of evidence. No action is taken on either.
+    """
+    report = investigation.insufficient_evidence_report(state)
+    if report is not None:
+        report = {**report, "stopped_by": reason}
+        print(f"[router] {report['summary']} -> end (insufficient_evidence)")
+        _record_route(state, "insufficient_evidence", END, report["summary"], reason, extra={"evidence_report": report})
+        return Command(
+            goto=END,
+            update={"status": "insufficient_evidence", "escalation_reason": reason, "evidence_report": report},
+        )
+    print(f"[router] {reason} -> end (escalate)")
+    _record_route(state, "escalated", END, reason, reason)
+    return Command(goto=END, update={"status": "escalated", "escalation_reason": reason})
 
 
 def should_continue(state: AgentState) -> Command:
@@ -130,25 +158,12 @@ def should_continue(state: AgentState) -> Command:
         )
         return Command(goto="remediator", update={"status": "confident"})
     if state.tokens_spent >= state.token_budget:
-        reason = f"token budget exhausted ({state.tokens_spent}/{state.token_budget} tokens)"
-        print(f"[router] {reason} -> end (escalate)")
-        _record_route(state, "escalated", END, reason, reason)
-        return Command(
-            goto=END,
-            update={"status": "escalated", "escalation_reason": reason},
+        return _end_without_finding(
+            state, f"token budget exhausted ({state.tokens_spent}/{state.token_budget} tokens)"
         )
     if state.iteration >= state.max_iterations:
-        print(f"[router] iteration cap hit ({state.iteration}/{state.max_iterations}) -> end (escalate)")
-        reason = f"iteration cap reached ({state.iteration}/{state.max_iterations})"
-        _record_route(state, "escalated", END, reason, reason)
-        return Command(
-            goto=END,
-            update={
-                "status": "escalated",
-                "escalation_reason": (
-                    f"iteration cap reached ({state.iteration}/{state.max_iterations})"
-                ),
-            },
+        return _end_without_finding(
+            state, f"iteration cap reached ({state.iteration}/{state.max_iterations})"
         )
     # Last of the stops, after the threshold, the budget and the cap have all
     # been ruled out: a run still below the threshold whose passes have stopped
@@ -156,12 +171,7 @@ def should_continue(state: AgentState) -> Command:
     # the budget is gone, and says only that the budget ran out.
     stagnation = investigation.stagnation_reason(state)
     if stagnation is not None:
-        print(f"[router] {stagnation} -> end (escalate)")
-        _record_route(state, "escalated", END, stagnation, stagnation)
-        return Command(
-            goto=END,
-            update={"status": "escalated", "escalation_reason": stagnation},
-        )
+        return _end_without_finding(state, stagnation)
     print(f"[router] confidence too low ({state.confidence:.2f}) -> loop back to observer")
     _record_route(
         state,

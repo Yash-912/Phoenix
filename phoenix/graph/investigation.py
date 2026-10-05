@@ -127,6 +127,75 @@ def _leader_phrase(state) -> str:
     )
 
 
+def insufficient_evidence_report(state) -> dict | None:
+    """A report of why a run ended with no finding, or None when that is not the case.
+
+    A run is insufficient-evidence when it stopped because it stopped learning
+    (stagnation_reason) and no hypothesis was supported by two independent
+    sources. That is a different fact from a run that hit the budget or the cap
+    while still changing its leader: that run ran out of room, this one ran out
+    of evidence. The caller has already ruled out the threshold, the budget and
+    the cap, as for stagnation_reason.
+
+    Computed from the scorer's own breakdowns and the evidence list, never by a
+    model, so the trail can say what was tried and why nothing was conclusive
+    without a second opinion about it.
+    """
+    reason = stagnation_reason(state)
+    if reason is None:
+        return None
+    if any(h.score_breakdown.get("sources_supporting", 0) >= 2 for h in state.hypotheses):
+        return None
+
+    usable: dict[str, int] = {}
+    seen: set[str] = set()
+    for item in state.evidence:
+        source = item.get("source", "")
+        if source not in scoring.SOURCE_WEIGHTS:
+            continue
+        seen.add(source)
+        if scoring._is_usable(item):
+            usable[source] = usable.get(source, 0) + 1
+
+    considered = [
+        {
+            "category": h.hypothesis.category,
+            "description": h.hypothesis.description,
+            "score": h.score,
+            "supporting_sources": _supporting_sources(h.score_breakdown),
+            "contradicted": h.score_breakdown.get("contradiction_penalty", 0) > 0,
+        }
+        for h in state.hypotheses
+    ]
+    supporting = sorted({source for entry in considered for source in entry["supporting_sources"]})
+    answered_without_support = sorted(source for source in usable if source not in supporting)
+    failed = sorted(source for source in seen if source not in usable)
+    never_read = sorted(source for source in scoring.SOURCE_WEIGHTS if source not in seen)
+
+    summary = (
+        f"Insufficient evidence after {state.iteration} pass(es): {len(considered)} hypothesis(es) "
+        f"considered, none supported by two independent sources. "
+        f"Answered without support: {', '.join(answered_without_support) or 'none'}. "
+        f"Read failed: {', '.join(failed) or 'none'}. "
+        f"Never read: {', '.join(never_read) or 'none'}."
+    )
+    return {
+        "reason": reason,
+        "summary": summary,
+        "hypotheses_considered": considered,
+        "sources_supporting_any_hypothesis": supporting,
+        "sources_answered_without_support": answered_without_support,
+        "sources_failed": failed,
+        "sources_never_read": never_read,
+        "queries_run": len(state.evidence),
+        "queries": [item["summary"][:MAX_QUERY_LENGTH] for item in state.evidence[-MAX_LISTED_QUERIES:]],
+        "iterations": state.iteration,
+        "tokens_spent": state.tokens_spent,
+        "confidence": state.confidence,
+        "confidence_threshold": state.confidence_threshold,
+    }
+
+
 def stagnation_reason(state) -> str | None:
     """Why the router should stop a run that is below the threshold, or None.
 

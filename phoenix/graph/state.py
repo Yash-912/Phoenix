@@ -63,8 +63,20 @@ class AgentState(BaseModel):
         # closed incident: PRD section 6 requires it to stop for human
         # review, and "resolved" would read as nothing further being needed.
         "tier3_investigating", "pr_opened",
+        # Terminal. The run investigated, found no hypothesis two independent
+        # sources support, and stopped learning. Kept distinct from "escalated"
+        # because it is a correct outcome, not a failure or a spent budget: the
+        # right response to an underdetermined incident is to stop and report.
+        "insufficient_evidence",
     ] = "investigating"
     escalation_reason: Optional[str] = None
+    evidence_report: Optional[dict] = Field(
+        default=None,
+        description=(
+            "Set only when status is insufficient_evidence: the hypotheses considered, which sources "
+            "answered without support, which reads failed, which were never read, and the queries run."
+        ),
+    )
 
     # --- Tier 3: code investigation -> patch -> validate -> PR -------------
     # Kept on a separate status axis from the top-level `status` above
