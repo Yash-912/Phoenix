@@ -83,6 +83,13 @@ Get **one full incident loop working on the easiest scenario first** (detect →
 
 **Exit criteria:** the agent reaches "insufficient evidence, escalating" and the trace shows what it tried and why nothing was conclusive.
 
+**Status: complete (2026-10-05).**
+- `insufficient_evidence` is a terminal status, separate from `escalated`. A run ends in it when it stops learning and no hypothesis has two independent sources behind it, whichever limit fires first (budget, iteration cap, stagnation). A run still learning at a limit stays `escalated`.
+- The audit log holds an `insufficient_evidence` row with a report: hypotheses considered, sources that answered without support, reads that failed, sources never read, queries run. No remediation tool is reached.
+- Live proof: Scenario 5, incident 65.
+- Found by the live run and fixed: the scorer counted a deployment the tool had already marked `too_far_before` as evidence, which pushed a false 0.75 and opened a PR. Scenario 4 had no observable symptom, so it now runs against a real connection pool under load. The Loki tool dropped Loki's own error text, so the model could not correct a bad query.
+- All five scenarios were re-run live and pass.
+
 ## Phase 7 — Safety model
 
 **Goal:** implement the two-dimensional policy from the PRD, not just autonomous-everything.
