@@ -714,10 +714,10 @@ def test_state_accepts_a_correctly_typed_needs_evidence_assignment():
     assert state.needs_evidence == CRASH_NEEDS
 
 
-def test_the_token_budget_is_an_int_defaulting_to_twenty_thousand():
+def test_the_token_budget_is_an_int_defaulting_to_thirty_thousand():
     state = _state(CRASH_EVIDENCE)
 
-    assert state.token_budget == 20000
+    assert state.token_budget == 30000
     assert isinstance(state.token_budget, int)
     assert state.tokens_spent == 0
     assert isinstance(state.tokens_spent, int)
@@ -746,6 +746,7 @@ def test_the_observer_bills_its_tokens_even_when_no_tool_was_requested(monkeypat
 def test_the_observer_adds_to_the_spend_already_on_the_state(monkeypatch):
     _stub_tool_calls(monkeypatch, [], tokens=940)
     state = _state(CRASH_EVIDENCE)
+    state.token_budget = 20000
     state.tokens_spent = 19100
 
     nodes.observer_node(state)
@@ -851,11 +852,11 @@ def test_the_int_field_tolerates_a_whole_float_and_refuses_a_fractional_one():
 def test_state_rejects_a_wrongly_typed_token_budget_assignment():
     state = _state(CRASH_EVIDENCE)
 
-    for bad in (None, [20000], {"tokens": 20000}, 20000.5):
+    for bad in (None, [30000], {"tokens": 30000}, 30000.5):
         with pytest.raises(ValidationError):
             state.token_budget = bad
 
-    assert state.token_budget == 20000
+    assert state.token_budget == 30000
 
 
 # --- remediator_node ----------------------------------------------------------

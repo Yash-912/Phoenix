@@ -33,7 +33,7 @@ class AgentState(BaseModel):
         ),
     )
     token_budget: int = Field(
-        default=20000,
+        default=30000,
         description="Hard ceiling on tokens_spent for one investigation, in tokens.",
     )
     progress_signature: Optional[dict] = Field(

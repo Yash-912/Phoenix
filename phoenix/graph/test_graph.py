@@ -85,13 +85,13 @@ def _final(result) -> dict:
 
 
 def test_a_run_that_has_spent_its_whole_budget_ends():
-    command = graph.should_continue(_state(tokens_spent=20000))
+    command = graph.should_continue(_state(tokens_spent=20000, token_budget=20000))
 
     assert command.goto == END
 
 
 def test_a_run_that_is_past_its_budget_ends():
-    command = graph.should_continue(_state(tokens_spent=20001))
+    command = graph.should_continue(_state(tokens_spent=20001, token_budget=20000))
 
     assert command.goto == END
 
@@ -116,7 +116,7 @@ def test_the_router_hands_the_escalation_back_rather_than_writing_it_onto_its_co
 
 
 def test_a_run_one_token_short_of_its_budget_still_loops():
-    command = graph.should_continue(_state(tokens_spent=19999))
+    command = graph.should_continue(_state(tokens_spent=19999, token_budget=20000))
 
     assert command.goto == "observer"
     assert not command.update
@@ -129,7 +129,7 @@ def test_the_budget_guard_never_asks_the_llm_anything(monkeypatch):
     monkeypatch.setattr(nodes, "decide_tool_calls", boom)
     monkeypatch.setattr(nodes, "decide_hypotheses", boom)
 
-    command = graph.should_continue(_state(tokens_spent=25000))
+    command = graph.should_continue(_state(tokens_spent=25000, token_budget=20000))
 
     assert command.goto == END
     assert command.update["status"] == "escalated"
