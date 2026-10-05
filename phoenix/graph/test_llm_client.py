@@ -403,3 +403,26 @@ def test_a_billed_fallback_with_no_choices_yields_no_hypotheses_and_keeps_the_bi
     assert decision.output.hypotheses == []
     assert decision.tokens == 260
     assert "no choices" in capsys.readouterr().out
+
+
+# ---- what the observer is told about writing LogQL -------------------------------------
+
+
+def _logql_description() -> str:
+    schema = next(t for t in llm_client.TOOL_SCHEMAS if t["function"]["name"] == "query_loki")
+    return schema["function"]["parameters"]["properties"]["logql"]["description"]
+
+
+def test_the_observer_is_told_to_read_the_plain_container_logs_first():
+    """Models handed filter syntax wrote filtered queries straight away, in invalid
+    forms that matched nothing, and never read the lines that carried the evidence."""
+    text = _logql_description().lower()
+
+    assert "plain selector" in text
+    assert text.index("plain selector") < text.index("|=")
+
+
+def test_the_observer_is_told_there_is_no_or_between_line_filters():
+    text = _logql_description()
+
+    assert "no 'or'" in text and "|~" in text
