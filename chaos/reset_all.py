@@ -2,22 +2,37 @@
 
 from __future__ import annotations
 
+import subprocess
+
 import requests
 
-from chaos import config_pool
+from chaos import config_pool, deploy_bad_v18
 from chaos.lib.deployer import DeploymentError
 
 # checkout-service is absent from this list on purpose. Its fault lives in the
 # image, so there is no flag to clear and no endpoint that could clear one --
-# asking it to 'heal' reported success while the service stayed broken. It is
-# reset by redeploying v17 through chaos/deploy_bad_v18.py --reset, which is the
-# same operation a Tier 2 rollback performs.
+# asking it to 'heal' reported success while the service stayed broken. main()
+# resets it by redeploying v17 through chaos/deploy_bad_v18.py, which is the same
+# operation a Tier 2 rollback performs.
 TARGETS = [
     ("payment-service", "http://localhost:8003/chaos/slow/disable"),
     ("payment-service", "http://localhost:8003/chaos/blip/stop"),
     ("worker-service", "http://localhost:8004/chaos/leak/stop"),
     ("api-gateway", "http://localhost:8005/chaos/heal"),
 ]
+
+
+def _checkout_version() -> str | None:
+    """The app.version label of the running checkout container, or None if unreadable."""
+    try:
+        result = subprocess.run(
+            ["docker", "inspect", "-f", '{{index .Config.Labels "app.version"}}', "checkout-service"],
+            capture_output=True, text=True, timeout=30, shell=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    version = result.stdout.strip()
+    return version if result.returncode == 0 and version else None
 
 
 def main() -> None:
@@ -43,6 +58,17 @@ def main() -> None:
         print(f"auth-service DB_POOL_SIZE: reset to {marker['config']['DB_POOL_SIZE']}")
     except DeploymentError as exc:
         print(f"auth-service DB_POOL_SIZE: FAILED {exc}")
+
+    # Scenario 1 leaves checkout on the bad image whenever nothing rolls it back.
+    # Redeploy the good one only when it is not already running: each redeploy
+    # recreates the container and writes a deployment marker, so doing it on every
+    # reset would fill the history the agent reads with no-op deploys. A version
+    # that cannot be read is redeployed rather than assumed healthy.
+    if _checkout_version() != deploy_bad_v18.GOOD_VERSION:
+        try:
+            deploy_bad_v18.reset()
+        except DeploymentError as exc:
+            print(f"checkout-service: FAILED {exc}")
 
 
 if __name__ == "__main__":
