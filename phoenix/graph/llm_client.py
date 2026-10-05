@@ -149,7 +149,14 @@ TOOL_SCHEMAS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "logql": {"type": "string", "description": "A valid LogQL query string, e.g. {container=\"checkout-service\"}"},
+                    "logql": {
+                        "type": "string",
+                        "description": (
+                            "A valid LogQL query string, e.g. {container=\"checkout-service\"}. To filter lines, "
+                            "put a filter after the selector: |= \"text\" (contains), != \"text\" (does not), "
+                            "|~ \"a|b\" (regex). There is no grep and no pipe to other commands."
+                        ),
+                    },
                     "minutes": {"type": "integer", "description": "How many minutes back to search. Defaults to 15."},
                 },
                 "required": ["logql"],

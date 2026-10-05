@@ -8,6 +8,9 @@ LOKI_URL = os.environ.get("LOKI_URL", "http://localhost:3100")
 # A window longer than a day is not a diagnostic window, it is a download.
 MAX_LOKI_MINUTES = 1440
 
+# Enough of Loki's own error text to name the syntax problem, not a page of it.
+MAX_ERROR_BODY_CHARS = 300
+
 
 def query_loki(logql: str, minutes: int = 15) -> dict:
     """Query Loki for logs matching a LogQL query over the last `minutes` minutes.
@@ -49,4 +52,11 @@ def query_loki(logql: str, minutes: int = 15) -> dict:
         response.raise_for_status()
         return response.json()
     except requests.RequestException as exc:
-        return {"status": "error", "error": str(exc)}
+        message = str(exc)
+        # A rejected query (400) says why in its body, and the caller is a model
+        # that wrote the query: without Loki's own message the only thing it can
+        # learn is that it failed, and it repeats the same mistake.
+        body = getattr(getattr(exc, "response", None), "text", "") or ""
+        if body:
+            message = f"{message}: {body[:MAX_ERROR_BODY_CHARS]}"
+        return {"status": "error", "error": message}
