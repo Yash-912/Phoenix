@@ -73,18 +73,18 @@ def _record_route(
 def _end_without_finding(state: AgentState, reason: str) -> Command:
     """End a run that stopped below the threshold, for `reason`.
 
-    The budget and the cap name why the run stopped; neither says whether it was
-    still learning. A run whose last passes changed nothing, and in which no
-    hypothesis has two independent sources, has run out of evidence, not of room,
-    whichever limit it happened to meet first -- so that is checked here, for all
-    three stops, and ends as insufficient_evidence with the report of what was
-    tried. A run that was still moving when it hit a limit stays escalated. The
-    reason is kept as the stop that fired; the report carries the stagnation
-    that made it an absence of evidence. No action is taken on either.
+    A run that stopped below the threshold with no hypothesis supported by two
+    independent sources took no action and found nothing it could stand behind.
+    That is insufficient evidence whichever limit it met first -- the budget, the
+    cap, or its own stagnation -- so it is checked here, for all three stops, and
+    ends as insufficient_evidence with the report of what was tried and the stop
+    that fired as its reason. Whether its last pass happened to move the leader
+    does not change that: a leader that moves from 0.00 to 0.30 has not found
+    anything. A run in which two sources do agree has a finding, however weak, and
+    stays escalated. No action is taken on either.
     """
-    report = investigation.insufficient_evidence_report(state)
+    report = investigation.insufficient_evidence_report(state, reason)
     if report is not None:
-        report = {**report, "stopped_by": reason}
         print(f"[router] {report['summary']} -> end (insufficient_evidence)")
         _record_route(state, "insufficient_evidence", END, report["summary"], reason, extra={"evidence_report": report})
         return Command(

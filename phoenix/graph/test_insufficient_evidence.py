@@ -105,38 +105,91 @@ def _route(monkeypatch, **fields):
     return graph.should_continue(state), rows
 
 
-def test_a_budget_stop_on_a_stagnant_run_is_insufficient_evidence_and_names_the_budget(monkeypatch):
-    """The live case: the budget ran out on the same pass that made the run stagnant."""
-    command, rows = _route(monkeypatch, stagnant_passes=2, tokens_spent=25624, token_budget=20000)
+BUDGET = "token budget exhausted (25624/20000 tokens)"
+
+
+def test_a_budget_stop_with_no_two_source_hypothesis_is_insufficient_evidence(monkeypatch):
+    """The live case: the budget ran out at 0.30 with one source behind the leader. The
+    run took no action and found nothing it could stand behind, whether or not its last
+    pass happened to move the leader."""
+    command, rows = _route(monkeypatch, stagnant_passes=0, tokens_spent=25624, token_budget=20000)
 
     assert command.update["status"] == "insufficient_evidence"
-    assert command.update["escalation_reason"] == "token budget exhausted (25624/20000 tokens)"
-    assert command.update["evidence_report"]["stopped_by"] == "token budget exhausted (25624/20000 tokens)"
-    assert command.update["evidence_report"]["reason"].startswith("investigation_stagnant:")
+    assert command.update["escalation_reason"] == BUDGET
+    assert command.update["evidence_report"]["reason"] == BUDGET
     assert rows[0][0] == "insufficient_evidence"
 
 
-def test_a_budget_stop_on_a_run_that_was_still_learning_stays_escalated(monkeypatch):
-    command, rows = _route(monkeypatch, stagnant_passes=0, tokens_spent=20000, token_budget=20000)
+def test_a_stagnant_budget_stop_names_the_budget_as_the_reason(monkeypatch):
+    command, _ = _route(monkeypatch, stagnant_passes=2, tokens_spent=25624, token_budget=20000)
+
+    assert command.update["status"] == "insufficient_evidence"
+    assert command.update["escalation_reason"] == BUDGET
+    assert command.update["evidence_report"]["reason"] == BUDGET
+
+
+def test_the_iteration_cap_with_no_two_source_hypothesis_is_insufficient_evidence(monkeypatch):
+    command, rows = _route(monkeypatch, stagnant_passes=0, iteration=5, max_iterations=5, tokens_spent=100)
+
+    assert command.update["status"] == "insufficient_evidence"
+    assert command.update["escalation_reason"] == "iteration cap reached (5/5)"
+    assert rows[0][0] == "insufficient_evidence"
+
+
+def _weak_finding_state(**fields) -> AgentState:
+    """Two independent sources agree on a cause but the score is below the threshold."""
+    evidence = [_ev("query_prometheus", "up==0 ServiceDown"), _ev("query_loki", LOKI_PANIC)]
+    return _state(evidence, CRASH, confidence=0.6, **fields)
+
+
+def test_a_budget_stop_with_a_two_source_hypothesis_stays_escalated(monkeypatch):
+    """Two sources agreeing is a finding, however weak, so the run did not find nothing."""
+    monkeypatch.setattr(graph, "record_audit", lambda *a: None)
+
+    command = graph.should_continue(_weak_finding_state(tokens_spent=20000, token_budget=20000))
 
     assert command.update["status"] == "escalated"
     assert "evidence_report" not in command.update
-    assert rows[0][0] == "escalated"
 
 
-def test_the_iteration_cap_on_a_stagnant_run_is_insufficient_evidence(monkeypatch):
-    command, rows = _route(monkeypatch, stagnant_passes=2, iteration=5, max_iterations=5, tokens_spent=100)
+def test_the_iteration_cap_with_a_two_source_hypothesis_stays_escalated(monkeypatch):
+    monkeypatch.setattr(graph, "record_audit", lambda *a: None)
 
-    assert command.update["status"] == "insufficient_evidence"
-    assert command.update["escalation_reason"] == "iteration cap reached (5/5)"
-    assert rows[0][0] == "insufficient_evidence"
-
-
-def test_a_run_that_is_still_learning_at_the_cap_is_not_called_insufficient_evidence(monkeypatch):
-    command, _ = _route(monkeypatch, stagnant_passes=0, iteration=5, max_iterations=5, tokens_spent=100)
+    command = graph.should_continue(_weak_finding_state(iteration=5, max_iterations=5, tokens_spent=100))
 
     assert command.update["status"] == "escalated"
     assert command.update["escalation_reason"] == "iteration cap reached (5/5)"
+
+
+def test_a_run_that_read_nothing_before_the_budget_ran_out_is_a_budget_problem(monkeypatch):
+    """It never looked, so there is no absence of evidence to report."""
+    monkeypatch.setattr(graph, "record_audit", lambda *a: None)
+
+    command = graph.should_continue(AgentState(incident_id=1, service_name=SERVICE, tokens_spent=20000, token_budget=20000))
+
+    assert command.update["status"] == "escalated"
+    assert "evidence_report" not in command.update
+
+
+def test_a_run_whose_every_read_failed_before_the_budget_ran_out_is_a_budget_problem(monkeypatch):
+    monkeypatch.setattr(graph, "record_audit", lambda *a: None)
+    state = AgentState(
+        incident_id=1, service_name=SERVICE, tokens_spent=20000, token_budget=20000,
+        evidence=[_ev("query_loki", "", ok=False)],
+    )
+
+    command = graph.should_continue(state)
+
+    assert command.update["status"] == "escalated"
+
+
+def test_a_stagnant_run_with_nothing_read_is_still_insufficient_evidence(monkeypatch):
+    """Stagnation is itself proof the run went round without learning."""
+    monkeypatch.setattr(graph, "record_audit", lambda *a: None)
+
+    command = graph.should_continue(AgentState(incident_id=1, service_name=SERVICE, stagnant_passes=2))
+
+    assert command.update["status"] == "insufficient_evidence"
 
 
 # ---- through the compiled graph, shaped like the ambiguous scenario ----------------

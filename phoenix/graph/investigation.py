@@ -127,21 +127,26 @@ def _leader_phrase(state) -> str:
     )
 
 
-def insufficient_evidence_report(state) -> dict | None:
+def insufficient_evidence_report(state, reason: str | None = None) -> dict | None:
     """A report of why a run ended with no finding, or None when that is not the case.
 
-    A run is insufficient-evidence when it stopped because it stopped learning
-    (stagnation_reason) and no hypothesis was supported by two independent
-    sources. That is a different fact from a run that hit the budget or the cap
-    while still changing its leader: that run ran out of room, this one ran out
-    of evidence. The caller has already ruled out the threshold, the budget and
-    the cap, as for stagnation_reason.
+    A run is insufficient-evidence when it stopped below the threshold and no
+    hypothesis was supported by two independent sources: it took no action and
+    found nothing it could stand behind. Whether the run stopped because it ran
+    out of room (the budget or the cap) or because it stopped learning makes no
+    difference to that, so the caller passes the reason it stopped and the report
+    names it. Without one, only a run that stopped learning (stagnation_reason)
+    qualifies. Two sources that agree are a finding, however weak, so such a run
+    is not an absence of evidence and gets no report.
+
+    The caller has already ruled out the threshold, so the run is below it.
 
     Computed from the scorer's own breakdowns and the evidence list, never by a
     model, so the trail can say what was tried and why nothing was conclusive
     without a second opinion about it.
     """
-    reason = stagnation_reason(state)
+    stagnation = stagnation_reason(state)
+    reason = reason if reason is not None else stagnation
     if reason is None:
         return None
     if any(h.score_breakdown.get("sources_supporting", 0) >= 2 for h in state.hypotheses):
@@ -156,6 +161,11 @@ def insufficient_evidence_report(state) -> dict | None:
         seen.add(source)
         if scoring._is_usable(item):
             usable[source] = usable.get(source, 0) + 1
+    # A run that stopped for room before it read anything usable never looked, so
+    # there is no absence of evidence to report: that is a budget problem. A run
+    # that stagnated went round without learning, which counts either way.
+    if not usable and stagnation is None:
+        return None
 
     considered = [
         {
