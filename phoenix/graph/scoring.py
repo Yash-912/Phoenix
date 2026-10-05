@@ -154,6 +154,38 @@ def _runtime_view(payload):
     return payload
 
 
+# Verdicts correlation.correlate gives a deployment it measured to be unrelated
+# to the incident's onset. The two "unknown" verdicts are deliberately absent: a
+# gap in what the tool could read is not a ruling out, and treating it as one
+# would drop evidence the run has no way to replace.
+_RULED_OUT_BY_TIME = frozenset({"too_far_before", "after_incident"})
+
+
+def _in_scope_view(payload):
+    """A payload with the deployments the tool ruled out by time removed.
+
+    get_recent_deployments returns the service's recent history, each marker
+    annotated with how it relates to this incident's start. A marker the tool
+    itself measured as too far before, or after, the incident is history, not
+    evidence of a cause; its tag and config still carry category keywords
+    ("slow-query", "v18"), and scoring them would let a deployment from days ago
+    support a diagnosis of an incident it had nothing to do with. Dropping it
+    here, from the text that is matched, leaves the tool's output untouched.
+    """
+    if isinstance(payload, dict):
+        view = {key: _in_scope_view(value) for key, value in payload.items()}
+        deployments = view.get("deployments")
+        if isinstance(deployments, list):
+            view["deployments"] = [
+                entry for entry in deployments
+                if not (isinstance(entry, dict) and entry.get("correlation") in _RULED_OUT_BY_TIME)
+            ]
+        return view
+    if isinstance(payload, (list, tuple)):
+        return [_in_scope_view(value) for value in payload]
+    return payload
+
+
 def _blob(evidence_item: dict) -> str:
     """Lowercased content of one evidence item for keyword matching:
     raw_data's leaf values only.
@@ -167,7 +199,7 @@ def _blob(evidence_item: dict) -> str:
     must never satisfy a category keyword on its own; only returned data can.
     """
     try:
-        values = _content_values(_runtime_view(evidence_item.get("raw_data", {})))
+        values = _content_values(_in_scope_view(_runtime_view(evidence_item.get("raw_data", {}))))
     except RecursionError:
         values = []
     return "\n".join(values).lower()

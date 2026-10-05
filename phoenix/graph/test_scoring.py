@@ -285,3 +285,58 @@ def test_a_successful_prometheus_response_stays_evidence_though_a_metric_is_labe
     assert bd["sources_supporting"] == 0
     assert bd["contradiction_penalty"] == 0.3
     assert score == 0.0
+
+
+# ---- deployments the tool already ruled out by time ------------------------------
+
+
+def _marker(correlation: str, **fields) -> dict:
+    return {"service": "payment-service", "image_tag": "slow-query", "git_commit": "slow-join",
+            "config": {"slow_query": True}, "correlation": correlation,
+            "in_window": correlation == "before_incident", **fields}
+
+
+def _deployments(*markers: dict) -> dict:
+    return _deploy_ev({"status": "ok", "service": "payment-service", "deployments": list(markers)})
+
+
+def test_a_deployment_far_before_the_incident_is_not_evidence_for_it():
+    ev = [_deployments(_marker("too_far_before"))]
+
+    score, bd = score_hypothesis(ev, Hypothesis(description="a slow query", category="slow_query"))
+
+    assert bd["has_deploy_signal"] == 0
+    assert score == 0.0
+
+
+def test_a_deployment_after_the_incident_began_is_not_evidence_for_it():
+    ev = [_deployments(_marker("after_incident"))]
+
+    _, bd = score_hypothesis(ev, Hypothesis(description="a slow query", category="slow_query"))
+
+    assert bd["has_deploy_signal"] == 0
+
+
+def test_a_deployment_shortly_before_the_incident_still_counts():
+    ev = [_deployments(_marker("before_incident"))]
+
+    _, bd = score_hypothesis(ev, Hypothesis(description="a slow query", category="slow_query"))
+
+    assert bd["has_deploy_signal"] == 1
+
+
+def test_one_in_window_deployment_counts_when_older_ones_are_ruled_out():
+    ev = [_deployments(_marker("too_far_before"), _marker("before_incident"))]
+
+    _, bd = score_hypothesis(ev, Hypothesis(description="a slow query", category="slow_query"))
+
+    assert bd["has_deploy_signal"] == 1
+
+
+def test_an_unknown_incident_time_is_a_gap_not_an_exclusion():
+    """The tool could not say whether the deployment was related; that is not a ruling out."""
+    ev = [_deployments(_marker("incident_time_unknown"))]
+
+    _, bd = score_hypothesis(ev, Hypothesis(description="a slow query", category="slow_query"))
+
+    assert bd["has_deploy_signal"] == 1
