@@ -130,7 +130,11 @@ TOOL_SCHEMAS = [
                 "query that reads process_resident_memory_bytes for one job also comes back "
                 "with a memory_trend block the tool measured over the paging alert's "
                 "30-minute window (growth, slope, and a sustained_growth verdict); that "
-                "block, not a single reading, is what shows whether memory is really growing."
+                "block, not a single reading, is what shows whether memory is really growing. "
+                "Likewise a query that reads http_request_duration_seconds for one job comes "
+                "back with a latency_measure block (the p95 over 30 minutes against the 1 s "
+                "paging threshold, and a sustained_slow verdict); the metric's name alone "
+                "does not show a service is slow, that block does."
             ),
             "parameters": {
                 "type": "object",

@@ -23,7 +23,7 @@ from phoenix.tools.deploy_tool import get_recent_deployments
 from phoenix.tools.docker_tool import get_container_state
 from phoenix.tools.health_tool import inspect_health
 from phoenix.tools.loki_tool import query_loki
-from phoenix.tools.memory_tool import query_prometheus_with_memory_trend
+from phoenix.tools.latency_tool import query_prometheus_with_latency_measure
 
 
 def _say(message: str = "") -> None:
@@ -51,7 +51,7 @@ def _say(message: str = "") -> None:
 # Observer stays read-only: remediation actions (restart/pause/cache)
 # live in remediation_tool.py and are executor-only, never dispatched here.
 TOOL_DISPATCH = {
-    "query_prometheus": lambda args: query_prometheus_with_memory_trend(args["promql"]),
+    "query_prometheus": lambda args: query_prometheus_with_latency_measure(args["promql"]),
     "query_loki": lambda args: query_loki(args["logql"], args.get("minutes", 15)),
     "get_container_state": lambda args: get_container_state(args["container_name"]),
     "inspect_health": lambda args: inspect_health(args["service_name"]),

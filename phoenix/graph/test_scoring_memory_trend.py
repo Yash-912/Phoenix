@@ -44,8 +44,12 @@ def test_measured_sustained_growth_supports_a_leak_through_the_prometheus_signal
     assert score == 0.4
 
 
+GROWTH_LOG = _loki("job result cache is growing: 4200 entries, nothing is ever evicted")
+LEAK_WORD_LOG = _loki("worker cache is leaking")
+
+
 def test_measured_growth_plus_a_corroborating_source_clears_the_routing_threshold():
-    score, breakdown = score_hypothesis([_prom(GROWTH), CHAOS_LOG], LEAK)
+    score, breakdown = score_hypothesis([_prom(GROWTH), GROWTH_LOG], LEAK)
 
     assert breakdown["sources_supporting"] == 2
     assert score == 0.9
@@ -53,19 +57,19 @@ def test_measured_growth_plus_a_corroborating_source_clears_the_routing_threshol
 
 def test_a_chaos_endpoints_name_in_logs_and_labels_is_not_evidence_of_a_leak():
     """Both signals matched only on the word 'leak' in a URL. Neither measured
-    memory, so together they stay below the routing threshold."""
+    memory, and a request path is the caller's input, so together they score nothing."""
     score, breakdown = score_hypothesis([CHAOS_LABELS, CHAOS_LOG], LEAK)
 
     assert breakdown["has_prometheus_signal"] == 0
-    assert breakdown["has_loki_signal"] == 1
-    assert score == 0.3
-    assert score < 0.75
+    assert breakdown["has_loki_signal"] == 0
+    assert score == 0.0
 
 
 def test_measured_flat_memory_overrides_a_log_line_that_merely_mentions_a_leak():
-    score, breakdown = score_hypothesis([_prom(FLAT), CHAOS_LOG], LEAK)
+    score, breakdown = score_hypothesis([_prom(FLAT), LEAK_WORD_LOG], LEAK)
 
     assert breakdown["has_prometheus_signal"] == 0
+    assert breakdown["has_loki_signal"] == 1
     assert score == 0.3 < 0.75
 
 

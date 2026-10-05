@@ -11,6 +11,8 @@ Rule (V1, deliberately simple):
 
 from __future__ import annotations
 
+import re
+
 from phoenix.graph.schemas import Hypothesis
 
 PROM_WEIGHT = 0.4
@@ -120,13 +122,36 @@ def _is_usable(evidence_item: dict) -> bool:
     return not (sub_reads and all(_is_failure(sub_read) for sub_read in sub_reads))
 
 
+# The request target in an HTTP access-log line, e.g. "POST /chaos/slow/enable HTTP/1.1".
+_REQUEST_LINE = re.compile(r'"(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS) \S+ (HTTP/\d(?:\.\d)?)"')
+
+# Fields whose value is what the caller asked for, not something observed: the
+# handler label of a request metric is a URL path, and __name__ is the series the
+# query named. Every service exports process_resident_memory_bytes and the latency
+# histogram, so their names would match a keyword whatever the reading was.
+_PATH_LABELS = frozenset({"handler", "__name__"})
+
+
 def _content_values(payload) -> list[str]:
-    """Scalar leaf values of a payload, field names discarded."""
+    """Scalar leaf values of a payload, field names discarded.
+
+    A URL path is dropped wherever it is recognisable: the request target of an
+    access-log line, and the value of a request metric's handler label. It is
+    whatever the caller asked for, and the reset and chaos scripts call endpoints
+    named /chaos/slow/disable and /chaos/leak/start, so scoring it would let the
+    harness's own requests satisfy a category keyword. The method, protocol and
+    status code of a request line are kept; they were observed.
+    """
     if isinstance(payload, dict):
-        return [text for value in payload.values() for text in _content_values(value)]
+        return [
+            text
+            for key, value in payload.items()
+            if key not in _PATH_LABELS
+            for text in _content_values(value)
+        ]
     if isinstance(payload, (list, tuple)):
         return [text for value in payload for text in _content_values(value)]
-    return [str(payload)]
+    return [_REQUEST_LINE.sub(r'"\1 \2"', str(payload))]
 
 
 def _runtime_view(payload):
@@ -231,6 +256,24 @@ def _measured_memory_growth(usable: list[dict]) -> bool:
     return False
 
 
+def _measured_slowdown(usable: list[dict]) -> bool:
+    """True when a Prometheus read carries a latency_measure the tool measured and
+    judged a sustained slowdown.
+
+    Only the typed field counts, and only on a usable query_prometheus item: that
+    is where the observer attaches the measurement (phoenix/tools/latency_tool.py),
+    so a block turning up anywhere else is not a measurement and is not credited.
+    """
+    for item in usable:
+        if item.get("source") != SOURCE_PROM:
+            continue
+        raw = item.get("raw_data")
+        measure = raw.get("latency_measure") if isinstance(raw, dict) else None
+        if isinstance(measure, dict) and measure.get("sustained_slow") is True:
+            return True
+    return False
+
+
 def score_hypothesis(evidence: list[dict], hypothesis: Hypothesis) -> tuple[float, dict]:
     """Score one hypothesis against all evidence. Returns (score, breakdown).
 
@@ -256,6 +299,11 @@ def score_hypothesis(evidence: list[dict], hypothesis: Hypothesis) -> tuple[floa
 
     if hypothesis.category == "memory_leak":
         signals[SOURCE_PROM] = 1 if _measured_memory_growth(usable) else 0
+    # Same reasoning for a slow query: the latency histogram's name is in every
+    # service's reading, so a keyword match on it passes any service. Only a
+    # measured, sustained p95 above the alert's threshold can.
+    if hypothesis.category == "slow_query":
+        signals[SOURCE_PROM] = 1 if _measured_slowdown(usable) else 0
 
     sources_supporting = sum(signals.values())
     agreement_bonus = AGREEMENT_BONUS if sources_supporting >= 2 else 0.0
@@ -292,6 +340,8 @@ def score_hypothesis(evidence: list[dict], hypothesis: Hypothesis) -> tuple[floa
     }
     if hypothesis.category == "memory_leak":
         breakdown["prometheus_signal_basis"] = "measured_memory_trend"
+    if hypothesis.category == "slow_query":
+        breakdown["prometheus_signal_basis"] = "measured_latency"
     return score, breakdown
 
 
