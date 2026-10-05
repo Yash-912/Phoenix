@@ -300,3 +300,217 @@ def test_forbidden_areas_name_dispatchers_toggles_and_tests_generically():
     assert "dispatcher" in joined
     assert "toggle" in joined
     assert "test" in joined
+
+
+# ---- nothing outside the target may change, except what the fix itself needs added
+
+MODULE = (
+    '"""Module docs that wrap\n'
+    'across two lines."""\n'
+    "\n"
+    "import os\n"
+    "\n"
+    "CAP = 100\n"
+    "\n"
+    "\n"
+    "class Store:\n"
+    '    """A store."""\n'
+    "    limit = 5\n"
+    "\n"
+    "    def put(self, k):\n"
+    "        return k\n"
+    "\n"
+    "\n"
+    "def helper(x):\n"
+    "    return x\n"
+    "\n"
+    "\n"
+    "def target(x):\n"
+    "    # keep this comment\n"
+    "    return helper(x)\n"
+)
+FIXED = MODULE.replace("    return helper(x)\n", "    return helper(x) + 1\n")
+
+
+def _outside(new: str, target: str = "target"):
+    assert new != MODULE
+    return _scope(PAYMENT_APP, MODULE, new, target=target)
+
+
+def test_a_fix_confined_to_the_target_function_is_accepted():
+    ok, reason = _outside(FIXED)
+
+    assert ok is True, reason
+
+
+def test_a_change_to_the_targets_own_comment_and_body_is_accepted():
+    new = MODULE.replace("    # keep this comment\n    return helper(x)\n", "    # reworded\n    return helper(x) * 2\n")
+
+    ok, reason = _outside(new)
+
+    assert ok is True, reason
+
+
+def test_a_fix_inside_a_method_leaves_its_class_alone_and_is_accepted():
+    new = MODULE.replace("        return k\n", "        return k + 1\n", 1)
+
+    ok, reason = _outside(new, target="Store.put")
+
+    assert ok is True, reason
+
+
+def test_an_import_the_target_uses_may_be_added():
+    new = FIXED.replace("import os\n", "import os\nimport functools\n").replace(
+        "return helper(x) + 1", "return functools.reduce(max, [helper(x)])"
+    )
+
+    ok, reason = _outside(new)
+
+    assert ok is True, reason
+
+
+def test_a_constant_the_target_uses_may_be_added():
+    new = FIXED.replace("CAP = 100\n", "CAP = 100\nLIMIT = 10\n").replace("helper(x) + 1", "helper(x) + LIMIT")
+
+    ok, reason = _outside(new)
+
+    assert ok is True, reason
+
+
+def test_a_helper_the_target_calls_may_be_added_with_its_blank_lines():
+    new = MODULE.replace("return helper(x)\n", "return _indexed(x)\n") + "\n\ndef _indexed(x):\n    return helper(x)\n"
+
+    ok, reason = _outside(new)
+
+    assert ok is True, reason
+
+
+def test_a_helper_may_be_added_before_the_target_too():
+    new = MODULE.replace("    return helper(x)\n", "    return _indexed(x)\n").replace(
+        "def target(x):", "def _indexed(x):\n    return helper(x)\n\n\ndef target(x):"
+    )
+    # only the target's own return line changes among the old lines
+    assert new.count("return _indexed(x)") == 1
+
+    ok, reason = _outside(new)
+
+    assert ok is True, reason
+
+
+def test_rewrapping_the_module_docstring_is_rejected_even_alongside_a_correct_fix():
+    new = FIXED.replace('"""Module docs that wrap\nacross two lines."""', '"""Module docs that wrap across two lines."""')
+
+    ok, reason = _outside(new)
+
+    assert ok is False
+    assert "outside the target function 'target'" in reason
+    assert "module docstring" in reason
+    assert "Module docs that wrap" in reason
+
+
+def test_a_whitespace_or_comment_only_change_elsewhere_is_rejected():
+    for new in (
+        FIXED.replace("import os\n", "import os  # needed\n"),
+        FIXED.replace("import os\n\nCAP", "import os\n\n\nCAP"),
+        FIXED.replace("CAP = 100\n", "CAP = 100   \n"),
+    ):
+        ok, reason = _outside(new)
+
+        assert ok is False, new
+        assert "outside the target function 'target'" in reason
+
+
+def test_an_unrelated_constant_change_is_rejected():
+    ok, reason = _outside(FIXED.replace("CAP = 100", "CAP = 200"))
+
+    assert ok is False
+    assert "CAP = 200" in reason
+
+
+def test_an_unrelated_import_removal_is_rejected():
+    ok, reason = _outside(FIXED.replace("import os\n\n", ""))
+
+    assert ok is False
+    assert "outside the target function 'target'" in reason
+
+
+def test_an_unrelated_class_attribute_or_docstring_change_is_rejected():
+    for new in (FIXED.replace("limit = 5", "limit = 6"), FIXED.replace('"""A store."""', '"""A cache."""')):
+        ok, reason = _outside(new)
+
+        assert ok is False, new
+        assert "outside the target function 'target'" in reason
+
+
+def test_an_unrelated_function_change_is_still_rejected_alongside_a_correct_fix():
+    ok, reason = _outside(FIXED.replace("def helper(x):\n    return x\n", "def helper(x):\n    return x + 0\n"))
+
+    assert ok is False
+    assert "helper" in reason
+
+
+def test_a_decoy_import_constant_or_helper_the_target_never_uses_is_rejected():
+    for added, expected in (
+        ("import json\n", "json"),
+        ("UNUSED = 1\n", "UNUSED"),
+        ("def _decoy():\n    return 1\n", "_decoy"),
+    ):
+        new = FIXED.replace("CAP = 100\n", "CAP = 100\n" + added)
+
+        ok, reason = _outside(new)
+
+        assert ok is False, added
+        assert expected in reason
+        assert "does not use" in reason
+
+
+def test_a_new_class_or_arbitrary_module_code_is_not_a_supporting_declaration():
+    for added in ("class Extra:\n    pass\n", "print('loaded')\n"):
+        new = FIXED.replace("CAP = 100\n", "CAP = 100\n" + added)
+
+        ok, reason = _outside(new)
+
+        assert ok is False, added
+        assert "outside the target function 'target'" in reason
+
+
+def test_an_addition_used_only_by_another_addition_must_still_be_reachable_from_the_target():
+    new = FIXED.replace("CAP = 100\n", "CAP = 100\nBASE = 1\nDERIVED = BASE + 1\n")
+
+    ok, reason = _outside(new)
+
+    assert ok is False
+    assert "does not use" in reason
+
+
+def _scope_real(path: str, old: str, new: str) -> tuple[bool, str]:
+    return _scope(path, old, new, target="_cache_store_unbounded")
+
+
+def test_the_module_docstring_rewrap_from_a_real_agent_patch_is_now_rejected():
+    """The shape of the Scenario 3 patch that passed the old gate: the right
+    eviction fix inside the target, plus a paragraph of the module docstring
+    re-wrapped. The fix alone is accepted; with the re-wrap it is not."""
+    path = "services/worker-service/app.py"
+    old = patch_tool.read_committed(path)["content"]
+    unbounded = "    with _cache_lock:\n        _cache[job_id] = result\n"
+    functional = old.replace(
+        unbounded,
+        "    with _cache_lock:\n"
+        "        if job_id not in _cache and len(_cache) >= _CACHE_MAX_SIZE:\n"
+        "            oldest_job_id = next(iter(_cache))\n"
+        "            del _cache[oldest_job_id]\n"
+        "        _cache[job_id] = result\n",
+        1,
+    )
+    paragraph = "the leak could never grow on its own the way a real production queue\nconsumer's cache would."
+    rewrapped = functional.replace(paragraph, paragraph.replace("queue\nconsumer", "queue consumer"), 1)
+    assert functional != old and rewrapped != functional
+
+    accepted, why = _scope_real(path, old, functional)
+    rejected, reason = _scope_real(path, old, rewrapped)
+
+    assert accepted is True, why
+    assert rejected is False
+    assert "outside the target function '_cache_store_unbounded'" in reason
+    assert "module docstring" in reason

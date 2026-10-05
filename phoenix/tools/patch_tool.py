@@ -18,6 +18,7 @@ worktree, in phoenix.tools.worktree_tool.
 from __future__ import annotations
 
 import ast
+import copy
 import difflib
 import re
 import subprocess
@@ -103,13 +104,132 @@ def function_exists(content: str, target_function: str | None) -> bool:
     return any(q.rsplit(".", 1)[-1] == name for q in _functions(tree))
 
 
+# The only module-level statements a fix may add. Anything else -- a class,
+# arbitrary code -- is not a supporting declaration for a function body.
+_ADDABLE = (ast.Import, ast.ImportFrom, ast.FunctionDef, ast.AsyncFunctionDef, ast.Assign, ast.AnnAssign)
+
+
+class _MaskTargets(ast.NodeTransformer):
+    """Replace every def named `name` with `pass`, so what is left of the module
+    is exactly the part a patch must not touch."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def visit_FunctionDef(self, node):
+        return ast.Pass() if node.name == self.name else self.generic_visit(node)
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+
+def _span(node: ast.AST) -> tuple[int, int]:
+    first = min([node.lineno, *(d.lineno for d in getattr(node, "decorator_list", []))])
+    return first, node.end_lineno
+
+
+def _bound_names(node: ast.AST) -> set[str]:
+    if isinstance(node, ast.Import):
+        return {a.asname or a.name.split(".")[0] for a in node.names}
+    if isinstance(node, ast.ImportFrom):
+        return {a.asname or a.name for a in node.names}
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return {node.name}
+    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+    return {n.id for t in targets for n in ast.walk(t) if isinstance(n, ast.Name)}
+
+
+def _used_names(nodes: list[ast.AST]) -> set[str]:
+    return {n.id for node in nodes for n in ast.walk(node) if isinstance(n, ast.Name)}
+
+
+def _outside_target_change(old_content, new_content, old_tree, new_tree, name, targets) -> str | None:
+    """Why the patch changes something other than the target, or None.
+
+    Every changed line has to be inside the target function, or inside a new
+    import, constant or helper that the target (directly, or through another new
+    declaration) actually uses. So a fix can bring along what it needs, and
+    nothing else moves: not a docstring, not a comment, not whitespace, not an
+    existing constant, class or import. The AST cannot see a comment or a blank
+    line, which is why the final comparison is on lines; it is the AST that says
+    which new statements count as additions and whether the fix uses them.
+    """
+    old_lines = old_content.splitlines()
+    new_lines = new_content.splitlines()
+    old_functions = _functions(old_tree)
+    new_functions = _functions(new_tree)
+    target_nodes = [new_functions[q] for q in targets]
+
+    masked_old = [ast.dump(s) for s in _MaskTargets(name).visit(copy.deepcopy(old_tree)).body]
+    masked_new = [ast.dump(s) for s in _MaskTargets(name).visit(copy.deepcopy(new_tree)).body]
+    added = []
+    for tag, _i1, _i2, j1, j2 in difflib.SequenceMatcher(None, masked_old, masked_new, autojunk=False).get_opcodes():
+        if tag == "insert":
+            added.extend(new_tree.body[j1:j2])
+    candidates = [s for s in added if isinstance(s, _ADDABLE)]
+
+    needed = _used_names(target_nodes)
+    kept: list[ast.AST] = []
+    grew = True
+    while grew:
+        grew = False
+        for statement in candidates:
+            if statement not in kept and _bound_names(statement) & needed:
+                kept.append(statement)
+                needed |= _used_names([statement])
+                grew = True
+    unused = [s for s in candidates if s not in kept]
+    if unused:
+        names = ", ".join(sorted(n for s in unused for n in _bound_names(s)))
+        return (
+            f"patch adds module-level {names} that the target function '{name}' does not use; "
+            f"only what the fix itself needs may be added"
+        )
+
+    allowed_old = {n for q in targets for n in range(_span(old_functions[q])[0], _span(old_functions[q])[1] + 1)}
+    allowed_new = {n for node in target_nodes for n in range(_span(node)[0], _span(node)[1] + 1)}
+    for statement in kept:
+        start, end = _span(statement)
+        allowed_new.update(range(start, end + 1))
+        row = start - 1
+        while row >= 1 and not new_lines[row - 1].strip():
+            allowed_new.add(row)
+            row -= 1
+        row = end + 1
+        while row <= len(new_lines) and not new_lines[row - 1].strip():
+            allowed_new.add(row)
+            row += 1
+
+    docstring = None
+    first = old_tree.body[0] if old_tree.body else None
+    if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant) and isinstance(first.value.value, str):
+        docstring = (first.lineno, first.end_lineno)
+
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, old_lines, new_lines, autojunk=False).get_opcodes():
+        if tag == "equal":
+            continue
+        old_bad = [n for n in range(i1 + 1, i2 + 1) if n not in allowed_old]
+        new_bad = [n for n in range(j1 + 1, j2 + 1) if n not in allowed_new]
+        if not old_bad and not new_bad:
+            continue
+        line_no = new_bad[0] if new_bad else old_bad[0]
+        text = (new_lines[line_no - 1] if new_bad else old_lines[line_no - 1]).strip() or "a blank line"
+        in_docstring = docstring and any(docstring[0] <= n <= docstring[1] for n in old_bad)
+        return (
+            f"patch changes lines outside the target function '{name}': line {line_no} `{text[:80]}`"
+            f"{' (the module docstring)' if in_docstring else ''}; only '{name}' may change, plus any "
+            f"import, constant or helper it needs, added without altering anything else"
+        )
+    return None
+
+
 def check_target_function(file_path: str, old_content: str, new_content: str, target_function: str | None) -> tuple[bool, str]:
     """The patch must change the investigation's target function and no other
     function. Compared on the AST, not on text, so reformatting or comments
     cannot disguise a change and a cosmetic rewrite of some other function
-    cannot pass as a fix. Module-level lines (imports, constants) and brand-new
-    helper functions are left alone: only a function that already existed can
-    be altered, and only the target may be.
+    cannot pass as a fix. Only the target may change, and the one thing allowed
+    alongside it is an addition the fix itself uses -- a new import, constant or
+    helper function that the target (or another such addition) refers to. Every
+    other line has to be exactly as it was: see _outside_target_change.
     """
     name = _normalise_target(target_function)
     if not name:
@@ -156,6 +276,9 @@ def check_target_function(file_path: str, old_content: str, new_content: str, ta
             f"patch also changes code outside the target function '{name}': {', '.join(altered)}; "
             f"only '{name}' may be changed"
         )
+    outside = _outside_target_change(old_content, new_content, old_tree, new_tree, name, targets)
+    if outside is not None:
+        return False, outside
     return True, f"only the target function '{name}' changed"
 
 
