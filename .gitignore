@@ -1,10 +1,22 @@
-.learn
+# Secrets: .env.example is the committed template
 .env
+.env.*
+!.env.example
+
+# Python
 agentic/
+.venv/
+venv/
 __pycache__/
 *.pyc
+.pytest_cache/
+.ruff_cache/
+
+# Local tooling and scratch state
+.learn
 .superpowers
-.pytest_cache
+.agents/
+.phoenix_worktrees/
 
 # Deployment history is lab runtime state, not source. Each real deployment
 # writes a marker here, so committing it would fill the log with one file per
