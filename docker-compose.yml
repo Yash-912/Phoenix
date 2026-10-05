@@ -192,11 +192,15 @@ services:
   postgres:
     image: postgres:16.4
     container_name: postgres
-    # Standard production slow-statement logging: any statement over 500ms is
+    # Standard production slow-statement logging: any statement over 200ms is
     # written to the server log, which promtail ships to Loki. This is what
     # lets an investigation corroborate a latency regression from the
     # database's own record of the slow statement, not just request timings.
-    command: ["postgres", "-c", "log_min_duration_statement=500"]
+    # 200ms rather than 500ms: the whole-table scan was first measured at about
+    # 2s and now runs in under 500ms of server time on a faster host, which
+    # logged nothing. A healthy indexed lookup takes about 10ms, so 200ms still
+    # leaves a wide margin and never logs the normal path.
+    command: ["postgres", "-c", "log_min_duration_statement=200"]
     environment:
       POSTGRES_USER: phoenix
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}

@@ -29,8 +29,8 @@ pytestmark = pytest.mark.skipif(
 PAYMENT_URL = "http://localhost:8003"
 ORDER_ID = "chaos-live-baseline"
 SAMPLES = 5
-# Postgres is started with log_min_duration_statement=500 (docker-compose.yml).
-SLOW_STATEMENT_MS = 500
+# Postgres is started with log_min_duration_statement=200 (docker-compose.yml).
+SLOW_STATEMENT_MS = 200
 
 
 def _timed_charge() -> float:
