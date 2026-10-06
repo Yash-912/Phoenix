@@ -60,6 +60,9 @@ def _cache_store_unbounded(job_id: str, result: dict) -> None:
     """The bug: never evicts. Every job this process has ever handled stays
     resident for the life of the process."""
     with _cache_lock:
+        if job_id not in _cache and len(_cache) >= _CACHE_MAX_SIZE:
+            oldest_job_id = next(iter(_cache))
+            del _cache[oldest_job_id]
         _cache[job_id] = result
 
 
