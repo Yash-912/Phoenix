@@ -108,7 +108,7 @@ def _samples(series: dict) -> list[tuple[float, float]]:
     return parsed
 
 
-def get_memory_trend(service_name: str) -> dict:
+def get_memory_trend(service_name: str, at: float | None = None) -> dict:
     """The measured trend of one service's resident memory over the alert's window.
 
     Read-only. A failed read, or a selector that matches more than one series,
@@ -120,7 +120,7 @@ def get_memory_trend(service_name: str) -> dict:
         return dict(UNAVAILABLE)
 
     window = TREND_WINDOW_MINUTES * 60
-    end = int(time.time())
+    end = int(at if at is not None else time.time())
     payload = query_prometheus_range(
         f'{MEMORY_METRIC}{{job="{service_name}"}}', end - window, end, TREND_STEP_SECONDS
     )
@@ -138,6 +138,26 @@ def get_memory_trend(service_name: str) -> dict:
     trend = summarize_memory_trend(_samples(results[0]))
     trend["window_seconds"] = window
     return trend
+
+
+def current_memory_state(service_name: str, at: float | None = None) -> dict:
+    """Is the service's memory still growing right now: present, absent, or unknown.
+
+    Judged on the same window and the same slope tolerance as the trend, but on the
+    recent half of it only: a leak that stopped, or was released by a restart, no
+    longer has a recent climb even though the window as a whole still shows growth.
+    A read that failed, or a series too short to judge, is unknown and never reads
+    as a leak having stopped.
+    """
+    trend = get_memory_trend(service_name, at=at)
+    recent = trend.get("recent_slope_bytes_per_s")
+    if trend.get("verdict") in ("unavailable", "insufficient_data") or recent is None:
+        return {"state": "unknown"}
+    return {
+        "state": "present" if recent > SLOPE_TOLERANCE else "absent",
+        "recent_slope_bytes_per_s": recent,
+        "tolerance_bytes_per_s": SLOPE_TOLERANCE,
+    }
 
 
 def query_prometheus_with_memory_trend(promql: str) -> dict:

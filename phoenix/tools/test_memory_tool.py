@@ -284,3 +284,39 @@ def test_an_unreadable_trend_leaves_the_original_read_intact(monkeypatch):
 
     assert result["data"]["result"][0]["value"][1] == "52113408"
     assert result["memory_trend"] == memory_tool.UNAVAILABLE
+
+
+# ---- is the growth still happening now? ----------------------------------------------------
+
+
+def _memory_payload(values: list[float], step: int = 60) -> dict:
+    return {"status": "success", "data": {"result": [{"metric": {}, "values": [[1000 + step * i, str(v)] for i, v in enumerate(values)]}]}}
+
+
+def _memory_state(monkeypatch, payload: dict) -> dict:
+    monkeypatch.setattr(memory_tool, "query_prometheus_range", lambda *a: payload)
+    return memory_tool.current_memory_state("svc")
+
+
+def test_memory_still_climbing_means_the_leak_is_present(monkeypatch):
+    values = [50_000_000 + 2_400_000 * i for i in range(31)]
+
+    assert _memory_state(monkeypatch, _memory_payload(values))["state"] == "present"
+
+
+def test_memory_that_has_stopped_climbing_means_the_leak_is_gone(monkeypatch):
+    values = [50_000_000 + 2_400_000 * i for i in range(15)] + [52_000_000] * 16
+
+    assert _memory_state(monkeypatch, _memory_payload(values))["state"] == "absent"
+
+
+def test_flat_memory_is_absent(monkeypatch):
+    assert _memory_state(monkeypatch, _memory_payload([52_000_000] * 31))["state"] == "absent"
+
+
+def test_too_few_samples_to_judge_is_unknown(monkeypatch):
+    assert _memory_state(monkeypatch, _memory_payload([1, 2, 3]))["state"] == "unknown"
+
+
+def test_a_failed_memory_read_is_unknown(monkeypatch):
+    assert _memory_state(monkeypatch, {"status": "error", "error": "boom"})["state"] == "unknown"

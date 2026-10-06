@@ -23,6 +23,7 @@ from phoenix.tools.deploy_tool import get_recent_deployments
 from phoenix.tools.docker_tool import get_container_state
 from phoenix.tools.health_tool import inspect_health
 from phoenix.tools.loki_tool import query_loki
+from phoenix.graph.symptom import blocks_action, current_symptom
 from phoenix.tools.latency_tool import query_prometheus_with_latency_measure
 
 
@@ -454,6 +455,45 @@ def _escalate(
     )
 
 
+def _check_symptom_before_acting(state: AgentState, category: str | None) -> Command | None:
+    """Stop the run if the symptom this finding describes is no longer observed.
+
+    The verifier will not report a recovery it did not observe; this will not act on
+    a symptom that is gone. A finding can be well supported by evidence that is real
+    and old -- a slowdown, a memory climb -- for a service that has since cleared, and
+    a restart or a patch for that repairs nothing. Only a clear absence stops the run:
+    a symptom that cannot be observed (no traffic, a failed read) is not one that is
+    gone, and the finding's evidence already had to overlap the incident's onset.
+
+    The run ends through the same escalation every other refusal here uses, with the
+    reason on the trail, rather than as resolved: nothing was observed to recover.
+    A category with no probe is not checked, and no row is written for it.
+    """
+    observed = current_symptom(category, state.service_name)
+    if observed.get("state") == "not_checked":
+        return None
+    if blocks_action(observed):
+        reason = (
+            f"the {category} symptom on {state.service_name} is no longer observed "
+            f"({_describe_observation(observed)}), so no action was taken on the earlier finding"
+        )
+        return _escalate(state, "symptom_cleared", reason, reason, extra={"symptom_check": observed})
+    record_audit(
+        state.incident_id,
+        "remediator",
+        "symptom_checked",
+        {"iteration": state.iteration, "category": category, "observed": observed},
+        f"the {category} symptom is {observed.get('state')} on {state.service_name}",
+    )
+    return None
+
+
+def _describe_observation(observed: dict) -> str:
+    """The numbers a probe measured, as a short phrase for the reason."""
+    parts = [f"{name}={value}" for name, value in observed.items() if name != "state"]
+    return ", ".join(parts) or "healthy on the latest reading"
+
+
 def _restart_already_applied(state: AgentState, plan, pre_action_signal) -> dict | None:
     """Evidence that repeating this action cannot free anything more, or None.
 
@@ -545,6 +585,15 @@ def remediator_node(state: AgentState) -> Command:
         )
 
     plan = plan_action(state)
+
+    # Before anything is read, restarted or handed to Tier 3: is there still a
+    # symptom to act on? A finding with no action to take has nothing to refuse.
+    top_category = state.hypotheses[0].hypothesis.category if state.hypotheses else None
+    if plan.available or is_tier3_eligible(top_category):
+        stopped = _check_symptom_before_acting(state, top_category)
+        if stopped is not None:
+            return stopped
+
     if not plan.available:
         category = state.hypotheses[0].hypothesis.category if state.hypotheses else None
         if is_tier3_eligible(category):
