@@ -340,3 +340,22 @@ def test_an_unknown_incident_time_is_a_gap_not_an_exclusion():
     _, bd = score_hypothesis(ev, Hypothesis(description="a slow query", category="slow_query"))
 
     assert bd["has_deploy_signal"] == 1
+
+
+def test_a_superseded_deployment_is_not_evidence_for_the_incident():
+    """A later marker replaced that state before the incident began, so it is history."""
+    ev = [_deployments(_marker("superseded"))]
+
+    score, bd = score_hypothesis(ev, Hypothesis(description="a slow query", category="slow_query"))
+
+    assert bd["has_deploy_signal"] == 0
+    assert score == 0.0
+
+
+def test_the_marker_that_superseded_it_is_still_read_as_the_state_in_effect():
+    ev = [_deployments(_marker("superseded"), _marker("before_incident", image_tag="healthy", git_commit="indexed", config={"slow_query": False}))]
+
+    _, bd = score_hypothesis(ev, Hypothesis(description="a slow query", category="slow_query"))
+
+    # The healthy marker carries no slow-query keyword, and the superseded one is gone.
+    assert bd["has_deploy_signal"] == 0

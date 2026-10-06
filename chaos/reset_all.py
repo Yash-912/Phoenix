@@ -6,7 +6,8 @@ import subprocess
 
 import requests
 
-from chaos import config_pool, deploy_bad_v18
+from chaos import config_pool, deploy_bad_v18, memory_leak, slow_query
+from chaos.lib import deploy_tracker
 from chaos.lib.deployer import DeploymentError
 
 # checkout-service is absent from this list on purpose. Its fault lives in the
@@ -15,11 +16,27 @@ from chaos.lib.deployer import DeploymentError
 # resets it by redeploying v17 through chaos/deploy_bad_v18.py, which is the same
 # operation a Tier 2 rollback performs.
 TARGETS = [
-    ("payment-service", "http://localhost:8003/chaos/slow/disable"),
     ("payment-service", "http://localhost:8003/chaos/blip/stop"),
-    ("worker-service", "http://localhost:8004/chaos/leak/stop"),
     ("api-gateway", "http://localhost:8005/chaos/heal"),
 ]
+
+# Faults whose injection wrote a deployment marker. Clearing the flag alone leaves
+# that marker as the newest word on the service's state, so the history keeps
+# saying the fault is on -- for an hour, to an investigation that reads it as the
+# active configuration. Each one is reverted through its own module, which clears
+# the flag and writes the marker that says so: (service, the config key the
+# injection set, the module's reset, the endpoint that clears the flag).
+RECORDED_FAULTS = [
+    ("payment-service", "slow_query", slow_query.reset, "http://localhost:8003/chaos/slow/disable"),
+    ("worker-service", "leak", memory_leak.reset, "http://localhost:8004/chaos/leak/stop"),
+]
+
+
+def _fault_on_record(service: str, key: str) -> bool:
+    """Whether the newest marker for the service says the fault is on."""
+    latest = deploy_tracker.get_recent_deployments(service, 1)
+    config = latest[0].get("config") if latest else None
+    return bool(isinstance(config, dict) and config.get(key))
 
 
 def _checkout_version() -> str | None:
@@ -42,6 +59,18 @@ def main() -> None:
             print(f"{name}: {r.status_code} {r.text[:80]}")
         except requests.RequestException as exc:
             print(f"{name}: FAILED {exc}")
+    for service, key, module_reset, endpoint in RECORDED_FAULTS:
+        try:
+            if _fault_on_record(service, key):
+                module_reset()  # clears the flag and records that it did
+                print(f"{service}: {key} reverted and recorded")
+            else:
+                # Nothing on record to supersede, so a marker would only be a no-op
+                # in the history the agent reads. The flag is still cleared.
+                r = requests.post(endpoint, timeout=5)
+                print(f"{service}: {r.status_code} {r.text[:80]}")
+        except requests.RequestException as exc:
+            print(f"{service}: FAILED {exc}")
     try:
         r = requests.post("http://localhost:8002/chaos/slow/disable", timeout=5)
         print(f"auth-service: {r.status_code}")

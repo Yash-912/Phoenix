@@ -605,7 +605,7 @@ def test_a_two_source_diagnosis_of_any_category_still_routes_straight_to_the_rem
     monkeypatch.setattr(graph, "record_audit", lambda *a: None)
     leader = Hypothesis(description="a query regression", category="slow_query")
     measured = _ev("query_prometheus", "http_request_duration_seconds p99 slow")
-    measured["raw_data"]["latency_measure"] = {"verdict": "sustained_slow", "sustained_slow": True}
+    measured["raw_data"]["latency_measure"] = {"verdict": "elevated_ongoing", "sustained_slow": True}
     evidence = [
         measured,
         _ev("query_loki", "duration: 1023.4 ms  statement: SELECT * FROM t"),

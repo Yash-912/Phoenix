@@ -8,8 +8,8 @@ import pytest
 from phoenix.graph.schemas import Hypothesis
 from phoenix.graph.scoring import CATEGORY_KEYWORDS, score_hypothesis
 
-SLOW_MEASURE = {"verdict": "sustained_slow", "sustained_slow": True, "samples": 40, "peak_p95_seconds": 2.4}
-NORMAL_MEASURE = {"verdict": "not_sustained_slow", "sustained_slow": False, "samples": 40, "peak_p95_seconds": 0.02}
+SLOW_MEASURE = {"verdict": "elevated_ongoing", "sustained_slow": True, "samples": 40, "peak_p95_seconds": 2.4}
+NORMAL_MEASURE = {"verdict": "within_threshold", "sustained_slow": False, "samples": 40, "peak_p95_seconds": 0.02}
 TOO_SHORT = {"verdict": "insufficient_data", "sustained_slow": False, "samples": 1}
 UNAVAILABLE = {"verdict": "unavailable", "sustained_slow": False}
 

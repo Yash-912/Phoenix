@@ -183,7 +183,7 @@ def _runtime_view(payload):
 # to the incident's onset. The two "unknown" verdicts are deliberately absent: a
 # gap in what the tool could read is not a ruling out, and treating it as one
 # would drop evidence the run has no way to replace.
-_RULED_OUT_BY_TIME = frozenset({"too_far_before", "after_incident"})
+_RULED_OUT_BY_TIME = frozenset({"too_far_before", "after_incident", "superseded"})
 
 
 def _in_scope_view(payload):
