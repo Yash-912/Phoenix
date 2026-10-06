@@ -1031,6 +1031,7 @@ def test_a_run_with_no_surviving_hypothesis_acts_on_nothing(monkeypatch):
 
 
 def test_a_successful_action_snapshots_the_signal_and_counts_the_attempt(monkeypatch):
+    monkeypatch.setattr(nodes, "current_symptom", lambda category, service: {"state": "present"})
     monkeypatch.setattr(verification, "read_signal", lambda category, service: SNAPSHOT)
     monkeypatch.setitem(
         dispatch.REMEDIATION_DISPATCH, "restart_service", lambda name: {"status": "ok"}
@@ -1055,6 +1056,7 @@ def test_the_snapshot_is_taken_before_the_action_not_after(monkeypatch):
     """The comparison is only meaningful against a reading from seconds ago, and
     an ordering bug here would quietly compare against a post-action value."""
     order: list[str] = []
+    monkeypatch.setattr(nodes, "current_symptom", lambda category, service: {"state": "present"})
     monkeypatch.setattr(
         verification, "read_signal", lambda c, s: (order.append("snapshot"), SNAPSHOT)[1]
     )

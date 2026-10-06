@@ -163,6 +163,62 @@ def test_the_check_comes_before_the_pre_action_snapshot(monkeypatch, audit):
     nodes.remediator_node(_leak_state())
 
 
+# ---- overload: real 5xx evidence from earlier is not a reason to restart a healthy service -----
+
+
+OVERLOAD = Hypothesis(description="the service is overloaded", category="overload")
+
+
+def _overload_state() -> AgentState:
+    return _confident(
+        OVERLOAD,
+        _item("query_prometheus", {"status": "success", "text": "HighErrorRate 5xx spike"}),
+        _item("query_loki", {"status": "success", "text": "traceback error rate 5xx"}),
+    )
+
+
+def _service_reads(monkeypatch, errors: str, latency: str, memory: str) -> None:
+    """The real overload probe, over signals the service reports as of now."""
+    from phoenix.tools import error_rate_tool, latency_tool, memory_tool
+
+    monkeypatch.setattr(error_rate_tool, "current_error_rate_state", lambda service: {"state": errors})
+    monkeypatch.setattr(latency_tool, "current_latency_state", lambda service: {"state": latency})
+    monkeypatch.setattr(memory_tool, "current_memory_state", lambda service: {"state": memory})
+
+
+def test_an_overload_whose_signals_are_all_gone_is_not_restarted(monkeypatch, audit):
+    restarted = _watch_restarts(monkeypatch)
+    _service_reads(monkeypatch, "absent", "absent", "absent")
+
+    command = nodes.remediator_node(_overload_state())
+
+    assert command.goto == END
+    assert restarted == []
+    assert command.update["status"] == "escalated"
+    assert "overload" in command.update["escalation_reason"]
+    assert "symptom_cleared" in [event for event, _, _ in audit]
+
+
+def test_an_overload_with_a_signal_still_present_is_restarted_as_before(monkeypatch, audit):
+    restarted = _watch_restarts(monkeypatch)
+    _service_reads(monkeypatch, "present", "absent", "absent")
+
+    command = nodes.remediator_node(_overload_state())
+
+    assert command.goto == "verifier"
+    assert restarted == [SERVICE]
+
+
+def test_an_overload_with_an_unreadable_signal_is_not_blocked(monkeypatch, audit):
+    restarted = _watch_restarts(monkeypatch)
+    _service_reads(monkeypatch, "absent", "unknown", "absent")
+
+    command = nodes.remediator_node(_overload_state())
+
+    assert command.goto == "verifier"
+    assert restarted == [SERVICE]
+
+
 # ---- categories with no probe behave exactly as they did -----------------------------------
 
 
