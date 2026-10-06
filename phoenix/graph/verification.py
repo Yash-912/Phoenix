@@ -418,6 +418,11 @@ def run_check(
             "signal": signal,
         }
 
+    if category == "overload":
+        outcome, detail = _check_overload(signal, before or {})
+        if outcome != OUTCOME_PASS:
+            return outcome, detail
+        return _confirm_overload_symptom(service_name, detail)
     if category in MEMORY_CATEGORIES:
         return _check_overload(signal, before or {})
     if category == "crash":
@@ -582,6 +587,58 @@ def _check_overload(signal: dict, before: dict) -> tuple[str, dict]:
         "reason": (
             f"working set fell from {int(before_bytes)} to {int(signal['bytes'])} "
             f"and is not climbing"
+        ),
+    }
+
+
+def _read_overload_symptom(service_name: str) -> dict:
+    """The service's 5xx ratio and p95 latency as of now: present, absent or unknown.
+
+    Imported here and not at the top: the tools behind it import this module for the
+    memory constants, so a module-level import would be a cycle. Memory is left out on
+    purpose; _check_overload has already judged it, and a restart empties it either way.
+    """
+    from phoenix.graph import symptom
+
+    return symptom.overload_symptom(service_name, signals=("error_rate", "latency"))
+
+
+def _confirm_overload_symptom(service_name: str, memory_detail: dict) -> tuple[str, dict]:
+    """A restart that freed memory has proved the restart, not the recovery.
+
+    Overload is the service failing requests or answering slowly. The working set comes
+    down after any restart, so a pass on memory alone credits a restart with a fix it
+    may not have made -- a service that is still returning 5xx was reported resolved.
+    The check passes only when the 5xx ratio and the p95 latency are both observed gone.
+    Either still present fails it, and a reading that cannot be had (no traffic, a failed
+    read) is inconclusive: this module reports only a recovery it saw.
+    """
+    try:
+        observed = _read_overload_symptom(service_name)
+    except Exception as exc:  # noqa: BLE001 - an unreadable symptom is a gap, not a crash
+        observed = {"state": "unknown", "signals": {}, "error": f"{type(exc).__name__}: {exc}"}
+    detail = {**memory_detail, "symptom": observed}
+    state = observed.get("state") if isinstance(observed, dict) else None
+
+    if state == "present":
+        return OUTCOME_FAIL, {
+            **detail,
+            "reason": (
+                f"{memory_detail['reason']}; but the service is still showing the overload "
+                f"symptom after the restart (5xx rate or p95 latency over its alert threshold), "
+                f"so the restart did not fix it"
+            ),
+        }
+    if state == "absent":
+        return OUTCOME_PASS, {
+            **detail,
+            "reason": f"{memory_detail['reason']}, and the 5xx rate and p95 latency are both back under their thresholds",
+        }
+    return OUTCOME_INCONCLUSIVE, {
+        **detail,
+        "reason": (
+            f"{memory_detail['reason']}, but the 5xx rate and p95 latency could not be observed "
+            f"after the restart (no traffic or an unreadable read), so recovery cannot be confirmed"
         ),
     }
 

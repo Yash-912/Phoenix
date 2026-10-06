@@ -51,6 +51,22 @@ def test_overload_with_no_signal_present_and_one_unreadable_is_unknown_not_absen
     assert _overload(monkeypatch, errors, latency, memory)["state"] == "unknown"
 
 
+def test_overload_symptom_can_be_limited_to_named_signals_and_reads_no_other(monkeypatch):
+    """The verifier asks about 5xx and latency only: memory has its own post-restart check."""
+    monkeypatch.setattr(error_rate_tool, "current_error_rate_state", lambda service: {"state": "absent"})
+    monkeypatch.setattr(latency_tool, "current_latency_state", lambda service: {"state": "absent"})
+
+    def boom(service):
+        raise AssertionError("memory was read")
+
+    monkeypatch.setattr(memory_tool, "current_memory_state", boom)
+
+    result = symptom.overload_symptom("svc", signals=("error_rate", "latency"))
+
+    assert result["state"] == "absent"
+    assert set(result["signals"]) == {"error_rate", "latency"}
+
+
 def test_overload_reports_what_each_signal_read(monkeypatch):
     result = _overload(monkeypatch, "absent", "absent", "absent")
 

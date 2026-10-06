@@ -27,13 +27,19 @@ NOT_CHECKED = {"state": "not_checked"}
 
 # Looked up through the module at call time, so the probes are the tools' own
 # current functions and nothing is copied here.
-def _overload_probe(service: str, at: float | None = None) -> dict:
+OVERLOAD_SIGNALS = ("error_rate", "latency", "memory")
+
+
+def overload_symptom(service: str, at: float | None = None, signals: tuple = OVERLOAD_SIGNALS) -> dict:
     """Is any of overload's signals -- 5xx, slowness, memory growth -- there now?
 
     An overload finding can rest on any one of them, so the finding is stale only when
     all of them are clearly gone. One present signal is enough to act on; a signal that
     cannot be read leaves the answer unknown rather than absent, because a gone error
     spike next to an unreadable latency read is not evidence that the load has cleared.
+
+    `signals` narrows which are read. The verifier asks about 5xx and latency only: the
+    working set has its own check after a restart, and a restart empties it either way.
     """
     readers = {
         "error_rate": lambda: error_rate_tool.current_error_rate_state(service)
@@ -43,22 +49,24 @@ def _overload_probe(service: str, at: float | None = None) -> dict:
         "memory": lambda: memory_tool.current_memory_state(service)
         if at is None else memory_tool.current_memory_state(service, at=at),
     }
-    signals = {}
+    read_signals = {}
     for name, read in readers.items():
+        if name not in signals:
+            continue
         try:
             result = read()
         except Exception:  # noqa: BLE001 - an unreadable signal is unknown, as for any probe
             result = None
         state = result.get("state") if isinstance(result, dict) else None
-        signals[name] = result if state in STATES else {"state": "unknown"}
-    states = {signal["state"] for signal in signals.values()}
+        read_signals[name] = result if state in STATES else {"state": "unknown"}
+    states = {signal["state"] for signal in read_signals.values()}
     if "present" in states:
         state = "present"
-    elif "unknown" in states:
+    elif "unknown" in states or not states:
         state = "unknown"
     else:
         state = "absent"
-    return {"state": state, "signals": signals}
+    return {"state": state, "signals": read_signals}
 
 
 PROBES = {
@@ -68,7 +76,7 @@ PROBES = {
     "memory_leak": lambda service, at=None: (
         memory_tool.current_memory_state(service) if at is None else memory_tool.current_memory_state(service, at=at)
     ),
-    "overload": _overload_probe,
+    "overload": overload_symptom,
 }
 
 

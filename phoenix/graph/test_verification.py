@@ -14,6 +14,19 @@ STARTED_BEFORE = "2026-09-30T09:00:00Z"
 STARTED_AFTER = "2026-09-30T10:00:30Z"
 
 
+# The real symptom reader, kept so the one test of its wiring can put it back.
+_REAL_READ_OVERLOAD_SYMPTOM = getattr(verification, "_read_overload_symptom", None)
+
+
+@pytest.fixture(autouse=True)
+def _overload_symptom_is_gone_unless_a_test_says_otherwise(monkeypatch):
+    """The overload check reads 5xx and latency from Prometheus; no test here may reach a real one."""
+    monkeypatch.setattr(
+        verification, "_read_overload_symptom",
+        lambda service: {"state": "absent", "signals": {"error_rate": {"state": "absent"}, "latency": {"state": "absent"}}},
+    )
+
+
 def _series(value: str, name: str = MEMORY_PROMQL) -> dict:
     """The shape query_prometheus actually returns: a raw instant vector whose
     sample value is a string, because that is what Prometheus's JSON encodes."""
@@ -320,6 +333,105 @@ def test_memory_that_dropped_and_then_started_climbing_again_fails(monkeypatch):
 
     assert outcome == "fail"
     assert "slope" in detail["reason"]
+
+
+# --- overload: a restart always frees memory, so the symptom has to be gone too -------------
+#
+# A restart empties a process whatever was wrong with the service, so a working set that
+# came down proves the restart happened and nothing else. An overload is the service
+# failing requests or answering slowly; recovery is those two being observed gone.
+
+
+def _symptom(state: str) -> dict:
+    return {"state": state, "signals": {"error_rate": {"state": state}, "latency": {"state": state}}}
+
+
+def _overload_after_a_good_restart(monkeypatch, symptom_state: str, reads: list | None = None):
+    monkeypatch.setattr(verification, "query_prometheus", _prom(400_000_000, slope=0.0))
+
+    def read(service):
+        if reads is not None:
+            reads.append(service)
+        return _symptom(symptom_state)
+
+    monkeypatch.setattr(verification, "_read_overload_symptom", read)
+    return verification.run_check("overload", SERVICE, {"bytes": BEFORE_BYTES, "slope": 0.0}, ACTION_AT)
+
+
+def test_a_restart_that_freed_memory_but_left_the_errors_does_not_verify(monkeypatch):
+    """The live Scenario 5 failure: the working set dropped, the 5xx never did, and it was called resolved."""
+    outcome, detail = _overload_after_a_good_restart(monkeypatch, "present")
+
+    assert outcome == "fail"
+    assert "still" in detail["reason"] and "5xx" in detail["reason"]
+    assert detail["symptom"]["state"] == "present"
+
+
+def test_a_restart_that_freed_memory_and_cleared_the_symptom_passes(monkeypatch):
+    outcome, detail = _overload_after_a_good_restart(monkeypatch, "absent")
+
+    assert outcome == "pass"
+    assert detail["symptom"]["state"] == "absent"
+    assert detail["before"] == BEFORE_BYTES and detail["after"] == 400_000_000
+
+
+def test_a_symptom_that_cannot_be_observed_after_the_restart_is_inconclusive_not_a_pass(monkeypatch):
+    """No traffic is not recovery: the verifier reports only a recovery it saw."""
+    outcome, detail = _overload_after_a_good_restart(monkeypatch, "unknown")
+
+    assert outcome == "inconclusive"
+    assert "could not be observed" in detail["reason"]
+
+
+def test_a_symptom_probe_that_raises_is_inconclusive_not_a_crashed_check(monkeypatch):
+    monkeypatch.setattr(verification, "query_prometheus", _prom(400_000_000, slope=0.0))
+
+    def boom(service):
+        raise RuntimeError("prometheus exploded")
+
+    monkeypatch.setattr(verification, "_read_overload_symptom", boom)
+
+    outcome, _ = verification.run_check("overload", SERVICE, {"bytes": BEFORE_BYTES, "slope": 0.0}, ACTION_AT)
+
+    assert outcome == "inconclusive"
+
+
+def test_a_memory_check_that_already_failed_does_not_read_the_symptom(monkeypatch):
+    reads: list = []
+    monkeypatch.setattr(verification, "query_prometheus", _prom(880_000_000, slope=0.0))
+    monkeypatch.setattr(verification, "_read_overload_symptom", lambda service: reads.append(service) or _symptom("absent"))
+
+    outcome, _ = verification.run_check("overload", SERVICE, {"bytes": BEFORE_BYTES, "slope": 0.0}, ACTION_AT)
+
+    assert outcome == "fail"
+    assert reads == []
+
+
+def test_a_memory_leak_restart_is_still_graded_on_memory_alone(monkeypatch):
+    """memory_leak shares the memory check; only overload gains the symptom requirement."""
+    reads: list = []
+    monkeypatch.setattr(verification, "query_prometheus", _prom(400_000_000, slope=0.0))
+    monkeypatch.setattr(verification, "_read_overload_symptom", lambda service: reads.append(service) or _symptom("present"))
+
+    outcome, _ = verification.run_check("memory_leak", SERVICE, {"bytes": BEFORE_BYTES, "slope": 0.0}, ACTION_AT)
+
+    assert outcome == "pass"
+    assert reads == []
+
+
+def test_the_symptom_is_read_from_the_error_rate_and_latency_tools_and_not_from_memory(monkeypatch):
+    from phoenix.tools import error_rate_tool, latency_tool, memory_tool
+
+    monkeypatch.setattr(verification, "query_prometheus", _prom(400_000_000, slope=0.0))
+    monkeypatch.setattr(verification, "_read_overload_symptom", _REAL_READ_OVERLOAD_SYMPTOM)
+    monkeypatch.setattr(error_rate_tool, "current_error_rate_state", lambda service: {"state": "present", "latest_error_ratio": 0.9})
+    monkeypatch.setattr(latency_tool, "current_latency_state", lambda service: {"state": "absent"})
+    monkeypatch.setattr(memory_tool, "current_memory_state", lambda service: (_ for _ in ()).throw(AssertionError("memory read")))
+
+    outcome, detail = verification.run_check("overload", SERVICE, {"bytes": BEFORE_BYTES, "slope": 0.0}, ACTION_AT)
+
+    assert outcome == "fail"
+    assert detail["symptom"]["signals"]["error_rate"]["latest_error_ratio"] == 0.9
 
 
 # --- crash: this action restarted it, and it is healthy now -------------------
