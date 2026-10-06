@@ -10,6 +10,7 @@ os.environ.setdefault("LLM_BASE_URL", "http://localhost:1/v1")
 os.environ.setdefault("LLM_API_KEY", "test-key")
 os.environ.setdefault("LLM_MODEL", "test-model")
 
+import pytest
 from langgraph.graph import END
 
 import phoenix.graph.tier3_nodes as tier3_nodes
@@ -392,6 +393,120 @@ def test_pr_opener_never_fabricates_success_and_never_merges(monkeypatch):
     assert update["tier3_status"] == "pr_opened"
     assert update["pr_result"]["url"] == real_url
     assert discarded == [("/fake/path", "phoenix/test-x")]
+
+
+# --- pr_opener_node idempotency -------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _no_open_duplicate_by_default(monkeypatch):
+    """The lookup shells out to gh; no test here may reach the real repo."""
+    monkeypatch.setattr(tier3_nodes, "find_open_duplicate", lambda *a, **k: {"status": "ok", "duplicate": None})
+    monkeypatch.setattr(tier3_nodes, "comment_on_pull_request", lambda *a, **k: {"status": "ok"})
+
+
+EXISTING = {"number": 25, "url": "https://github.com/Yash-912/Phoenix/pull/25", "branch": "phoenix/older"}
+FINAL_DIFF = "diff --git a/services/payment-service/app.py b/services/payment-service/app.py\n@@ -1 +1 @@\n-a\n+b\n"
+
+
+def _opener_state():
+    return _state(
+        incident_id=9,
+        patch_validation={"scope_ok": True, "applied": True, "tests_passed": True, "lint_passed": True,
+                          "diff_valid": True, "commit_sha": "a" * 40, "final_diff": FINAL_DIFF},
+        patch_candidate={"file_path": "services/payment-service/app.py", "rationale": "fix", "changed_lines": 2, "hunks": 1},
+        worktree_branch="phoenix/test-x", worktree_path="/fake/path",
+    )
+
+
+def _opener_wiring(monkeypatch):
+    rows, created, discarded, comments = [], [], [], []
+    monkeypatch.setattr(tier3_nodes, "record_audit", lambda incident, node, event, detail, text: rows.append((event, detail)))
+    monkeypatch.setattr(tier3_nodes, "open_pull_request", lambda *a, **k: (created.append(a), {"status": "ok", "url": "https://github.com/x/y/pull/99", "branch": a[0], "base": "main"})[1])
+    monkeypatch.setattr(tier3_nodes.worktree_tool, "discard_worktree", lambda p, b: discarded.append((p, b)))
+    monkeypatch.setattr(tier3_nodes, "comment_on_pull_request", lambda number, body: (comments.append((number, body)), {"status": "ok"})[1])
+    return rows, created, discarded, comments
+
+
+def test_a_change_an_open_pr_already_carries_opens_no_second_pr(monkeypatch):
+    rows, created, discarded, comments = _opener_wiring(monkeypatch)
+    monkeypatch.setattr(tier3_nodes, "find_open_duplicate", lambda *a, **k: {"status": "ok", "duplicate": EXISTING})
+
+    command = tier3_nodes.pr_opener_node(_opener_state())
+    update = _update(command)
+
+    assert created == []
+    assert command.goto == END
+    assert update["status"] == "pr_exists"
+    assert update["tier3_status"] == "pr_exists"
+    assert update["pr_result"]["url"] == EXISTING["url"]
+    assert update["pr_result"]["duplicate_of"] == 25
+    assert discarded == [("/fake/path", "phoenix/test-x")]
+
+
+def test_the_existing_pr_is_commented_on_and_the_audit_trail_records_it(monkeypatch):
+    rows, created, discarded, comments = _opener_wiring(monkeypatch)
+    monkeypatch.setattr(tier3_nodes, "find_open_duplicate", lambda *a, **k: {"status": "ok", "duplicate": EXISTING})
+
+    tier3_nodes.pr_opener_node(_opener_state())
+
+    assert [number for number, _ in comments] == [25]
+    assert "incident #9" in comments[0][1]
+    events = [event for event, _ in rows]
+    assert "pr_duplicate" in events
+    assert "pr_result" not in events
+    detail = dict(rows)["pr_duplicate"]
+    assert detail["existing_pr"] == EXISTING and detail["comment"] == {"status": "ok"}
+
+
+def test_a_failed_comment_does_not_undo_the_decision_not_to_duplicate(monkeypatch):
+    rows, created, discarded, comments = _opener_wiring(monkeypatch)
+    monkeypatch.setattr(tier3_nodes, "find_open_duplicate", lambda *a, **k: {"status": "ok", "duplicate": EXISTING})
+    monkeypatch.setattr(tier3_nodes, "comment_on_pull_request", lambda *a: {"status": "error", "error": "no permission"})
+
+    command = tier3_nodes.pr_opener_node(_opener_state())
+
+    assert created == []
+    assert _update(command)["status"] == "pr_exists"
+    assert dict(rows)["pr_duplicate"]["comment"]["error"] == "no permission"
+
+
+def test_the_duplicate_check_is_made_on_the_real_committed_diff(monkeypatch):
+    _opener_wiring(monkeypatch)
+    seen = []
+    monkeypatch.setattr(tier3_nodes, "find_open_duplicate", lambda diff: (seen.append(diff), {"status": "ok", "duplicate": None})[1])
+
+    tier3_nodes.pr_opener_node(_opener_state())
+
+    assert seen == [FINAL_DIFF]
+
+
+def test_with_no_duplicate_the_pr_is_opened_as_before(monkeypatch):
+    rows, created, discarded, comments = _opener_wiring(monkeypatch)
+
+    update = _update(tier3_nodes.pr_opener_node(_opener_state()))
+
+    assert len(created) == 1 and comments == []
+    assert update["status"] == "pr_opened"
+
+
+def test_a_failed_lookup_still_opens_the_pr_and_says_the_check_failed(monkeypatch):
+    rows, created, discarded, comments = _opener_wiring(monkeypatch)
+    monkeypatch.setattr(tier3_nodes, "find_open_duplicate", lambda *a, **k: {"status": "error", "error": "gh down"})
+
+    update = _update(tier3_nodes.pr_opener_node(_opener_state()))
+
+    assert len(created) == 1
+    assert update["status"] == "pr_opened"
+    assert dict(rows)["pr_duplicate_check_failed"]["error"] == "gh down"
+
+
+def test_a_pr_that_fails_validation_never_reaches_the_duplicate_check(monkeypatch):
+    monkeypatch.setattr(tier3_nodes, "record_audit", lambda *a, **k: None)
+    monkeypatch.setattr(tier3_nodes, "find_open_duplicate", lambda *a, **k: (_ for _ in ()).throw(AssertionError("looked up")))
+    state = _state(patch_validation={"scope_ok": True, "applied": True, "tests_passed": False, "lint_passed": True, "diff_valid": True})
+
+    assert _update(tier3_nodes.pr_opener_node(state))["tier3_status"] == "pr_failed"
 
 
 # --- structural hard safety boundary --------------------------------------

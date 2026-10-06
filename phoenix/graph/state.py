@@ -63,6 +63,10 @@ class AgentState(BaseModel):
         # closed incident: PRD section 6 requires it to stop for human
         # review, and "resolved" would read as nothing further being needed.
         "tier3_investigating", "pr_opened",
+        # Tier 3 found the fix an open PR already proposes. Terminal and distinct
+        # from "pr_opened": nothing new was opened, and the existing PR is the one
+        # awaiting human review.
+        "pr_exists",
         # Terminal. The run investigated, found no hypothesis two independent
         # sources support, and stopped learning. Kept distinct from "escalated"
         # because it is a correct outcome, not a failure or a spent budget: the
@@ -86,7 +90,7 @@ class AgentState(BaseModel):
     # rejection must not look like a Tier 1 action failure in the trail.
     tier3_status: Literal[
         "not_started", "investigating", "no_defect_found", "patch_generated",
-        "patch_rejected", "validated", "validation_failed", "pr_opened", "pr_failed",
+        "patch_rejected", "validated", "validation_failed", "pr_opened", "pr_exists", "pr_failed",
     ] = "not_started"
     tier3_iteration: int = 0
     max_tier3_iterations: int = Field(

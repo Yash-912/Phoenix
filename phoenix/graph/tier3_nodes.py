@@ -22,7 +22,7 @@ from phoenix.graph.persist import record_audit
 from phoenix.graph.schemas import PatchTarget
 from phoenix.graph.state import AgentState
 from phoenix.tools import git_tool, patch_tool, repo_tool, test_runner_tool, worktree_tool
-from phoenix.tools.github_tool import open_pull_request
+from phoenix.tools.github_tool import comment_on_pull_request, find_open_duplicate, open_pull_request
 
 TIER3_DESTINATIONS: tuple[str, ...] = ("patch_generator", "patch_validator", "pr_opener", END)
 
@@ -451,6 +451,41 @@ def pr_opener_node(state: AgentState) -> Command:
         f"{(validation.get('final_diff') or '')[:5000]}\n"
         "```"
     )
+
+    # A recurring incident arrives with the same fix an open PR already proposes.
+    # Opening it again only makes the reviewer read it twice; the existing PR is
+    # told it happened again instead. A lookup that fails is not an answer of "no
+    # duplicate", so it is recorded, and the PR is opened as it always was.
+    lookup = find_open_duplicate(validation.get("final_diff") or "")
+    existing = lookup.get("duplicate") if lookup.get("status") == "ok" else None
+    if lookup.get("status") != "ok":
+        record_audit(
+            state.incident_id, "pr_opener", "pr_duplicate_check_failed", {"error": lookup.get("error")},
+            "could not check for an existing PR with this change; opening one",
+        )
+    if existing:
+        comment = comment_on_pull_request(
+            existing["number"],
+            f"Phoenix produced this same fix again for incident #{state.incident_id} "
+            f"({state.service_name}), so no new PR was opened. The fault recurred; "
+            f"this PR is still the open proposal.",
+        )
+        record_audit(
+            state.incident_id, "pr_opener", "pr_duplicate",
+            {"existing_pr": existing, "comment": comment, "branch": state.worktree_branch},
+            f"an open PR (#{existing['number']}) already carries this change; no new PR opened",
+        )
+        if state.worktree_path:
+            worktree_tool.discard_worktree(state.worktree_path, state.worktree_branch)
+        _say(f"[pr_opener] {existing['url']} already carries this change -> no new PR, STOP for human review")
+        return Command(
+            goto=END,
+            update={
+                "status": "pr_exists", "tier3_status": "pr_exists",
+                "pr_result": {"status": "exists", "url": existing["url"], "duplicate_of": existing["number"],
+                              "branch": existing.get("branch")},
+            },
+        )
 
     result = open_pull_request(state.worktree_branch, title, body, base=worktree_tool.current_branch() or PR_BASE_BRANCH)
     record_audit(state.incident_id, "pr_opener", "pr_result", {"result": result}, None)
