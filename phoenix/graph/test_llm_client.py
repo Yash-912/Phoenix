@@ -426,3 +426,42 @@ def test_the_observer_is_told_there_is_no_or_between_line_filters():
     text = _logql_description()
 
     assert "no 'or'" in text and "|~" in text
+
+
+# ---- sampling is not left to the provider's default ---------------------------------------
+
+
+def test_the_observer_asks_for_deterministic_sampling(monkeypatch):
+    """With no temperature the provider's default applies, so the same incident could be
+    read differently from one run to the next for no reason in the evidence."""
+    recorded = _stub_completions(monkeypatch)
+
+    llm_client.decide_tool_calls("svc", [], [])
+
+    assert recorded[0]["temperature"] == 0
+
+
+def test_the_sampling_temperature_is_a_single_named_zero():
+    assert llm_client.TEMPERATURE == 0
+
+
+def test_every_model_call_in_the_module_passes_the_temperature():
+    """A structural guard: a call added later cannot silently go back to the default."""
+    import ast
+    import pathlib
+
+    tree = ast.parse(pathlib.Path(llm_client.__file__).read_text(encoding="utf-8"))
+    calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        and node.func.attr in ("create", "parse")
+        and any(kw.arg == "model" for kw in node.keywords)
+    ]
+    missing = [
+        node.lineno for node in calls
+        if not any(kw.arg == "temperature" and isinstance(kw.value, ast.Name) and kw.value.id == "TEMPERATURE"
+                   for kw in node.keywords)
+    ]
+
+    assert len(calls) >= 7
+    assert missing == []

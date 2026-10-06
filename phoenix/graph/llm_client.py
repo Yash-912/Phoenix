@@ -68,6 +68,12 @@ MAX_RESULT_CHARS = 2500
 # tokens consume first, which cuts a reply off mid-JSON on a large prompt.
 MAX_OUTPUT_TOKENS = 8192
 
+# Sampling is fixed, not left to the provider's default. Every decision this module
+# asks for is read against evidence that has not changed, so a different answer on
+# the next call is variance with no cause in the evidence. Deterministic sampling
+# narrows that; it does not make a model call repeatable, and nothing here assumes it does.
+TEMPERATURE = 0
+
 
 TIER3_RESULT_CHARS = 14000
 
@@ -283,7 +289,7 @@ def decide_tool_calls(
         )
 
     response = client.chat.completions.create(
-        model=LLM_MODEL,
+        model=LLM_MODEL, temperature=TEMPERATURE,
         max_tokens=MAX_OUTPUT_TOKENS,
         messages=[
             {
@@ -406,7 +412,7 @@ def decide_hypotheses(
 
     try:
         completion = client.beta.chat.completions.parse(
-            model=LLM_MODEL,
+            model=LLM_MODEL, temperature=TEMPERATURE,
             messages=messages,
             response_format=DiagnoserOutput,
         )
@@ -433,7 +439,7 @@ def decide_hypotheses(
 
     try:
         fallback = client.chat.completions.create(
-            model=LLM_MODEL,
+            model=LLM_MODEL, temperature=TEMPERATURE,
             max_tokens=MAX_OUTPUT_TOKENS,
             messages=[
                 *messages,
@@ -575,7 +581,7 @@ def decide_code_investigation_calls(
     ]
 
     response = client.chat.completions.create(
-        model=LLM_MODEL,
+        model=LLM_MODEL, temperature=TEMPERATURE,
         max_tokens=MAX_OUTPUT_TOKENS,
         messages=[
             {
@@ -669,7 +675,7 @@ def decide_defect(service_name: str, hypothesis_description: str, evidence: list
     tokens = 0
     try:
         completion = client.beta.chat.completions.parse(
-            model=LLM_MODEL, messages=messages, response_format=CodeDefect,
+            model=LLM_MODEL, temperature=TEMPERATURE, messages=messages, response_format=CodeDefect,
         )
     except (
         BadRequestError, NotFoundError, UnprocessableEntityError,
@@ -688,7 +694,7 @@ def decide_defect(service_name: str, hypothesis_description: str, evidence: list
 
     try:
         fallback = client.chat.completions.create(
-            model=LLM_MODEL,
+            model=LLM_MODEL, temperature=TEMPERATURE,
             max_tokens=MAX_OUTPUT_TOKENS,
             messages=[
                 *messages,
@@ -793,7 +799,7 @@ def decide_patch(old_content: str, target: PatchTarget, feedback: str | None = N
     ]
 
     try:
-        response = client.chat.completions.create(model=LLM_MODEL, messages=messages, max_tokens=MAX_OUTPUT_TOKENS)
+        response = client.chat.completions.create(model=LLM_MODEL, temperature=TEMPERATURE, messages=messages, max_tokens=MAX_OUTPUT_TOKENS)
     except OpenAIError as exc:
         print(f"[llm_client] patch generation failed, LLM call failed: {exc}")
         return PatchDecision(None, 0)
