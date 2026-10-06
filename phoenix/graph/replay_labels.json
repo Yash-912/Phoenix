@@ -1,0 +1,137 @@
+{
+ "63": {
+  "expect": "ambiguous",
+  "note": "first ambiguous run; scored on a stale deployment marker"
+ },
+ "64": {
+  "expect": "ambiguous",
+  "note": "ambiguous run after the first scorer fix"
+ },
+ "65": {
+  "expect": "ambiguous",
+  "note": "ambiguous run that ended insufficient_evidence"
+ },
+ "66": {
+  "expect": "deploy",
+  "note": "bad deploy, rolled back and resolved"
+ },
+ "67": {
+  "expect": "config",
+  "note": "config regression triggered by a manual webhook, no symptom (original run never reached 0.75: evidence-limited)",
+  "strict": false
+ },
+ "68": {
+  "expect": "config",
+  "note": "config regression, first real-load run (original run never reached 0.75: evidence-limited)",
+  "strict": false
+ },
+ "69": {
+  "expect": "config",
+  "note": "config regression, real alert, rolled back"
+ },
+ "70": {
+  "expect": "slow_query",
+  "note": "slow query, PR opened (the run never read the latency histogram, so there is nothing to measure)",
+  "strict": false
+ },
+ "71": {
+  "expect": "memory_leak",
+  "note": "memory leak, restart then PR"
+ },
+ "75": {
+  "expect": "ambiguous",
+  "note": "ambiguous run contaminated by chaos reset access-log lines"
+ },
+ "76": {
+  "expect": "ambiguous",
+  "note": "ambiguous run, token budget"
+ },
+ "77": {
+  "expect": "deploy",
+  "note": "bad deploy, stopped at 0.50 (original run never reached 0.75: evidence-limited)",
+  "strict": false
+ },
+ "78": {
+  "expect": "config",
+  "note": "config regression, resolved"
+ },
+ "79": {
+  "expect": "slow_query",
+  "note": "slow query, PR opened"
+ },
+ "80": {
+  "expect": "memory_leak",
+  "note": "memory leak, Tier 3 could not pin a file"
+ },
+ "81": {
+  "expect": "ambiguous",
+  "note": "ambiguous run"
+ },
+ "82": {
+  "expect": "deploy",
+  "note": "bad deploy, invalid LogQL (original run never reached 0.75: evidence-limited)",
+  "strict": false
+ },
+ "84": {
+  "expect": "ambiguous",
+  "note": "matrix round 1 s5"
+ },
+ "85": {
+  "expect": "deploy",
+  "note": "matrix round 1 s1 (original run never reached 0.75: evidence-limited)",
+  "strict": false
+ },
+ "86": {
+  "expect": "config",
+  "note": "matrix round 1 s4"
+ },
+ "87": {
+  "expect": "slow_query",
+  "note": "matrix round 1 s2"
+ },
+ "88": {
+  "expect": "memory_leak",
+  "note": "matrix round 1 s3"
+ },
+ "89": {
+  "expect": "ambiguous",
+  "note": "matrix round 2 s5"
+ },
+ "90": {
+  "expect": "deploy",
+  "note": "matrix round 2 s1 (original run never reached 0.75: evidence-limited)",
+  "strict": false
+ },
+ "91": {
+  "expect": "config",
+  "note": "matrix round 2 s4"
+ },
+ "92": {
+  "expect": "slow_query",
+  "note": "matrix round 2 s2"
+ },
+ "93": {
+  "expect": "memory_leak",
+  "note": "matrix round 2 s3"
+ },
+ "94": {
+  "expect": "ambiguous",
+  "note": "matrix round 3 s5"
+ },
+ "95": {
+  "expect": "deploy",
+  "note": "matrix round 3 s1"
+ },
+ "96": {
+  "expect": "config",
+  "note": "matrix round 3 s4"
+ },
+ "97": {
+  "expect": "slow_query",
+  "note": "matrix round 3 s2"
+ },
+ "98": {
+  "expect": "ambiguous",
+  "note": "matrix round 4 s5"
+ }
+}
