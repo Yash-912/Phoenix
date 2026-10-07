@@ -585,6 +585,19 @@ def _repo_context_text(service_name: str, context: dict | None) -> str:
     return text
 
 
+# What counts as the defect. Without it the investigator reads a dispatcher that
+# picks between a good and a defective implementation, concludes the flag's
+# default is wrong, and names the dispatcher: a target the patch generator is
+# forbidden to touch, so every patch is rejected and the run ends with no fix.
+_SCAFFOLDING_GUIDANCE = (
+    " A feature flag, toggle or test switch that selects between a good and a defective "
+    "implementation is scaffolding, not the defect, and neither is the function that "
+    "dispatches on it. Name the implementation that does the defective work, and describe "
+    "a fix that corrects what that code does; never propose to flip, default or reverse a "
+    "flag or a branch."
+)
+
+
 def decide_code_investigation_calls(
     service_name: str, hypothesis_description: str, evidence_so_far: list[dict], repo_context: dict | None = None
 ) -> ToolCallDecision:
@@ -622,6 +635,7 @@ def decide_code_investigation_calls(
                     "hit only locates code and does not show what it does. Each earlier "
                     "result is included below. Call only the tools you genuinely need next; "
                     "reply with no tool calls once you have read enough to name the defect."
+                    + _SCAFFOLDING_GUIDANCE
                     + _repo_context_text(service_name, repo_context)
                 ),
             },
@@ -691,6 +705,7 @@ def decide_defect(service_name: str, hypothesis_description: str, evidence: list
                 "is, and the minimal change that fixes it inside that function -- describe the "
                 "fix, do not write code. If the evidence does not pin down one file and one "
                 "function, set defect_found to false rather than guessing."
+                + _SCAFFOLDING_GUIDANCE
             ),
         },
         {
