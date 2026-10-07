@@ -559,8 +559,34 @@ TOOL_SCHEMAS_TIER3 = [
 ]
 
 
+def _repo_context_text(service_name: str, context: dict | None) -> str:
+    """Where the code is, as prompt text: the repository layout and the service's directory.
+
+    The investigator has no directory listing, and a deployment marker names a deploy, not
+    a file, so without this it searches for the marker and guesses paths. Empty when there
+    is no context, which leaves the prompt exactly as it was.
+    """
+    if not context:
+        return ""
+    text = f" Repository layout (top level): {', '.join(context.get('top_level') or [])}."
+    service_dir = context.get("service_dir")
+    if service_dir:
+        files = ", ".join(context.get("service_files") or [])
+        more = " and more files (the list is cut)" if context.get("service_files_truncated") else ""
+        text += (
+            f" The source code of service '{service_name}' is in '{service_dir}/' "
+            f"(files: {files}{more}). Look there first."
+        )
+    else:
+        text += (
+            f" There is no directory named after service '{service_name}' under 'services/'; "
+            "use the layout to find where its code lives."
+        )
+    return text
+
+
 def decide_code_investigation_calls(
-    service_name: str, hypothesis_description: str, evidence_so_far: list[dict]
+    service_name: str, hypothesis_description: str, evidence_so_far: list[dict], repo_context: dict | None = None
 ) -> ToolCallDecision:
     """Ask the LLM which of the 4 read-only repo/git tools to call next, to
     track a runtime hypothesis down to the code that causes it.
@@ -596,6 +622,7 @@ def decide_code_investigation_calls(
                     "hit only locates code and does not show what it does. Each earlier "
                     "result is included below. Call only the tools you genuinely need next; "
                     "reply with no tool calls once you have read enough to name the defect."
+                    + _repo_context_text(service_name, repo_context)
                 ),
             },
             {

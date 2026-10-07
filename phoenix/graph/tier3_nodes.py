@@ -82,9 +82,22 @@ def code_investigator_node(state: AgentState) -> Command:
     tokens_spent = state.tokens_spent
     iteration = state.tier3_iteration
 
+    # Where the service's code lives, so the model is not left to guess it from a deployment
+    # marker. A layout that cannot be read is an emptier prompt, never a stopped investigation.
+    try:
+        repo_context = repo_tool.repo_context(state.service_name)
+    except Exception:  # noqa: BLE001
+        repo_context = None
+    if repo_context:
+        record_audit(
+            state.incident_id, "code_investigator", "investigation_context",
+            {"service_dir": repo_context.get("service_dir"), "service_file_count": len(repo_context.get("service_files") or [])},
+            None,
+        )
+
     while iteration < state.max_tier3_iterations:
         iteration += 1
-        decision = decide_code_investigation_calls(state.service_name, hypothesis_description, evidence)
+        decision = decide_code_investigation_calls(state.service_name, hypothesis_description, evidence, repo_context)
         tokens_spent += decision.tokens
 
         if not decision.calls:

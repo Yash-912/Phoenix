@@ -15,6 +15,8 @@ the check is against where the path actually lands, not how it was spelled.
 
 from __future__ import annotations
 
+import difflib
+import re
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -72,6 +74,135 @@ def _iter_source_files(start: Path):
         yield path
 
 
+# ---- where the code lives, and what a wrong path probably meant --------------------------
+#
+# The investigator used to be handed a deployment marker and nothing else, and a marker is
+# a label: it appears in chaos tooling and deployment records, never in the service's own
+# source. With no directory listing and no hint it guessed paths that did not exist. These
+# give it the service's directory and the layout around it, and a wrong path gets the
+# nearest real one back.
+
+MAX_LAYOUT_FILES = 40
+SERVICES_PARENT = "services"
+_SERVICE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
+_MIN_SUBSTRING_LENGTH = 4
+_SUGGESTION_CUTOFF = 0.75
+
+
+def service_source_dir(service_name: str) -> str | None:
+    """`services/<name>` if that directory exists, else None.
+
+    The name must be a single path segment, so it can only ever name a direct child of
+    `services/` and never walk out of it. Whether the directory exists is checked, not
+    assumed: a repo that keeps its services elsewhere gets None and the layout instead.
+    """
+    if not isinstance(service_name, str) or not _SERVICE_NAME.fullmatch(service_name):
+        return None
+    if (REPO_ROOT / SERVICES_PARENT / service_name).is_dir():
+        return f"{SERVICES_PARENT}/{service_name}"
+    return None
+
+
+def _relative(path: Path) -> str:
+    return str(path.relative_to(REPO_ROOT)).replace("\\", "/")
+
+
+def _visible_children(parent: Path) -> list[Path]:
+    try:
+        entries = sorted(parent.iterdir(), key=lambda p: p.name.lower())
+    except OSError:
+        return []
+    return [e for e in entries if not e.name.startswith(".") and e.name not in EXCLUDED_DIR_NAMES]
+
+
+def repo_context(service_name: str) -> dict:
+    """The repository's top-level layout and the service's source files, for the prompt.
+
+    Never raises: a layout that cannot be read is an emptier context, not a stopped
+    investigation. File lists are capped, and say when they were.
+    """
+    top_level = [e.name + "/" if e.is_dir() else e.name for e in _visible_children(REPO_ROOT)][:MAX_LAYOUT_FILES]
+    service_dir = service_source_dir(service_name)
+    files: list[str] = []
+    if service_dir:
+        try:
+            files = sorted(_relative(p) for p in _iter_source_files(REPO_ROOT / service_dir))
+        except OSError:
+            files = []
+    return {
+        "top_level": top_level,
+        "service_dir": service_dir,
+        "service_files": files[:MAX_LAYOUT_FILES],
+        "service_files_truncated": len(files) > MAX_LAYOUT_FILES,
+    }
+
+
+def _normalise(name: str) -> str:
+    return name.lower().replace("_", "-")
+
+
+def _closest_child(parent: Path, name: str) -> Path | None:
+    """The child of `parent` that `name` most plausibly meant, or None."""
+    children = _visible_children(parent)
+    wanted = _normalise(name)
+    by_name = {_normalise(c.name): c for c in children}
+    if wanted in by_name:
+        return by_name[wanted]
+    if len(wanted) >= _MIN_SUBSTRING_LENGTH:
+        for norm, child in by_name.items():
+            if wanted in norm:
+                return child
+    close = difflib.get_close_matches(wanted, list(by_name), n=1, cutoff=_SUGGESTION_CUTOFF)
+    return by_name[close[0]] if close else None
+
+
+def suggest_paths(path: str, limit: int = 3) -> list[str]:
+    """Existing paths a wrong `path` probably meant. Always real paths, never a guess.
+
+    A segment that does not exist is matched against its real siblings (so
+    `services/payment_service/app.py` finds `services/payment-service/app.py`); a name that
+    matches nothing there is looked for one level down in every directory (so a bare
+    `payment_service` or `worker` finds `services/payment-service` and `services/worker-service`).
+    """
+    parts = [p for p in Path(str(path).replace("\\", "/")).parts if p not in ("", ".", "/")]
+    if not parts or ".." in parts:
+        return []
+    try:
+        current = REPO_ROOT
+        for index, part in enumerate(parts):
+            if (current / part).exists():
+                current = current / part
+                continue
+            rest = parts[index + 1:]
+            sibling = _closest_child(current, part)
+            if sibling is not None:
+                corrected = sibling.joinpath(*rest) if rest else sibling
+                return [_relative(corrected if corrected.exists() else sibling)]
+            wanted = _normalise(part)
+            found = {}
+            for top in _visible_children(REPO_ROOT):
+                if not top.is_dir():
+                    continue
+                for child in _visible_children(top):
+                    norm = _normalise(child.name)
+                    if norm == wanted or (len(wanted) >= _MIN_SUBSTRING_LENGTH and wanted in norm):
+                        corrected = child.joinpath(*rest) if rest else child
+                        target = corrected if corrected.exists() else child
+                        # A wrong path is nearly always a directory the caller meant to search or
+                        # read inside, so directories rank ahead of files, an exact name ahead of
+                        # a longer one that merely contains it, then the shorter name.
+                        found[_relative(target)] = (not target.is_dir(), norm != wanted, len(norm))
+            return sorted(found, key=lambda p: (*found[p], p))[:limit]
+    except OSError:
+        return []
+    return []
+
+
+def _did_you_mean(path: str) -> str:
+    suggestions = suggest_paths(path)
+    return f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
+
+
 def search_repository(query: str, path: str | None = None, max_results: int = MAX_SEARCH_RESULTS) -> dict:
     """Case-insensitive literal search for `query` across text files under
     `path` (default: the whole repo), scoped to REPO_ROOT.
@@ -92,7 +223,7 @@ def search_repository(query: str, path: str | None = None, max_results: int = MA
         start = resolved
 
     if not start.exists():
-        return {"status": "error", "error": f"path '{path or '.'}' does not exist"}
+        return {"status": "error", "error": f"path '{path or '.'}' does not exist.{_did_you_mean(path) if path else ''}"}
 
     needle = query.lower()
     matches: list[dict] = []
@@ -131,7 +262,7 @@ def read_file(path: str, start_line: int | None = None, end_line: int | None = N
     if resolved is None:
         return {"status": "error", "error": f"path '{path}' is outside the repository"}
     if not resolved.exists():
-        return {"status": "error", "error": f"'{path}' does not exist in the repository"}
+        return {"status": "error", "error": f"'{path}' does not exist in the repository.{_did_you_mean(path)}"}
     if not resolved.is_file():
         return {"status": "error", "error": f"'{path}' is not a file"}
     if resolved.suffix.lower() in SKIPPED_EXTENSIONS:
