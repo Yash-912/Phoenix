@@ -1070,6 +1070,7 @@ def test_the_diagnoser_audits_the_confidence_and_the_categories_the_table_has_no
             "progressed": True,
             "reasons": ["first diagnosis"],
             "stagnant_passes": 0,
+            "failed_reads_last_pass": 0,
             "signature": returned.progress_signature,
         },
         "hypotheses": [

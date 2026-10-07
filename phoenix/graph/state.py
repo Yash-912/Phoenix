@@ -48,6 +48,14 @@ class AgentState(BaseModel):
         default=0,
         description="Consecutive diagnoser passes whose progress_signature did not change. Reset by any change.",
     )
+    failed_reads_last_pass: int = Field(
+        default=0,
+        description=(
+            "How many tool calls in the last observer pass did not return a read: raised, or "
+            "came back as the error envelope (a Loki query it rejected, an unreachable Prometheus). "
+            "A pass that read nothing says nothing about whether the leader is settled."
+        ),
+    )
     observation_exhausted: bool = Field(
         default=False,
         description="True when the last observer pass executed no call it had not already run.",

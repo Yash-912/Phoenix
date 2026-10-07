@@ -279,6 +279,14 @@ def observer_node(state: AgentState) -> AgentState:
         except Exception as exc:
             failure = f"{type(exc).__name__}: {exc}"
             result = {"status": "error", "error": failure}
+        else:
+            # The tools catch their own transport errors and hand back the error
+            # envelope instead of raising, so a Loki query Loki rejected (HTTP
+            # 400) or a Prometheus that did not answer arrives here as a normal
+            # return. It is a failed read all the same, and the trail must say so.
+            if scoring._is_failure(result):
+                failure = str(result["error"])
+        if failure is not None:
             failed.append(tool_name)
 
         item = {
@@ -320,6 +328,10 @@ def observer_node(state: AgentState) -> AgentState:
     # for nothing or only for repeats. The router reads this after a stagnant
     # pass as "there is nothing further to observe".
     state.observation_exhausted = not dispatched
+
+    # Overwritten every pass, never accumulated: the diagnoser that runs next
+    # asks whether *this* pass read what it set out to.
+    state.failed_reads_last_pass = len(failed)
 
     return state
 
@@ -368,7 +380,15 @@ def diagnoser_node(state: AgentState) -> AgentState:
     # decides nothing here, it only counts, and the router acts on the count.
     signature = investigation.progress_signature(state.hypotheses)
     progressed, progress_reasons = investigation.assess_progress(state.progress_signature, signature)
-    state.stagnant_passes = 0 if progressed else state.stagnant_passes + 1
+    # An unchanged picture after a pass whose reads failed is not stagnation: the
+    # pass did not look, so it cannot show that there was nothing to find. The
+    # count is held rather than reset -- it neither grows nor forgets what earlier
+    # clean passes established. The iteration cap and the token budget still end
+    # a run that keeps failing.
+    if progressed:
+        state.stagnant_passes = 0
+    elif not state.failed_reads_last_pass:
+        state.stagnant_passes += 1
     state.progress_signature = signature
     if not progressed:
         _say(
@@ -390,6 +410,7 @@ def diagnoser_node(state: AgentState) -> AgentState:
                 "progressed": progressed,
                 "reasons": progress_reasons,
                 "stagnant_passes": state.stagnant_passes,
+                "failed_reads_last_pass": state.failed_reads_last_pass,
                 "signature": signature,
             },
             "hypotheses": [

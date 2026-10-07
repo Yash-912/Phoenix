@@ -613,6 +613,65 @@ def test_one_failed_call_does_not_cost_the_pass_the_calls_after_it(monkeypatch):
     assert audit[0]["evidence_collected"] == 3
 
 
+LOKI_PARSE_ERROR = {
+    "status": "error",
+    "error": "400 Client Error: Bad Request: parse error at line 0, col 46: syntax error: unexpected |=",
+}
+
+
+def test_a_tool_that_returns_its_error_envelope_is_recorded_as_a_failed_read(monkeypatch, capsys):
+    """Loki rejecting a query is a failed read even though nothing was raised.
+
+    query_loki catches requests' errors and hands back {"status": "error"}, so
+    the observer's except never sees it. Before this, the audit row for a pass
+    whose Loki query got an HTTP 400 said failed_tools: [] -- a pass that read
+    nothing recorded as one that read everything.
+    """
+    written, audit = _trail_spy(monkeypatch)
+    _stub_tool_calls(monkeypatch, [
+        {"name": "query_loki", "arguments": {"logql": '{container="x"} |= "a" or |= "b"', "minutes": 30}},
+        {"name": "query_prometheus", "arguments": {"promql": "up == 0"}},
+    ])
+    monkeypatch.setitem(nodes.TOOL_DISPATCH, "query_loki", lambda args: LOKI_PARSE_ERROR)
+    monkeypatch.setitem(
+        nodes.TOOL_DISPATCH, "query_prometheus", lambda args: {"status": "success", "text": "ServiceDown firing"}
+    )
+
+    state = nodes.observer_node(_state([]))
+
+    assert audit[0]["failed_tools"] == ["query_loki"]
+    assert audit[0]["dispatched_tools"] == ["query_loki", "query_prometheus"]
+    assert state.failed_reads_last_pass == 1
+    assert state.evidence[0]["raw_data"] == LOKI_PARSE_ERROR
+    assert written == state.evidence
+    assert "failed: 400 Client Error" in capsys.readouterr().out
+
+
+def test_a_successful_pass_records_no_failed_read(monkeypatch):
+    _, audit = _trail_spy(monkeypatch)
+    _stub_tool_calls(monkeypatch, [{"name": "query_prometheus", "arguments": {"promql": "up == 0"}}])
+    monkeypatch.setitem(nodes.TOOL_DISPATCH, "query_prometheus", lambda args: {"status": "success", "text": "ok"})
+
+    state = nodes.observer_node(_state([]))
+
+    assert audit[0]["failed_tools"] == []
+    assert state.failed_reads_last_pass == 0
+
+
+def test_the_failed_read_count_describes_the_last_pass_only(monkeypatch):
+    _trail_spy(monkeypatch)
+    _stub_tool_calls(monkeypatch, [{"name": "query_loki", "arguments": {"logql": "{a}", "minutes": 5}}])
+    monkeypatch.setitem(nodes.TOOL_DISPATCH, "query_loki", lambda args: LOKI_PARSE_ERROR)
+    state = nodes.observer_node(_state([]))
+    assert state.failed_reads_last_pass == 1
+
+    _stub_tool_calls(monkeypatch, [{"name": "query_prometheus", "arguments": {"promql": "up"}}])
+    monkeypatch.setitem(nodes.TOOL_DISPATCH, "query_prometheus", lambda args: {"status": "success", "text": "ok"})
+    state = nodes.observer_node(state)
+
+    assert state.failed_reads_last_pass == 0
+
+
 def test_a_failed_call_is_not_something_the_scorer_can_score(monkeypatch):
     _trail_spy(monkeypatch)
     _loki_wanting_an_int(monkeypatch, [])

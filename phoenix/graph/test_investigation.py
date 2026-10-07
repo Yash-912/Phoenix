@@ -149,7 +149,8 @@ def test_case_3_an_identical_diagnosis_increments_stagnation(monkeypatch):
 
     assert state.stagnant_passes == 1
     assert audit["progress"] == {
-        "progressed": False, "reasons": [], "stagnant_passes": 1, "signature": state.progress_signature,
+        "progressed": False, "reasons": [], "stagnant_passes": 1, "failed_reads_last_pass": 0,
+        "signature": state.progress_signature,
     }
 
     state, _ = _diagnose(monkeypatch, state, LEADER)
@@ -191,6 +192,46 @@ def test_a_contradiction_is_progress_and_is_recorded(monkeypatch):
     assert state.stagnant_passes == 0
     assert state.progress_signature["contradicted"] is True
     assert any("contradicted" in r for r in audit["progress"]["reasons"])
+
+
+def test_a_pass_with_a_failed_read_is_not_counted_as_stagnant(monkeypatch):
+    """A read that failed learned nothing because it did not run, not because
+    the leader is settled. The next pass is told what failed and gets a chance
+    to ask properly; the iteration cap and the token budget still end the run."""
+    state = _state([_ev("query_prometheus", PROM_DOWN)])
+    state, _ = _diagnose(monkeypatch, state, LEADER)
+
+    state.failed_reads_last_pass = 1
+    state, audit = _diagnose(monkeypatch, state, LEADER)
+
+    assert state.stagnant_passes == 0
+    assert audit["progress"]["progressed"] is False
+    assert audit["progress"]["stagnant_passes"] == 0
+    assert audit["progress"]["failed_reads_last_pass"] == 1
+
+
+def test_a_failed_read_does_not_reset_stagnation_already_counted(monkeypatch):
+    state = _state([_ev("query_prometheus", PROM_DOWN)])
+    state, _ = _diagnose(monkeypatch, state, LEADER)
+    state, _ = _diagnose(monkeypatch, state, LEADER)
+    assert state.stagnant_passes == 1
+
+    state.failed_reads_last_pass = 1
+    state, _ = _diagnose(monkeypatch, state, LEADER)
+
+    assert state.stagnant_passes == 1
+
+
+def test_a_clean_pass_after_a_failed_one_counts_again(monkeypatch):
+    state = _state([_ev("query_prometheus", PROM_DOWN)])
+    state, _ = _diagnose(monkeypatch, state, LEADER)
+    state.failed_reads_last_pass = 1
+    state, _ = _diagnose(monkeypatch, state, LEADER)
+
+    state.failed_reads_last_pass = 0
+    state, _ = _diagnose(monkeypatch, state, LEADER)
+
+    assert state.stagnant_passes == 1
 
 
 def test_a_diagnosis_with_no_hypotheses_that_repeats_is_stagnant_too(monkeypatch):
