@@ -21,7 +21,7 @@ SERVICE = "svc"
 OVERLOAD = Hypothesis(description="the service is overloaded", category="overload")
 CRASH = Hypothesis(description="the service is crashing", category="crash")
 
-PROM_ERRORS = "HighErrorRate firing, error rate above threshold"
+PROM_ERRORS = "HighLatency firing, p95 above threshold"
 # The log line Scenario 5's blip writes; it matches no category keyword.
 LOKI_GENERIC = "payment request failed, please retry"
 LOKI_PANIC = "panic: index out of range, process exit 1"

@@ -38,8 +38,8 @@ def test_two_source_agreement_gets_bonus():
 
 
 def test_all_three_sources_clamps_to_one():
-    ev = [_ev("query_prometheus", "HighErrorRate 5xx spike"),
-          _ev("query_loki", "traceback error rate 5xx"),
+    ev = [_ev("query_prometheus", "HighLatency p95 spike"),
+          _ev("query_loki", "traceback request slow"),
           _ev("get_container_state", "container exit dead oom crash")]
     h_crash = Hypothesis(description="crashed", category="crash")
     # docker-only support for crash: 0.3, no agreement, no penalty (only 1 distinct... wait 3 distinct sources but 0... recalc below)
@@ -359,3 +359,52 @@ def test_the_marker_that_superseded_it_is_still_read_as_the_state_in_effect():
 
     # The healthy marker carries no slow-query keyword, and the superseded one is gone.
     assert bd["has_deploy_signal"] == 0
+
+
+# ---- overload is not evidenced by the symptoms every fault shares ----------------------------
+
+OVERLOAD_HYPOTHESIS = Hypothesis(description="the service is overloaded", category="overload")
+
+# The shape of a real http_requests_total read: the status class is a label on the
+# counter, so "5xx" is in the payload whenever the series exists, errors or none.
+PROM_REQUEST_COUNTER = {
+    "status": "success",
+    "data": {"resultType": "vector", "result": [
+        {"metric": {"handler": "/charge", "method": "post", "status": "2xx", "job": "payment-service"}, "value": [1791305993.1, "174"]},
+        {"metric": {"handler": "/charge", "method": "get", "status": "5xx", "job": "payment-service"}, "value": [1791305993.1, "0"]},
+    ]},
+}
+
+
+def _item(source: str, raw: dict) -> dict:
+    return {"iteration": 1, "source": source, "collected_at": "2026-01-01T00:00:00+00:00",
+            "summary": f"{source}()", "raw_data": raw}
+
+
+def test_a_5xx_status_label_on_a_request_counter_is_not_overload_evidence():
+    score, bd = score_hypothesis([_item("query_prometheus", PROM_REQUEST_COUNTER)], OVERLOAD_HYPOTHESIS)
+
+    assert bd["has_prometheus_signal"] == 0
+    assert score == 0.0
+
+
+def test_error_symptom_words_are_not_overload_evidence_from_any_source():
+    for text in ("HighErrorRate firing", "traceback error rate 5xx", "5xx spike on /charge"):
+        for source in ("query_prometheus", "query_loki"):
+            _, bd = score_hypothesis([_ev(source, text)], OVERLOAD_HYPOTHESIS)
+            assert bd["sources_supporting"] == 0, (source, text)
+
+
+def test_error_symptoms_that_every_fault_shares_do_not_reach_the_threshold_for_overload():
+    ev = [_ev("query_prometheus", "HighErrorRate 5xx spike"), _ev("query_loki", "traceback error rate 5xx")]
+
+    score, bd = score_hypothesis(ev, OVERLOAD_HYPOTHESIS)
+
+    assert bd["sources_supporting"] == 0
+    assert score < 0.75
+
+
+def test_latency_and_resource_pressure_still_support_overload():
+    for text in ("HighLatency p95", "cpu saturated", "memory pressure", "overload shedding requests"):
+        _, bd = score_hypothesis([_ev("query_prometheus", text)], OVERLOAD_HYPOTHESIS)
+        assert bd["has_prometheus_signal"] == 1, text

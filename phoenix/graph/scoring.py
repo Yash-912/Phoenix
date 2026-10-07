@@ -47,7 +47,14 @@ SOURCE_SIGNAL_KEYS: dict[str, str] = {
 
 CATEGORY_KEYWORDS: dict[str, list[str]] = {
     "crash": ["down", "exit", "dead", "oom", "crash", "restart", "servicedown", "up==0"],
-    "overload": ["latency", "slow", "p95", "highlatency", "cpu", "memory", "overload", "5xx", "error rate", "higherrorrate"],
+    # No "5xx" / "error rate" / "HighErrorRate": a bad deploy, a crash loop, a
+    # config error and a blip all return 5xx, so they show that something is
+    # wrong and not that the service is overloaded. They also match without any
+    # error having happened -- the status class is a label on http_requests_total,
+    # so "5xx" is in that read whenever the series exists -- which scored an
+    # ambiguous blip at the restart threshold. Whether 5xx is present now is
+    # measured by symptom.py and checked before and after any restart.
+    "overload": ["latency", "slow", "p95", "highlatency", "cpu", "memory", "overload"],
     "deploy": ["deploy", "version", "release", "image", "v18", "v17", "rollout"],
     "config": ["config", "pool", "timeout", "connection", "env var", "setting"],
     "network": ["network", "connection refused", "dns", "unreachable", "timeout"],
