@@ -146,6 +146,9 @@ def chaos_leak_start():
         return {"error": "chaos disabled"}
     global LEAK_ENABLED
     LEAK_ENABLED = True
+    # Trigger the leak by processing a job immediately to ensure the
+    # unbounded cache mechanism is engaged and will accumulate entries.
+    _process_job(str(uuid.uuid4()))
     return {"leak": "started"}
 
 
