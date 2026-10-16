@@ -1,6 +1,14 @@
 from datetime import datetime
+from typing import Literal
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
+
+
+class ApprovalDecision(BaseModel):
+    """An answer to one approval request. approver must be on the configured list."""
+
+    decision: Literal["approve", "deny"]
+    approver: str = Field(min_length=1, max_length=200)
 
 
 class AlertmanagerAlert(BaseModel):
