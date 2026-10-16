@@ -41,6 +41,7 @@ import os
 import time
 
 from phoenix.graph.graph import build_graph
+from phoenix.graph.memory import remember_run
 from phoenix.graph.persist import close_persistence, list_unhandled_incidents, max_incident_id
 from phoenix.graph.state import AgentState
 
@@ -68,7 +69,8 @@ def poll_once(after_id: int = 0) -> list[int]:
         try:
             app = build_graph()
             result = app.invoke(AgentState(incident_id=incident_id, service_name=service_name))
-            status = result.get("status") if isinstance(result, dict) else getattr(result, "status", None)
+            remember_run(result)
+            status =result.get("status") if isinstance(result, dict) else getattr(result, "status", None)
             print(f"[watcher] incident {incident_id} finished: status={status}")
             if status in ("escalated", "insufficient_evidence"):
                 get = result.get if isinstance(result, dict) else lambda key: getattr(result, key, None)
