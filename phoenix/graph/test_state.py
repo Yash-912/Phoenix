@@ -13,7 +13,7 @@ def test_a_fresh_state_has_taken_no_action_and_acts_under_the_default_policy():
 
     assert state.remediation_attempts == 0
     assert state.max_remediation_attempts == 2
-    assert state.policy_mode == "autonomous_lab"
+    assert state.policy_mode == "guarded"
     assert state.planned_action is None
     assert state.verification_result is None
     assert state.verification_delay_seconds == 15

@@ -1005,17 +1005,24 @@ def _update(command) -> dict:
     return command.update
 
 
-def test_guarded_mode_does_not_reach_the_action(monkeypatch):
-    called = _no_action(monkeypatch)
+def test_guarded_mode_runs_a_tier_1_action_without_waiting(monkeypatch):
+    """Tier 1 has no approval floor, so guarded mode runs it straight away.
+    The held cases are in test_safety_policy.py and test_remediator_approval.py."""
+    monkeypatch.setattr(nodes, "current_symptom", lambda category, service: {"state": "present"})
+    monkeypatch.setattr(verification, "read_signal", lambda category, service: SNAPSHOT)
+    called = []
+    monkeypatch.setitem(
+        dispatch.REMEDIATION_DISPATCH, "restart_service",
+        lambda name: called.append(name) or {"status": "ok"},
+    )
     state = _remediator_state("crash", policy_mode="guarded")
 
     command = nodes.remediator_node(state)
     update = _update(command)
 
-    assert called == []
-    assert command.goto == END
-    assert update.get("remediation_attempts") is None
-    assert update["status"] == "escalated"
+    assert called == [SERVICE]
+    assert command.goto == "verifier"
+    assert update["planned_action"]["approval"] == {"required": False, "policy_mode": "guarded", "tier": 1}
 
 
 def test_the_attempt_cap_stops_a_misrouted_remediator_before_it_dispatches(monkeypatch):
@@ -1070,7 +1077,7 @@ def test_a_deploy_finding_with_a_safe_target_reaches_the_rollback(monkeypatch):
         {"image_tag": "v17", "timestamp": "2026-10-01T08:00:00+00:00", "config": {"regression": False}},
     ])
 
-    command = nodes.remediator_node(_remediator_state("deploy"))
+    command = nodes.remediator_node(_remediator_state("deploy", policy_mode="autonomous_lab"))
     update = _update(command)
 
     assert calls == [{"service": SERVICE, "args": ("v17", "2026-10-02T08:00:00+00:00")}]

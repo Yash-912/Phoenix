@@ -18,6 +18,7 @@ from langgraph.graph import END
 from langgraph.types import Command
 
 from phoenix.graph.llm_client import decide_code_investigation_calls, decide_defect, decide_patch
+from phoenix.graph import safety_policy
 from phoenix.graph.persist import record_audit
 from phoenix.graph.schemas import PatchTarget
 from phoenix.graph.state import AgentState
@@ -477,6 +478,7 @@ def pr_opener_node(state: AgentState) -> Command:
             "could not check for an existing PR with this change; opening one",
         )
     if existing:
+        safety_policy.assert_tier3_action("comment_on_pull_request")
         comment = comment_on_pull_request(
             existing["number"],
             f"Phoenix produced this same fix again for incident #{state.incident_id} "
@@ -500,6 +502,7 @@ def pr_opener_node(state: AgentState) -> Command:
             },
         )
 
+    safety_policy.assert_tier3_action("open_pull_request")
     result = open_pull_request(state.worktree_branch, title, body, base=worktree_tool.current_branch() or PR_BASE_BRANCH)
     record_audit(state.incident_id, "pr_opener", "pr_result", {"result": result}, None)
 

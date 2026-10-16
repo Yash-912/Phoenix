@@ -22,7 +22,7 @@ class _FakeApp:
         self._results = results_by_incident
         self.invoked_with: list[tuple[int, str]] = []
 
-    def invoke(self, state):
+    def invoke(self, state, config=None):
         self.invoked_with.append((state.incident_id, state.service_name))
         result = self._results[state.incident_id]
         if isinstance(result, Exception):
@@ -33,7 +33,7 @@ class _FakeApp:
 def _patch(monkeypatch, incidents: list[tuple[int, str]], results_by_incident: dict[int, object]):
     monkeypatch.setattr(watcher, "list_unhandled_incidents", lambda after_id=0: incidents)
     fake_app = _FakeApp(results_by_incident)
-    monkeypatch.setattr(watcher, "build_graph", lambda: fake_app)
+    monkeypatch.setattr(watcher, "build_graph", lambda checkpointer=None: fake_app)
     return fake_app
 
 
