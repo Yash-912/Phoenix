@@ -16,6 +16,7 @@ are, and knows nothing about Scenario 2 or Scenario 3 specifically.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path, PurePosixPath
@@ -26,6 +27,30 @@ TEST_DIR = REPO_ROOT / "phoenix"
 TEST_TIMEOUT_SECONDS = 120
 LINT_TIMEOUT_SECONDS = 30
 MAX_OUTPUT_CHARS = 4000
+
+# The patched code is LLM-generated, so the test subprocess must not inherit
+# this process's credentials. Only what Python needs to start is kept; any
+# variable whose name looks like a credential is dropped even if it would
+# otherwise be kept.
+_ENV_KEEP = {
+    "PATH", "PATHEXT", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC",
+    "HOME", "USERPROFILE", "TEMP", "TMP", "TMPDIR",
+    "LANG", "LC_ALL", "PYTHONPATH", "PYTHONHOME",
+}
+_ENV_DROP_MARKERS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "DATABASE_URL", "LLM_", "GH_", "GITHUB_")
+
+
+def _scrubbed_env() -> dict[str, str]:
+    """The subset of this process's environment a test run may see."""
+    env = {}
+    for name, value in os.environ.items():
+        upper = name.upper()
+        if upper not in _ENV_KEEP:
+            continue
+        if any(marker in upper for marker in _ENV_DROP_MARKERS):
+            continue
+        env[name] = value
+    return env
 
 
 def discover_tests_for(file_path: str) -> list[str]:
@@ -75,7 +100,7 @@ def run_tests(worktree_path: str, test_paths: list[str]) -> dict:
     try:
         result = subprocess.run(
             argv, cwd=str(worktree), capture_output=True, text=True,
-            timeout=TEST_TIMEOUT_SECONDS, shell=False,
+            timeout=TEST_TIMEOUT_SECONDS, shell=False, env=_scrubbed_env(),
         )
     except (OSError, subprocess.SubprocessError) as exc:
         return {"status": "error", "error": f"{type(exc).__name__}: {exc}"}

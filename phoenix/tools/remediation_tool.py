@@ -24,6 +24,8 @@ import os
 
 import requests
 
+from phoenix.tools.health_tool import SERVICE_PORTS
+
 DOCKER_PROXY_URL = os.environ.get("DOCKER_PROXY_URL", "http://localhost:2375")
 
 ALLOWED_DOCKER_ACTIONS = {
@@ -31,6 +33,12 @@ ALLOWED_DOCKER_ACTIONS = {
     "pause_worker": {"method": "POST", "path": "/containers/{name}/pause"},
     "resume_worker": {"method": "POST", "path": "/containers/{name}/unpause"},
 }
+
+# The container names a Tier 1 action may target: the application services
+# health_tool already knows how to inspect. postgres, phoenix-api and the
+# observability containers are deliberately absent. Checked in _call_proxy so
+# every path to the proxy goes through it, not only the caller's choice.
+ALLOWED_CONTAINER_NAMES = frozenset(SERVICE_PORTS)
 
 # Tier 2. Not reachable through _call_proxy -- see module docstring.
 ALLOWED_ROLLBACK_SERVICES = {"checkout-service"}
@@ -48,6 +56,13 @@ def _call_proxy(action: str, container_name: str) -> dict:
     spec = ALLOWED_DOCKER_ACTIONS.get(action)
     if spec is None:
         return {"status": "error", "error": f"action '{action}' not in allowlist"}
+    if not isinstance(container_name, str) or container_name not in ALLOWED_CONTAINER_NAMES:
+        return {
+            "status": "error",
+            "action": action,
+            "error": f"container '{container_name}' not in the service allowlist",
+            "allowed": sorted(ALLOWED_CONTAINER_NAMES),
+        }
     url = f"{DOCKER_PROXY_URL}{spec['path'].format(name=container_name)}"
     try:
         response = requests.post(url, timeout=10)

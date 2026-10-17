@@ -3,11 +3,18 @@ services:
     image: tecnativa/docker-socket-proxy:latest
     container_name: docker-socket-proxy
     environment:
-      # Tool-level allowlist: POST enabled at proxy, but remediation_tool.py
-      # enforces the semantic allowlist (restart/pause/unpause only).
-      # Raw exec, image build, network/create remain blocked by tool code.
+      # Read-only container inspection (docker_tool.get_container_state and the
+      # labels read in remediation_policy). Needed for GET /containers/*.
       CONTAINERS: 1
-      POST: 1
+      # POST stays off. It would open every POST endpoint, including
+      # /containers/create and /containers/{id}/exec, which with the socket
+      # mounted is host-root equivalent. Instead the proxy's per-verb flags
+      # grant only what remediation_tool.py calls: restart, pause and unpause
+      # on containers. Anything else is denied at the proxy. ALLOW_RESTARTS is
+      # the proxy's own grouping and also covers stop and kill.
+      ALLOW_RESTARTS: 1
+      ALLOW_PAUSE: 1
+      ALLOW_UNPAUSE: 1
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     ports:

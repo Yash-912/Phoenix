@@ -69,3 +69,34 @@ def test_run_tests_and_run_linter_execute_for_real_against_a_throwaway_worktree(
         assert lint_result["returncode"] != 0
     finally:
         worktree_tool.discard_worktree(path, branch)
+
+
+def test_scrubbed_env_drops_credentials_and_keeps_what_python_needs(monkeypatch):
+    for name in ("LLM_API_KEY", "PHOENIX_APP_PASSWORD", "DATABASE_URL", "GH_TOKEN", "GITHUB_TOKEN", "AWS_SECRET_ACCESS_KEY"):
+        monkeypatch.setenv(name, "leaked")
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("SYSTEMROOT", r"C:\Windows")
+
+    env = test_runner_tool._scrubbed_env()
+
+    for name in ("LLM_API_KEY", "PHOENIX_APP_PASSWORD", "DATABASE_URL", "GH_TOKEN", "GITHUB_TOKEN", "AWS_SECRET_ACCESS_KEY"):
+        assert name not in env
+    assert env["PATH"] == "/usr/bin"
+    assert env["SYSTEMROOT"] == r"C:\Windows"
+
+
+def test_the_patched_test_run_cannot_read_the_parent_credentials(tmp_path, monkeypatch):
+    """A real pytest subprocess: the test it runs sees no credential variables."""
+    monkeypatch.setenv("LLM_API_KEY", "sk-should-not-leak")
+    monkeypatch.setenv("PHOENIX_APP_PASSWORD", "should-not-leak")
+    (tmp_path / "test_env_probe.py").write_text(
+        "import os\n"
+        "def test_no_credentials_visible():\n"
+        "    assert 'LLM_API_KEY' not in os.environ\n"
+        "    assert 'PHOENIX_APP_PASSWORD' not in os.environ\n",
+        encoding="utf-8",
+    )
+
+    result = test_runner_tool.run_tests(str(tmp_path), ["test_env_probe.py"])
+
+    assert result["status"] == "ok", result["stdout"] + result["stderr"]

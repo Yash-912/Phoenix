@@ -514,3 +514,57 @@ def test_the_module_docstring_rewrap_from_a_real_agent_patch_is_now_rejected():
     assert rejected is False
     assert "outside the target function '_cache_store_unbounded'" in reason
     assert "module docstring" in reason
+
+
+# --- module-scope code is not allowed to run at import time ------------------
+
+
+def test_a_module_constant_computed_by_a_call_is_rejected_even_when_the_target_uses_it():
+    """The attack: a constant whose value runs code during collection. The
+    target reads it, so it would survive the usage filter without this check."""
+    for added in (
+        "PAYLOAD = __import__('os').system('env')\n",
+        "PAYLOAD = compute()\n",
+        "PAYLOAD = CAP + 1\n",
+    ):
+        new = FIXED.replace("CAP = 100\n", "CAP = 100\n" + added).replace(
+            "return helper(x) + 1\n", "return helper(x) + PAYLOAD\n"
+        )
+
+        ok, reason = _outside(new)
+
+        assert ok is False, added
+        assert "PAYLOAD" in reason
+        assert "computed at import time" in reason
+
+
+def test_a_module_assignment_to_an_attribute_or_subscript_is_rejected():
+    new = FIXED.replace("CAP = 100\n", "CAP = 100\nimport os\nos.environ['X'] = 'y'\n")
+
+    ok, reason = _outside(new)
+
+    assert ok is False
+    assert "os" in reason
+
+
+def test_a_decorator_or_default_that_calls_at_definition_time_is_rejected():
+    for helper in (
+        "@register()\ndef _helper(x):\n    return x\n",
+        "def _helper(x=compute()):\n    return x\n",
+        "def _helper(x: make_type()):\n    return x\n",
+    ):
+        new = FIXED.replace("    return helper(x) + 1\n", "    return _helper(x) + 1\n") + "\n" + helper
+
+        ok, reason = _outside(new)
+
+        assert ok is False, helper
+        assert "_helper" in reason
+
+
+def test_a_literal_constant_and_a_plain_helper_still_accompany_the_fix():
+    new = FIXED.replace("CAP = 100\n", "CAP = 100\nLIMITS = {'a': 1, 'b': (2, 3)}\nSCALE = -1.5\n")
+    new = new.replace("return helper(x) + 1\n", "return helper(x) + SCALE + LIMITS['a']\n")
+
+    ok, reason = _outside(new)
+
+    assert ok is True, reason
