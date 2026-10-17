@@ -25,3 +25,19 @@ import pytest
 @pytest.fixture(autouse=True)
 def _isolated_deployment_history(tmp_path, monkeypatch):
     monkeypatch.setenv("PHOENIX_DEPLOYMENTS_ROOT", str(tmp_path / "deployments"))
+
+
+@pytest.fixture(autouse=True)
+def _reset_incident_onset():
+    """Clear the incident onset that a graph run leaves in deploy_tool.
+
+    nodes.py sets deploy_tool's module-level incident start time on every
+    run, and nothing clears it. A test that runs a graph would otherwise
+    leak its onset into a later test that reads it (the latency window is
+    anchored to it), so the result depended on test order.
+    """
+    from phoenix.tools import deploy_tool
+
+    deploy_tool.set_incident_started_at(None)
+    yield
+    deploy_tool.set_incident_started_at(None)
