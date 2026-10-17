@@ -1242,6 +1242,8 @@ def test_a_whole_run_writes_its_trail_in_the_order_the_nodes_happened(monkeypatc
         ("hypotheses", None),
         ("audit_log", "diagnosis"),
         ("audit_log", "threshold_reached"),
+        ("audit_log", "action_started"),
+        ("audit_log", "action_finished"),
         ("audit_log", "action_executed"),
         ("audit_log", "verification"),
     ]
@@ -1251,7 +1253,7 @@ def test_a_whole_run_writes_its_trail_in_the_order_the_nodes_happened(monkeypatc
     assert threshold_row["escalation_reason"] is None
     # One commit per insert. The incident-onset SELECT does not commit: it is a
     # read, and it shares no transaction with the trail.
-    assert recorder.commits == 8
+    assert recorder.commits == 10
 
 
 def test_a_run_with_no_database_still_produces_its_diagnosis(monkeypatch):
@@ -1318,7 +1320,7 @@ def test_a_database_that_refuses_every_row_costs_a_run_nothing_but_its_trail(mon
     refused_count, refused = outcomes[0]
     written_count, written = outcomes[1]
 
-    assert refused_count == written_count == 8
+    assert refused_count == written_count == 10
     assert refused["confidence"] == written["confidence"] == 0.9
     assert refused["status"] == written["status"] == "resolved"
     assert refused["hypotheses"] == written["hypotheses"]
@@ -1375,6 +1377,8 @@ def test_a_second_iteration_is_recorded_under_its_own_number(monkeypatch):
         "observer_pass",
         "diagnosis",
         "threshold_reached",
+        "action_started",
+        "action_finished",
         "action_executed",
         "verification",
     ]

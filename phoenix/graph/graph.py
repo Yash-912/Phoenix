@@ -3,7 +3,7 @@ import sys
 from langgraph.graph import END, StateGraph
 from langgraph.types import Command
 
-from phoenix.graph import investigation
+from phoenix.graph import investigation, safety_policy
 from phoenix.graph.nodes import (
     diagnoser_node,
     observer_node,
@@ -182,7 +182,12 @@ def should_continue(state: AgentState) -> Command:
     return Command(goto="observer")
 
 
-def build_graph():
+def build_graph(checkpointer=None):
+    """Compile the run graph. A checkpointer is what lets a run pause for an approval.
+
+    Without one the graph is stateless, as the tests and the one-shot CLI use it, and
+    a run that needs approval escalates instead of pausing (see nodes._can_pause).
+    """
     graph = StateGraph(AgentState)
     graph.add_node("observer", observer_node)
     graph.add_node("diagnoser", diagnoser_node)
@@ -206,16 +211,24 @@ def build_graph():
     # static edge alongside a Command would be a second, competing claim
     # about where the run goes next.
 
-    return graph.compile()
+    return graph.compile(checkpointer=checkpointer)
 
 
 if __name__ == "__main__":
     incident_id = int(sys.argv[1]) if len(sys.argv) > 1 else 1
     service_name = sys.argv[2] if len(sys.argv) > 2 else "checkout-service"
 
+    # No checkpointer here: a one-shot run cannot be resumed, so a run that needs an
+    # approval escalates. The watcher is the process that holds paused runs.
     app = build_graph()
     try:
-        result = app.invoke(AgentState(incident_id=incident_id, service_name=service_name))
+        result = app.invoke(
+            AgentState(
+                incident_id=incident_id,
+                service_name=service_name,
+                policy_mode=safety_policy.load_config().execution_policy,
+            )
+        )
     finally:
         close_persistence()
     print("\nFinal state:")

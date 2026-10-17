@@ -3,10 +3,11 @@ import sys
 import time
 from datetime import datetime, timezone
 
+from langgraph.config import get_config
 from langgraph.graph import END
-from langgraph.types import Command
+from langgraph.types import Command, interrupt
 
-from phoenix.graph import investigation, scoring, verification
+from phoenix.graph import approvals, investigation, safety_policy, scoring, verification
 from phoenix.graph.llm_client import decide_hypotheses, decide_tool_calls
 from phoenix.graph.persist import (
     get_incident_first_seen,
@@ -551,6 +552,176 @@ def _restart_already_applied(state: AgentState, plan, pre_action_signal) -> dict
     }
 
 
+APPROVAL_EVIDENCE_LIMIT = 20
+APPROVAL_TEXT_LIMIT = 300
+
+
+def _can_pause() -> bool:
+    """True only inside a run the watcher gave a checkpointer and a thread.
+
+    Checked before interrupt() rather than trusted to raise: without a
+    checkpointer langgraph does not raise, it hands the paused run back as a
+    result with nothing saved, and the approval would wait for a resume that can
+    never come. The checkpointer sits under langgraph's own __pregel_checkpointer
+    key, present on every run but None when no checkpointer was compiled in. A
+    change to that key fails closed here: the run escalates instead of pausing.
+    """
+    try:
+        configurable = get_config().get("configurable", {})
+    except RuntimeError:
+        return False
+    return "thread_id" in configurable and configurable.get("__pregel_checkpointer") is not None
+
+
+def _approval_gate(state: AgentState, plan) -> tuple[Command | None, dict]:
+    """Decide whether this planned action may run now, must wait, or must stop.
+
+    Returns (None, record) when the action may run. record says what the policy
+    decided, and is kept on the planned action so the trail and the final state
+    both show it. Returns (Command, {}) when the run stops here.
+
+    When the policy holds the action, the request is written to the approvals
+    table and the run pauses at interrupt(). The graph is run again from the top
+    on resume, so everything before this point (the plan, the symptom check, the
+    signal read) happens again against the live system. The decision is then read
+    back from the database rather than taken from the resume value: the database
+    row is the answer, and it has to match the action the run is about to take.
+    An approval for a different container or different arguments is refused, so a
+    rollback target that moved while the run waited is not carried out.
+
+    Anything the gate cannot establish fails closed as an escalation: a bad
+    configuration, no way to pause, a store that cannot be written or read, an
+    expired or denied request, a decider no longer on the list.
+    """
+    tier = safety_policy.action_tier(plan.action)
+    try:
+        config = safety_policy.load_config()
+    except safety_policy.PolicyConfigError as exc:
+        reason = f"the safety configuration is invalid, so {plan.action} on {plan.container} was not taken: {exc}"
+        return _escalate(state, "action_blocked_by_policy", reason, reason), {}
+
+    if not safety_policy.approval_required(state.policy_mode, tier, config):
+        return None, {"required": False, "policy_mode": state.policy_mode, "tier": tier}
+
+    if not _can_pause():
+        reason = (
+            f"{plan.action} on {plan.container} needs approval under the {state.policy_mode} "
+            f"policy, and this process cannot pause for one, so no action was taken"
+        )
+        return _escalate(state, "action_blocked_by_policy", reason, reason), {}
+
+    summary = _approval_summary(state)
+    try:
+        request = approvals.request_approval(
+            incident_id=state.incident_id,
+            request_key=f"{state.incident_id}:{plan.action}:{plan.container}:{state.iteration}:{state.remediation_attempts}",
+            action=plan.action,
+            container=plan.container,
+            args=plan.args,
+            tier=tier,
+            incident_summary=summary,
+            plan_reasoning=plan.reasoning,
+            evidence=_approval_evidence(state),
+            ttl_seconds=config.approval_ttl_seconds,
+        )
+    except approvals.ApprovalStoreError as exc:
+        reason = f"{plan.action} on {plan.container} needs approval, which could not be recorded ({exc}), so no action was taken"
+        return _escalate(state, "approval_unavailable", reason, reason), {}
+
+    if request["status"] == "pending":
+        record_audit(
+            state.incident_id, "remediator", "approval_requested",
+            {
+                "approval_id": request["id"],
+                "action": plan.action,
+                "container": plan.container,
+                "args": list(plan.args),
+                "tier": tier,
+                "policy_mode": state.policy_mode,
+                "expires_at": request["expires_at"].isoformat(),
+            },
+            f"{plan.action} on {plan.container} is held for approval",
+        )
+        _say(f"[remediator] {plan.action} on {plan.container} is held for approval (request {request['id']})")
+
+    # On the first pass this raises GraphInterrupt and the run pauses here. On
+    # resume it returns at once, and the lines below read what was decided.
+    interrupt({"approval_id": request["id"], "action": plan.action, "container": plan.container})
+
+    try:
+        row = approvals.read_approval(request["id"])
+    except approvals.ApprovalStoreError as exc:
+        reason = f"approval {request['id']} for {plan.action} on {plan.container} could not be read ({exc}), so no action was taken"
+        return _escalate(state, "approval_unavailable", reason, reason), {}
+
+    if row is None:
+        reason = f"approval {request['id']} for {plan.action} on {plan.container} is missing, so no action was taken"
+        return _escalate(state, "approval_unavailable", reason, reason), {}
+
+    status = row["status"]
+    decided_by = row.get("decided_by")
+    if status == "approved":
+        same_target = (
+            row["action"] == plan.action
+            and row["container"] == plan.container
+            and list(row["args"]) == list(plan.args)
+        )
+        if not same_target:
+            reason = (
+                f"approval {row['id']} was for {row['action']} on {row['container']} with "
+                f"{row['args']}, but the live plan is {plan.action} on {plan.container} with "
+                f"{list(plan.args)}, so the approval does not cover this action and none was taken"
+            )
+            return _escalate(state, "approval_mismatch", reason, reason), {}
+        if decided_by not in config.approvers:
+            reason = f"approval {row['id']} was given by {decided_by!r}, who is no longer an approver, so no action was taken"
+            return _escalate(state, "approval_mismatch", reason, reason), {}
+        record_audit(
+            state.incident_id, "remediator", "approval_granted",
+            {"approval_id": row["id"], "decided_by": decided_by, "decision_channel": row.get("decision_channel")},
+            f"{decided_by} approved {plan.action} on {plan.container}",
+        )
+        return None, {
+            "required": True,
+            "approval_id": row["id"],
+            "status": status,
+            "decided_by": decided_by,
+            "decided_at": row["decided_at"].isoformat() if row.get("decided_at") else None,
+            "policy_mode": state.policy_mode,
+            "tier": tier,
+        }
+
+    if status == "denied":
+        reason = f"{decided_by} denied {plan.action} on {plan.container} (approval {row['id']}), so no action was taken"
+    elif status == "expired":
+        reason = (
+            f"approval {row['id']} for {plan.action} on {plan.container} expired before anyone answered, "
+            f"so no action was taken; expiry escalates and is never an approval"
+        )
+    else:
+        reason = f"approval {row['id']} for {plan.action} on {plan.container} is still {status}, so no action was taken"
+    return _escalate(state, "approval_not_granted", reason, reason), {}
+
+
+def _approval_summary(state: AgentState) -> str:
+    if not state.hypotheses:
+        return "no surviving hypothesis"
+    top = state.hypotheses[0]
+    return f"{top.hypothesis.category}: {top.hypothesis.description}"[:APPROVAL_TEXT_LIMIT]
+
+
+def _approval_evidence(state: AgentState) -> list[dict]:
+    """The most recent evidence, as the summaries a person reads. Raw payloads stay out."""
+    return [
+        {
+            "source": item.get("source"),
+            "iteration": item.get("iteration"),
+            "summary": str(item.get("summary", ""))[:APPROVAL_TEXT_LIMIT],
+        }
+        for item in state.evidence[-APPROVAL_EVIDENCE_LIMIT:]
+    ]
+
+
 def remediator_node(state: AgentState) -> Command:
     """Take the one Tier 1 action this diagnosis allows, then hand off to verify.
 
@@ -563,10 +734,11 @@ def remediator_node(state: AgentState) -> Command:
     guards against is a loop that keeps restarting a service that cannot be
     restarted.
 
-    guarded mode refuses rather than asks. There is no approval step in this
-    phase: a run that stops here has taken no action and a human has been told
-    why, which is the safe reading of "guarded" even though it is not yet the
-    useful one.
+    Whether an action waits for a person is decided by safety_policy, from the
+    run's execution mode and the action's tier. An action that waits pauses the
+    run at _approval_gate, after everything above has read the live system, and
+    resumes into the same checks: a run that resumes re-plans and re-reads before
+    it acts, so an approval never carries over a stale plan.
 
     A category with no Tier 1 action ends the run as action_unavailable with no
     escalation reason. The diagnosis succeeded, the correct response was that a
@@ -595,15 +767,6 @@ def remediator_node(state: AgentState) -> Command:
             f"({state.remediation_attempts}/{state.max_remediation_attempts})"
         )
         return _escalate(state, "action_attempts_exhausted", reason, reason)
-
-    if state.policy_mode == "guarded":
-        category = state.hypotheses[0].hypothesis.category if state.hypotheses else "unknown"
-        return _escalate(
-            state,
-            "action_blocked_by_policy",
-            f"policy_mode is guarded, so no action was taken for the {category} finding",
-            "policy_mode is guarded, so no action taken",
-        )
 
     plan = plan_action(state)
 
@@ -673,12 +836,37 @@ def remediator_node(state: AgentState) -> Command:
             )
         return _escalate(state, "action_redundant", reason, reason)
 
+    # The gate comes last among the checks, after the signal read above, so the
+    # reading a resumed run acts on is taken after the approval, not before it.
+    stopped, approval = _approval_gate(state, plan)
+    if stopped is not None:
+        return stopped
+
     action_at = datetime.now(timezone.utc).isoformat()
 
     _say(f"[remediator] taking {plan.action} on {plan.container} ({plan.reasoning})")
+    record_audit(
+        state.incident_id,
+        "remediator",
+        "action_started",
+        {
+            "iteration": state.iteration,
+            "action": plan.action,
+            "container": plan.container,
+            "args": list(plan.args),
+            "action_at": action_at,
+            "approval": approval,
+        },
+        f"{plan.action} on {plan.container} started",
+    )
     try:
         result = dispatch(plan.action, plan.container, plan.args)
     except Exception as exc:
+        record_audit(
+            state.incident_id, "remediator", "action_finished",
+            {"action": plan.action, "container": plan.container, "ok": False, "error": f"{type(exc).__name__}: {exc}"},
+            f"{plan.action} on {plan.container} raised",
+        )
         reason = f"{plan.action} on {plan.container} raised {type(exc).__name__}: {exc}"
         return _escalate(state, "action_failed", reason, reason)
 
@@ -688,8 +876,19 @@ def remediator_node(state: AgentState) -> Command:
             if isinstance(result, dict)
             else f"returned {type(result).__name__} rather than a result"
         )
+        record_audit(
+            state.incident_id, "remediator", "action_finished",
+            {"action": plan.action, "container": plan.container, "ok": False, "error": str(detail)},
+            f"{plan.action} on {plan.container} failed",
+        )
         reason = f"{plan.action} on {plan.container} failed: {detail}"
         return _escalate(state, "action_failed", reason, reason)
+
+    record_audit(
+        state.incident_id, "remediator", "action_finished",
+        {"action": plan.action, "container": plan.container, "ok": True, "result": result},
+        f"{plan.action} on {plan.container} finished",
+    )
 
     planned_action = {
         "action": plan.action,
@@ -697,6 +896,7 @@ def remediator_node(state: AgentState) -> Command:
         "check": plan.check,
         "pre_action_signal": pre_action_signal,
         "action_at": action_at,
+        "approval": approval,
         # What the action was supposed to achieve, so verification can check the
         # thing that was planned rather than inferring intent from the category.
         # A deploy rollback names the artifact it restored (to_version); a config

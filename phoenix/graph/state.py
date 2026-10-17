@@ -158,11 +158,12 @@ class AgentState(BaseModel):
         ),
     )
     policy_mode: Literal["autonomous_lab", "guarded"] = Field(
-        default="autonomous_lab",
+        default="guarded",
         description=(
-            "The execution boundary. 'guarded' means the action does not execute "
-            "and the run escalates. The approval workflow is Phase 7; Phase 3 "
-            "ships the boundary and the test that it holds, not a queue."
+            "The execution policy for this run, set from PHOENIX_EXECUTION_POLICY when the run "
+            "starts (phoenix/graph/safety_policy.py). 'guarded' holds Tier 2 for an approval; "
+            "'autonomous_lab' runs everything at once. Defaults to guarded, so a state built "
+            "without config is never lab. The model never sets it."
         ),
     )
     planned_action: Optional[dict] = Field(

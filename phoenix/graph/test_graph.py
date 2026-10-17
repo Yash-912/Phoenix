@@ -504,7 +504,7 @@ def test_a_confident_deploy_finding_rolls_back_to_the_version_before_the_inciden
     resolve the target from history, roll back, verify."""
     rolled_back = _deploy_run(monkeypatch)
 
-    final = _final(graph.build_graph().invoke(_state(token_budget=100000, max_iterations=5)))
+    final = _final(graph.build_graph().invoke(_state(token_budget=100000, max_iterations=5, policy_mode="autonomous_lab")))
 
     assert final["confidence"] >= final["confidence_threshold"], final["confidence"]
     assert final["planned_action"]["action"] == "rollback_deployment"
@@ -523,7 +523,7 @@ def test_a_deploy_rollback_is_checked_against_the_version_it_restored(monkeypatc
     reporting a recovery that never happened."""
     _deploy_run(monkeypatch)
 
-    final = _final(graph.build_graph().invoke(_state(token_budget=100000, max_iterations=5)))
+    final = _final(graph.build_graph().invoke(_state(token_budget=100000, max_iterations=5, policy_mode="autonomous_lab")))
 
     assert final["verification_result"]["detail"]["expected_version"] == "v17"
     assert final["status"] == "resolved"
@@ -735,7 +735,7 @@ def test_a_confident_config_finding_rolls_back_to_the_known_good_pool_size(monke
     rolled_back = _config_run(monkeypatch)
 
     final = _final(
-        graph.build_graph().invoke(AgentState(incident_id=1, service_name=AUTH_SERVICE, token_budget=100000, max_iterations=5))
+        graph.build_graph().invoke(AgentState(incident_id=1, service_name=AUTH_SERVICE, token_budget=100000, max_iterations=5, policy_mode="autonomous_lab"))
     )
 
     assert final["confidence"] >= final["confidence_threshold"], final["confidence"]

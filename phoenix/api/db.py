@@ -67,3 +67,42 @@ def list_incidents() -> list[dict]:
     with pool.connection() as conn:
         rows = conn.execute(LIST_INCIDENTS).fetchall()
     return [dict(zip(columns, row)) for row in rows]
+
+
+# The first answer wins because this UPDATE only matches a row still pending and
+# not yet expired. A second answer matches nothing and changes nothing. Expiry
+# is refused here, not left to the sweep, so an answer that arrives after the
+# deadline cannot be an approval even in the gap before the sweep runs.
+DECIDE_APPROVAL = """
+UPDATE approvals
+SET status = %(status)s, decided_by = %(approver)s, decided_at = now(), decision_channel = %(channel)s
+WHERE id = %(id)s AND status = 'pending' AND expires_at > now()
+RETURNING id, incident_id, action, container, status, decided_by, decided_at;
+"""
+
+APPROVAL_CURRENT_STATE = """
+SELECT status FROM approvals WHERE id = %(id)s;
+"""
+
+
+def decide_approval(approval_id: int, status: str, approver: str, channel: str) -> tuple[str, dict | None]:
+    """Record one answer. Returns (outcome, detail).
+
+    outcome is 'decided' (detail is the row), 'not_found', 'expired' (pending but
+    past its deadline, so refused), or 'already_decided' (detail holds the status
+    that won).
+    """
+    with pool.connection() as conn:
+        row = conn.execute(
+            DECIDE_APPROVAL,
+            {"status": status, "approver": approver, "channel": channel, "id": approval_id},
+        ).fetchone()
+        if row:
+            columns = ["id", "incident_id", "action", "container", "status", "decided_by", "decided_at"]
+            return "decided", dict(zip(columns, row))
+        current = conn.execute(APPROVAL_CURRENT_STATE, {"id": approval_id}).fetchone()
+    if current is None:
+        return "not_found", None
+    if current[0] == "pending":
+        return "expired", None
+    return "already_decided", {"status": current[0]}
