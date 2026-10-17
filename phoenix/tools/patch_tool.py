@@ -142,6 +142,39 @@ def _used_names(nodes: list[ast.AST]) -> set[str]:
     return {n.id for node in nodes for n in ast.walk(node) if isinstance(n, ast.Name)}
 
 
+def _import_time_effect(statement: ast.AST) -> str | None:
+    """Why running this module-level statement at import time could do more
+    than bind a name, or None if it cannot.
+
+    A supporting declaration is imported before any test runs, so anything it
+    executes runs during collection. Imports and literal constants are allowed.
+    Assignments to anything but a plain name, or to a value that is not a
+    literal, are not, and neither is a function whose decorators, defaults or
+    annotations make a call when it is defined.
+    """
+    if isinstance(statement, (ast.Import, ast.ImportFrom)):
+        return None
+    if isinstance(statement, (ast.Assign, ast.AnnAssign)):
+        targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+        if not all(isinstance(t, ast.Name) for t in targets):
+            return "assigns to something other than a plain name"
+        if statement.value is None:
+            return None
+        try:
+            ast.literal_eval(statement.value)
+        except (ValueError, TypeError, SyntaxError):
+            return "assigns a value that is computed at import time, not a literal constant"
+        return None
+    if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        header = [*statement.decorator_list, statement.args]
+        if statement.returns is not None:
+            header.append(statement.returns)
+        if any(isinstance(n, ast.Call) for part in header for n in ast.walk(part)):
+            return "calls something while the function is being defined"
+        return None
+    return "runs code when the module is imported"
+
+
 def _outside_target_change(old_content, new_content, old_tree, new_tree, name, targets) -> str | None:
     """Why the patch changes something other than the target, or None.
 
@@ -184,6 +217,14 @@ def _outside_target_change(old_content, new_content, old_tree, new_tree, name, t
             f"patch adds module-level {names} that the target function '{name}' does not use; "
             f"only what the fix itself needs may be added"
         )
+    for statement in kept:
+        effect = _import_time_effect(statement)
+        if effect is not None:
+            names = ", ".join(sorted(_bound_names(statement))) or "a statement"
+            return (
+                f"patch adds module-level {names} that {effect}; supporting declarations "
+                f"must be imports, literal constants or plain functions"
+            )
 
     allowed_old = {n for q in targets for n in range(_span(old_functions[q])[0], _span(old_functions[q])[1] + 1)}
     allowed_new = {n for node in target_nodes for n in range(_span(node)[0], _span(node)[1] + 1)}
