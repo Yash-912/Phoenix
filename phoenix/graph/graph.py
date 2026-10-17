@@ -10,6 +10,7 @@ from phoenix.graph.nodes import (
     remediator_node,
     verifier_node,
 )
+from phoenix.graph.memory import remember_run
 from phoenix.graph.persist import close_persistence, record_audit
 from phoenix.graph.state import AgentState
 from phoenix.graph.tier3_nodes import (
@@ -229,6 +230,7 @@ if __name__ == "__main__":
                 policy_mode=safety_policy.load_config().execution_policy,
             )
         )
+        remember_run(result)
     finally:
         close_persistence()
     print("\nFinal state:")

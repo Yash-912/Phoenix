@@ -45,6 +45,7 @@ from langgraph.types import Command
 
 from phoenix.graph import approvals, safety_policy
 from phoenix.graph.graph import build_graph
+from phoenix.graph.memory import remember_run
 from phoenix.graph.persist import close_persistence, list_unhandled_incidents, max_incident_id, record_audit
 from phoenix.graph.state import AgentState
 
@@ -99,6 +100,7 @@ def _handle_result(incident_id: int, app, config: dict, result) -> None:
         _paused[approval_id] = (incident_id, app, config)
         print(f"[watcher] incident {incident_id} paused, waiting on approval {approval_id}")
         return
+    remember_run(result)
     status = result.get("status") if isinstance(result, dict) else getattr(result, "status", None)
     print(f"[watcher] incident {incident_id} finished: status={status}")
     if status in ("escalated", "insufficient_evidence"):
