@@ -28,11 +28,16 @@ WHERE service_name = %(service_name)s
 RETURNING id;
 """
 
+# incidents.status is the Alertmanager alert lifecycle (active or resolved), not
+# the investigation outcome. The outcome lives in incident_memory.status, and is
+# null until the investigation has finished.
 LIST_INCIDENTS = """
-SELECT id, service_name, alertname, severity, status,
-       first_seen_at, last_seen_at, alert_count
-FROM incidents
-ORDER BY first_seen_at DESC;
+SELECT i.id, i.service_name, i.alertname, i.severity, i.status,
+       m.status AS investigation_status,
+       i.first_seen_at, i.last_seen_at, i.alert_count
+FROM incidents i
+LEFT JOIN incident_memory m ON m.incident_id = i.id
+ORDER BY i.first_seen_at DESC;
 """
 
 
@@ -62,7 +67,7 @@ def resolve_incident(service_name: str, alertname: str) -> int | None:
 def list_incidents() -> list[dict]:
     columns = [
         "id", "service_name", "alertname", "severity", "status",
-        "first_seen_at", "last_seen_at", "alert_count",
+        "investigation_status", "first_seen_at", "last_seen_at", "alert_count",
     ]
     with pool.connection() as conn:
         rows = conn.execute(LIST_INCIDENTS).fetchall()
