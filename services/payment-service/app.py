@@ -86,11 +86,8 @@ def _find_charge_slow(order_id: str) -> tuple | None:
     """
     conn = _get_conn()
     with conn.cursor() as cur:
-        cur.execute("SELECT order_id, amount, status FROM charges")
-        for row in cur.fetchall():
-            if row[0] == order_id:
-                return row[1], row[2]
-    return None
+        cur.execute("SELECT amount, status FROM charges WHERE order_id = %s", (order_id,))
+        return cur.fetchone()
 
 
 def find_charge(order_id: str) -> tuple | None:
