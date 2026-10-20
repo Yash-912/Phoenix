@@ -1,22 +1,18 @@
 services:
   docker-socket-proxy:
-    image: tecnativa/docker-socket-proxy:latest
+    # Pinned by digest: the rule order inside this image decides what the proxy
+    # lets through, and :latest can change it underneath us.
+    image: tecnativa/docker-socket-proxy@sha256:1f5038b54f06c3e18422902cf00ba21803d1c97805aae032e5e6673d532d3459
     container_name: docker-socket-proxy
-    environment:
-      # Read-only container inspection (docker_tool.get_container_state and the
-      # labels read in remediation_policy). Needed for GET /containers/*.
-      CONTAINERS: 1
-      # POST stays off. It would open every POST endpoint, including
-      # /containers/create and /containers/{id}/exec, which with the socket
-      # mounted is host-root equivalent. Instead the proxy's per-verb flags
-      # grant only what remediation_tool.py calls: restart, pause and unpause
-      # on containers. Anything else is denied at the proxy. ALLOW_RESTARTS is
-      # the proxy's own grouping and also covers stop and kill.
-      ALLOW_RESTARTS: 1
-      ALLOW_PAUSE: 1
-      ALLOW_UNPAUSE: 1
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
+      # The allowlist lives in this template rather than in environment flags.
+      # The image's own template refuses every non-GET unless POST=1 before it
+      # reaches the ALLOW_RESTARTS / ALLOW_PAUSE / ALLOW_UNPAUSE rules, and
+      # POST=1 would open /containers/create and /containers/{id}/exec, which
+      # with the socket mounted is host-root equivalent. The template allows GET
+      # on /containers/{name}/json and POST on restart, pause and unpause only.
+      - ./infra/docker-socket-proxy/haproxy.cfg.template:/usr/local/etc/haproxy/haproxy.cfg.template:ro
     ports:
       - "127.0.0.1:2375:2375"
     networks:
