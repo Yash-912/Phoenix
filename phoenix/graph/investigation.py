@@ -21,6 +21,8 @@ covered without an entry here.
 
 from __future__ import annotations
 
+import re
+
 from phoenix.graph import scoring
 
 # Two consecutive passes with an unchanged picture: the first can be an unlucky
@@ -127,6 +129,17 @@ def _leader_phrase(state) -> str:
     )
 
 
+def _short_error(error) -> str | None:
+    """A tool's error text without the request URL, which pushes the cause past any cut.
+
+    An HTTP failure reads "400 Client Error: Bad Request for url: <long url>: parse
+    error at ..."; the part that says what was wrong comes after the url.
+    """
+    if not error:
+        return None
+    return re.sub(r"for url: \S+?(?=:\s|$)", "for url: <url>", str(error))[:MAX_QUERY_LENGTH]
+
+
 def insufficient_evidence_report(state, reason: str | None = None) -> dict | None:
     """A report of why a run ended with no finding, or None when that is not the case.
 
@@ -153,14 +166,25 @@ def insufficient_evidence_report(state, reason: str | None = None) -> dict | Non
         return None
 
     usable: dict[str, int] = {}
+    reads: dict[str, int] = {}
     seen: set[str] = set()
+    failed_reads: list[dict] = []
     for item in state.evidence:
         source = item.get("source", "")
         if source not in scoring.SOURCE_WEIGHTS:
             continue
         seen.add(source)
+        reads[source] = reads.get(source, 0) + 1
         if scoring._is_usable(item):
             usable[source] = usable.get(source, 0) + 1
+        else:
+            raw = item.get("raw_data")
+            error = raw.get("error") if isinstance(raw, dict) else None
+            failed_reads.append({
+                "source": source,
+                "query": item.get("summary", "")[:MAX_QUERY_LENGTH],
+                "error": _short_error(error),
+            })
     # A run that stopped for room before it read anything usable never looked, so
     # there is no absence of evidence to report: that is a budget problem. A run
     # that stagnated went round without learning, which counts either way.
@@ -181,13 +205,21 @@ def insufficient_evidence_report(state, reason: str | None = None) -> dict | Non
     answered_without_support = sorted(source for source in usable if source not in supporting)
     failed = sorted(source for source in seen if source not in usable)
     never_read = sorted(source for source in scoring.SOURCE_WEIGHTS if source not in seen)
+    # A source that answered on some reads still lost the ones that failed; naming
+    # only sources with no usable read would report a rejected query as nothing.
+    partly_failed = sorted({entry["source"] for entry in failed_reads} - set(failed))
+    partly_failed_text = ", ".join(
+        f"{source} ({sum(1 for e in failed_reads if e['source'] == source)} of {reads[source]} reads)"
+        for source in partly_failed
+    )
 
     summary = (
         f"Insufficient evidence after {state.iteration} pass(es): {len(considered)} hypothesis(es) "
         f"considered, none supported by two independent sources. "
         f"Answered without support: {', '.join(answered_without_support) or 'none'}. "
         f"Read failed: {', '.join(failed) or 'none'}. "
-        f"Never read: {', '.join(never_read) or 'none'}."
+        + (f"Some reads failed: {partly_failed_text}. " if partly_failed_text else "")
+        + f"Never read: {', '.join(never_read) or 'none'}."
     )
     return {
         "reason": reason,
@@ -196,6 +228,7 @@ def insufficient_evidence_report(state, reason: str | None = None) -> dict | Non
         "sources_supporting_any_hypothesis": supporting,
         "sources_answered_without_support": answered_without_support,
         "sources_failed": failed,
+        "failed_reads": failed_reads,
         "sources_never_read": never_read,
         "queries_run": len(state.evidence),
         "queries": [item["summary"][:MAX_QUERY_LENGTH] for item in state.evidence[-MAX_LISTED_QUERIES:]],

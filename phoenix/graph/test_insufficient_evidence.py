@@ -95,6 +95,39 @@ def test_a_failed_read_is_reported_as_failed_not_as_answered():
     assert report["sources_answered_without_support"] == []
 
 
+def test_a_failed_read_of_a_source_that_also_answered_is_still_reported():
+    """One rejected query must not vanish because the same source answered another."""
+    rejected = _ev("query_loki", "", ok=False)
+    rejected["summary"] = "query_loki({'logql': 'bad |= \"a\" OR |= \"b\"'})"
+    evidence = [_ev("query_prometheus", PROM_ERRORS), _ev("query_loki", LOKI_GENERIC), rejected]
+    state = _state(evidence, OVERLOAD, stagnant_passes=2)
+
+    report = investigation.insufficient_evidence_report(state)
+
+    assert report["sources_failed"] == []
+    assert report["sources_answered_without_support"] == ["query_loki"]
+    assert report["failed_reads"] == [
+        {"source": "query_loki", "query": rejected["summary"], "error": "boom"}
+    ]
+    assert "Some reads failed: query_loki (1 of 2 reads)" in report["summary"]
+
+
+def test_a_failed_reads_error_keeps_its_cause_and_drops_the_request_url():
+    error = (
+        "400 Client Error: Bad Request for url: http://localhost:3100/loki/api/v1/query_range"
+        "?query=%7Bc%3D%22x%22%7D+%7C%3D+%22a%22" + "&start=1" * 20
+        + ": parse error at line 0, col 45: syntax error: unexpected |="
+    )
+    item = _ev("query_loki", "", ok=False)
+    item["raw_data"]["error"] = error
+    state = _state([_ev("query_prometheus", PROM_ERRORS), item], OVERLOAD, stagnant_passes=2)
+
+    report = investigation.insufficient_evidence_report(state)
+
+    assert "localhost" not in report["failed_reads"][0]["error"]
+    assert report["failed_reads"][0]["error"].endswith("parse error at line 0, col 45: syntax error: unexpected |=")
+
+
 # ---- the router ----------------------------------------------------------------
 
 
