@@ -1,1 +1,2 @@
 *.sh text eol=lf
+infra/docker-socket-proxy/*.template text eol=lf

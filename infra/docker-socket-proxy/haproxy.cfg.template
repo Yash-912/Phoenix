@@ -1,0 +1,68 @@
+global
+    log stdout format raw daemon "${LOG_LEVEL}"
+
+    pidfile /run/haproxy.pid
+    maxconn 4000
+
+    # Turn on stats unix socket
+    server-state-file /var/lib/haproxy/server-state
+
+defaults
+    mode http
+    log global
+    option httplog
+    option dontlognull
+    option http-server-close
+    option redispatch
+    retries 3
+    timeout http-request 10s
+    timeout queue 1m
+    timeout connect 10s
+    timeout client 10m
+    timeout server 10m
+    timeout http-keep-alive 10s
+    timeout check 10s
+    maxconn 3000
+
+    # Allow seamless reloads
+    load-server-state-from-file global
+
+    # Use provided example error pages
+    errorfile 400 /usr/local/etc/haproxy/errors/400.http
+    errorfile 403 /usr/local/etc/haproxy/errors/403.http
+    errorfile 408 /usr/local/etc/haproxy/errors/408.http
+    errorfile 500 /usr/local/etc/haproxy/errors/500.http
+    errorfile 502 /usr/local/etc/haproxy/errors/502.http
+    errorfile 503 /usr/local/etc/haproxy/errors/503.http
+    errorfile 504 /usr/local/etc/haproxy/errors/504.http
+
+backend dockerbackend
+    server dockersocket $SOCKET_PATH
+
+backend docker-events
+    server dockersocket $SOCKET_PATH
+    timeout server 0
+
+frontend dockerfrontend
+    bind ${BIND_CONFIG}
+    # Phoenix replaces the stock ACL block. In the stock template the line
+    # "http-request deny unless METH_GET || { env(POST) -m bool }" runs before
+    # the per-verb ALLOW_* rules, so with POST=0 every non-GET is refused first
+    # and ALLOW_RESTARTS / ALLOW_PAUSE / ALLOW_UNPAUSE never take effect. With
+    # POST=1 the generic /containers rule would instead allow /containers/create
+    # and /containers/{id}/exec. So the allowlist is spelled out here and nothing
+    # is controlled by environment flags.
+
+    # Container inspection: docker_tool.get_container_state and the deploy
+    # tracker's label reads.
+    http-request allow if METH_GET { path,url_dec -m reg -i ^(/v[\d\.]+)?/containers/[a-zA-Z0-9_.-]+/json$ }
+
+    # Tier 1 verbs, as listed in remediation_tool.ALLOWED_DOCKER_ACTIONS. Stop,
+    # kill, start, create and exec are not on this list.
+    http-request allow if METH_POST { path,url_dec -m reg -i ^(/v[\d\.]+)?/containers/[a-zA-Z0-9_.-]+/(restart|pause|unpause)$ }
+
+    # Liveness and version negotiation for Docker clients.
+    http-request allow if METH_GET { path,url_dec -m reg -i ^(/v[\d\.]+)?/(_ping|version)$ }
+
+    http-request deny
+    default_backend dockerbackend
