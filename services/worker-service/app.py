@@ -67,7 +67,7 @@ def _cache_store_bounded(job_id: str, result: dict) -> None:
     """The fix: cap the cache at _CACHE_MAX_SIZE, evicting the oldest entry
     (insertion order -- a plain dict preserves it) once full."""
     with _cache_lock:
-        if job_id not in _cache and len(_cache) >= _CACHE_MAX_SIZE:
+        if len(_cache) >= _CACHE_MAX_SIZE:
             oldest_job_id = next(iter(_cache))
             del _cache[oldest_job_id]
         _cache[job_id] = result
