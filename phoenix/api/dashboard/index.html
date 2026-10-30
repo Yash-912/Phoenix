@@ -8,9 +8,12 @@
   <link rel="stylesheet" href="styles/tokens.css">
   <link rel="stylesheet" href="styles/base.css">
   <link rel="stylesheet" href="styles/components.css">
+  <link rel="stylesheet" href="styles/motion.css">
+  <script>document.documentElement.classList.add("js");</script>
   <script type="module" src="js/main.js"></script>
 </head>
 <body>
+  <div class="progress" id="progress" aria-hidden="true"></div>
   <a class="skip-link" href="#app">Skip to the content</a>
   <header class="topbar">
     <div class="topbar__inner">
@@ -18,11 +21,15 @@
       <nav class="nav" aria-label="Main">
         <a href="#/" data-nav="incidents">Incidents</a>
         <a href="#/approvals" data-nav="approvals">Approvals<span class="badge" id="pending-badge" hidden></span></a>
+        <span class="live" id="live" data-state="live">Connecting</span>
       </nav>
     </div>
   </header>
   <main class="frame" id="app" tabindex="-1">
-    <p class="state muted">Loading…</p>
+    <div role="status" aria-label="Loading">
+      <div class="skeleton skeleton--title"></div>
+      <div class="skeleton skeleton--row"></div><div class="skeleton skeleton--row"></div><div class="skeleton skeleton--row"></div>
+    </div>
   </main>
   <noscript><p class="frame">The dashboard needs JavaScript to read from Phoenix.</p></noscript>
 </body>

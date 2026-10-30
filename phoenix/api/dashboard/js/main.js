@@ -6,6 +6,7 @@ import { renderList } from "./views/list.js";
 import { renderDetail, renderNotFound } from "./views/detail.js";
 import { renderApprovals } from "./views/approvals.js";
 import { emptyState } from "./views/shared.js";
+import { bindChrome, countUp, jumpTo, reveal, watchSections } from "./motion.js";
 
 const app = document.getElementById("app");
 const REFRESH_MS = 8000;
@@ -36,8 +37,22 @@ function setNav(route, pending) {
   badge.textContent = pending ? String(pending) : "";
 }
 
-function paint(markup) {
+// animate is true for a page the person just arrived at, and false for a background refresh or
+// a small interaction, so a live update never replays the entrance.
+function paint(markup, animate = false) {
+  app.classList.toggle("no-anim", !animate);
   app.innerHTML = toString(markup);
+  app.classList.remove("is-loading");
+  reveal(app, animate);
+  countUp(app, animate);
+  watchSections(app);
+}
+
+const live = document.getElementById("live");
+function markLive(ok) {
+  if (!live) return;
+  live.dataset.state = ok ? "live" : "stale";
+  live.textContent = ok ? `Live · ${new Date().toLocaleTimeString([], { hour12: false })}` : "Not reachable, retrying";
 }
 
 // The tab title says where you are, and moving to a new page puts keyboard focus on its
@@ -56,6 +71,7 @@ function focusHeading() {
 }
 
 function failure(error) {
+  markLive(false);
   const text = error.status === 503 ? "The database behind Phoenix is not reachable right now." : "Phoenix did not answer.";
   paint(emptyState(text, "This page will keep trying.", null));
 }
@@ -77,14 +93,15 @@ function view(route, data) {
   return renderList({ incidents: data.incidents, filter: state.filter, now });
 }
 
-async function show({ force = false } = {}) {
+async function show({ force = false, animate = force } = {}) {
   const route = parseRoute();
   try {
     const data = await load(route);
     const key = JSON.stringify([route, data]);
     if (!force && key === state.last.key) return;
     state.last = { key, data };
-    paint(view(route, data));
+    paint(view(route, data), animate);
+    markLive(true);
     document.title = titleFor(route, data);
     if (force && state.focusNext) {
       state.focusNext = false;
@@ -102,9 +119,9 @@ async function show({ force = false } = {}) {
   }
 }
 
-function rerender() {
+function rerender(animate = false) {
   const route = parseRoute();
-  if (state.last.data) paint(view(route, state.last.data));
+  if (state.last.data) paint(view(route, state.last.data), animate);
 }
 
 window.addEventListener("hashchange", () => {
@@ -113,6 +130,7 @@ window.addEventListener("hashchange", () => {
   state.last = { key: "", data: null };
   state.focusNext = true;
   window.scrollTo(0, 0);
+  app.classList.add("is-loading");
   show({ force: true });
 });
 
@@ -122,12 +140,14 @@ app.addEventListener("click", async (event) => {
   const action = target.dataset.action;
   if (action === "filter") {
     state.filter = target.dataset.filter;
-    rerender();
+    rerender(true);
     app.querySelector(`[data-filter="${state.filter}"]`)?.focus();
   } else if (action === "toggle-minor") {
     state.ui.showMinor = !state.ui.showMinor;
     rerender();
     app.querySelector('[data-action="toggle-minor"]')?.focus();
+  } else if (action === "jump") {
+    jumpTo(target.dataset.jump);
   } else if (action === "show-all-steps") {
     state.ui.showAllSteps = true;
     rerender();
@@ -161,7 +181,7 @@ app.addEventListener("submit", async (event) => {
   rerender();
   const result = await decide(window.fetch.bind(window), { approvalId, decision, approver, token });
   state.ui.decision = { approvalId, busy: false, message: result.message, ok: result.ok };
-  if (result.ok) await show({ force: true });
+  if (result.ok) await show({ force: true, animate: false });
   else rerender();
 });
 
@@ -171,6 +191,14 @@ setInterval(() => {
   if (app.contains(document.activeElement) && document.activeElement.tagName === "INPUT") return;
   show();
 }, REFRESH_MS);
+
+bindChrome();
+
+// The skip link cannot be a #anchor: the page routes on the URL hash.
+document.querySelector(".skip-link")?.addEventListener("click", (event) => {
+  event.preventDefault();
+  app.focus();
+});
 
 (async function start() {
   try {

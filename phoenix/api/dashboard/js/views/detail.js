@@ -6,7 +6,7 @@ import { clockTime, diffLines, factValue, fullTime, humanKey, percent, pretty, s
 import { alertChip, emptyState, outcomeChip } from "./shared.js";
 
 function section(number, label, heading, body, note) {
-  return html`<section class="section" aria-labelledby="s${number}">
+  return html`<section class="section" id="section-s${number}" data-reveal aria-labelledby="s${number}">
     <div class="section__label"><p class="label">${String(number).padStart(2, "0")} · ${label}</p><h2 id="s${number}">${heading}</h2>${note ? html`<p>${note}</p>` : ""}</div>
     <div class="section__body">${body}</div>
   </section>`;
@@ -203,11 +203,11 @@ function evidenceReport(report) {
 
 // --- 04 steps ---------------------------------------------------------------------------
 
-function stepItem(step) {
+function stepItem(step, index = 0) {
   const decision = ["diagnose", "route", "act", "approval", "verify"].includes(step.kind);
   const cls = ["step", decision ? "step--decision" : "", step.kind === "stop" ? "step--stop" : "", step.kind === "failure" ? "step--failure" : "", step.minor ? "step--minor" : ""].filter(Boolean).join(" ");
   const entries = Object.entries(step.facts || {});
-  return html`<li class="${cls}"><span class="step__dot" aria-hidden="true"></span><div>
+  return html`<li class="${cls}" data-reveal style="--i:${Math.min(index, 10)}"><span class="step__dot" aria-hidden="true"></span><div>
     <div class="step__head"><span class="step__title">${step.title}</span><span class="step__kind">${step.node}${step.iteration ? ` · pass ${step.iteration}` : ""}</span><span class="step__time">${clockTime(step.at)}</span></div>
     ${step.text ? html`<p class="step__text">${step.text}</p>` : ""}
     ${entries.length ? html`<div class="step__facts">${entries.map(([k, v]) => html`<span>${humanKey(k)} <b>${factValue(v)}</b></span>`)}</div>` : ""}
@@ -270,6 +270,13 @@ function rawBody(trace, ui) {
 
 // --- page -------------------------------------------------------------------------------
 
+const JUMPS = [["s1", "Summary"], ["s2", "What it did"], ["s3", "Reasoning"], ["s4", "Trail"], ["s5", "Evidence"], ["s6", "History"], ["s7", "Record"]];
+
+// Buttons, not links: the page routes on the URL hash, so a #anchor link would leave the page.
+function jumpBar() {
+  return html`<nav class="jump" aria-label="On this page">${JUMPS.map(([id, label]) => html`<button type="button" data-action="jump" data-jump="${id}">${label}</button>`)}</nav>`;
+}
+
 export function renderDetail({ trace, ui, config, now }) {
   const i = trace.incident;
   const open = trace.approvals.filter((a) => a.can_decide);
@@ -281,6 +288,7 @@ export function renderDetail({ trace, ui, config, now }) {
       </div>
       ${incidentRecord(trace)}
     </header>
+    ${jumpBar()}
     ${open.length ? html`<div class="block" role="region" aria-label="Needs an answer"><p class="block__title">Needs an answer</p>${open.map((a) => approvalCard(a, ui, config, now))}</div>` : ""}
     ${section(1, "Summary", "What happened", summary(trace))}
     ${section(2, "Actions", "What Phoenix did", didBody(trace, ui, config, now), "The tier it chose, why, who approved it, what it changed and whether that worked.")}

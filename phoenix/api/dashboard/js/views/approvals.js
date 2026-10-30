@@ -6,7 +6,7 @@ import { emptyState } from "./shared.js";
 
 export function renderApprovals({ approvals, now }) {
   const body = approvals.length
-    ? html`<nav class="rows" aria-label="Open approval requests">${approvals.map((a) => html`<a class="row" href="#/incidents/${a.incident_id}">
+    ? html`<nav class="rows" aria-label="Open approval requests">${approvals.map((a, index) => html`<a class="row" href="#/incidents/${a.incident_id}" data-reveal style="--i:${Math.min(index, 12)}">
         <span class="row__id">#${a.incident_id}</span>
         <span><span class="row__title">${a.action.replace(/_/g, " ")} on ${a.container}</span><br><span class="row__sub">${a.service_name} · tier ${a.tier}</span></span>
         <span class="row__outcome"><span class="chip chip--attention">${timeLeft(a.expires_at, now)}</span></span>

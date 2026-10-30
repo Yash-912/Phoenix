@@ -3,6 +3,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { html, raw, toString } from "../js/html.js";
 import { applyFilter, diffLines, factValue, filterCounts, relativeTime, safeUrl, stats, timeLeft } from "../js/format.js";
+import { countAt, easeOutCubic } from "../js/motion.js";
 import { clearCredentials, decide, loadCredentials, saveCredentials } from "../js/approve.js";
 
 test("html escapes by default and trusts only raw()", () => {
@@ -153,4 +154,13 @@ test("credentials round-trip through storage and tolerate a broken one", () => {
   const throwing = { getItem() { throw new Error("blocked"); }, setItem() { throw new Error("blocked"); }, removeItem() { throw new Error("blocked"); } };
   assert.deepEqual(loadCredentials(throwing), { approver: "", token: "" });
   assert.doesNotThrow(() => saveCredentials(throwing, { approver: "a", token: "t" }));
+});
+
+test("the count-up eases out, starts at zero and lands exactly on the number", () => {
+  assert.equal(countAt(50, 0), 0);
+  assert.equal(countAt(50, 1), 50);
+  assert.equal(countAt(50, 2), 50);
+  assert.equal(countAt(50, -1), 0);
+  assert.ok(easeOutCubic(0.5) > 0.5, "fast at first, slow at the end");
+  assert.ok(countAt(100, 0.3) > 30);
 });

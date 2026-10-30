@@ -175,7 +175,29 @@ test("every form field has a visible label and the page has one h1", opts, () =>
 
 test("every section has a labelled heading for screen readers", opts, () => {
   const out = detail(33);
-  const sections = out.match(/<section class="section" aria-labelledby="(s\d)"/g) || [];
+  const sections = out.match(/<section class="section" id="section-s\d" data-reveal aria-labelledby="(s\d)"/g) || [];
   assert.equal(sections.length, 7);
   for (const [, id] of out.matchAll(/aria-labelledby="(s\d)"/g)) assert.ok(out.includes(`id="${id}"`), id);
+});
+
+test("the jump bar uses buttons, never #anchors, because the page routes on the hash", opts, () => {
+  const out = detail(33);
+  const bar = out.match(/<nav class="jump"[\s\S]*?<\/nav>/)[0];
+  assert.equal((bar.match(/<button type="button" data-action="jump" data-jump="s\d"/g) || []).length, 7);
+  assert.doesNotMatch(bar, /href=/);
+  for (const [, id] of bar.matchAll(/data-jump="(s\d)"/g)) assert.ok(out.includes(`id="section-${id}"`), id);
+});
+
+test("the list rows, stats and hero are marked for motion and carry their final numbers", opts, () => {
+  const out = toString(renderList({ incidents: load("overview.json").incidents, filter: "all", now: NOW }));
+  assert.match(out, /class="hero__art"/);
+  assert.equal((out.match(/class="row" href=[^>]*data-reveal/g) || []).length, 10);
+  assert.match(out, /data-count="10">10</);
+});
+
+test("steps are staggered but the stagger is capped so a long trace is not slow", opts, () => {
+  const out = toString(renderDetail({ trace: load("trace_long.json"), ui: ui({ showMinor: true, showAllSteps: true }), config: { approvals_enabled: false }, now: NOW }));
+  const delays = [...out.matchAll(/<li class="step[^>]*style="--i:(\d+)"/g)].map((m) => Number(m[1]));
+  assert.equal(delays.length, 180);
+  assert.equal(Math.max(...delays), 10);
 });
