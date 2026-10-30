@@ -1,14 +1,20 @@
+import functools
 import json
 import os
 from typing import NamedTuple
 
 from openai import (
+    APIConnectionError,
+    APIStatusError,
+    AuthenticationError,
     BadRequestError,
     ContentFilterFinishReasonError,
     LengthFinishReasonError,
     NotFoundError,
     OpenAI,
     OpenAIError,
+    PermissionDeniedError,
+    RateLimitError,
     UnprocessableEntityError,
 )
 from openai.types.chat import ChatCompletion
@@ -20,7 +26,137 @@ LLM_BASE_URL = os.environ["LLM_BASE_URL"]
 LLM_API_KEY = os.environ["LLM_API_KEY"]
 LLM_MODEL = os.environ["LLM_MODEL"]
 
-client = OpenAI(base_url=LLM_BASE_URL, api_key=LLM_API_KEY)
+# The SDK retries a connection error, a timeout, a 429 and a 5xx on its own, with
+# exponential backoff and the provider's Retry-After, before an error reaches this
+# module. That is the bounded retry for one call; it is made explicit here (the SDK's
+# own default is 2) so it is a setting and not an accident. What is left after it is
+# an outage, which raises LLMUnavailableError, and retrying the whole investigation
+# later is the watcher's job.
+DEFAULT_LLM_MAX_RETRIES = 2
+
+
+def _max_retries_from_env() -> int:
+    try:
+        value = int(os.environ.get("LLM_MAX_RETRIES", ""))
+    except ValueError:
+        return DEFAULT_LLM_MAX_RETRIES
+    return value if value >= 0 else DEFAULT_LLM_MAX_RETRIES
+
+
+LLM_MAX_RETRIES = _max_retries_from_env()
+
+client = OpenAI(base_url=LLM_BASE_URL, api_key=LLM_API_KEY, max_retries=LLM_MAX_RETRIES)
+
+
+class LLMCallError(RuntimeError):
+    """An LLM call that produced no response. Carries the failing operation; the
+    provider's own error is chained as the cause.
+
+    Two kinds, kept apart because they call for opposite responses. An outage will
+    probably pass, so the whole investigation may be tried again later
+    (LLMUnavailableError). A rejected request will not: the same request is refused
+    the same way every time (LLMRequestRejectedError).
+    """
+
+    def __init__(self, operation: str, cause: BaseException):
+        self.operation = operation
+        super().__init__(f"{operation}: the LLM call failed ({type(cause).__name__}: {cause})")
+
+
+class LLMUnavailableError(LLMCallError):
+    """The model could not be reached or would not serve the request right now:
+    a connection error or timeout, a 429, a 5xx, or an authentication failure.
+
+    Distinct from a response that came back unusable. An unusable response is an
+    answer the model gave (no hypotheses, no defect) and is judged on the evidence; an
+    outage is the absence of an answer, and reporting it as "no hypotheses" would end a
+    run as insufficient_evidence when the evidence was never weighed at all.
+    """
+
+
+class LLMRequestRejectedError(LLMCallError):
+    """The provider refused this particular request (a 400 such as a prompt over the
+    context window or a content-policy refusal, a 404 or a 422). Not an outage, and
+    not worth retrying: it ends the run, once, as an escalation.
+    """
+
+
+def _call_error(operation: str, exc: OpenAIError) -> LLMCallError:
+    """Classify an SDK error: an outage when it says the service, not the request, failed.
+
+    Connection errors and timeouts, rate limits, server errors (5xx), a request timeout
+    (408) and authentication or permission failures are the service's state, and may
+    clear. Any other status is the provider rejecting what was sent. An SDK error that
+    carries no status at all is treated as an outage, which is what every OpenAIError
+    was treated as before this distinction existed.
+    """
+    if isinstance(exc, (APIConnectionError, RateLimitError, AuthenticationError, PermissionDeniedError)):
+        return LLMUnavailableError(operation, exc)
+    if isinstance(exc, APIStatusError):
+        if exc.status_code >= 500 or exc.status_code == 408:
+            return LLMUnavailableError(operation, exc)
+        return LLMRequestRejectedError(operation, exc)
+    return LLMUnavailableError(operation, exc)
+
+
+def _outage_is_unavailable(operation: str):
+    """Let an SDK error out of a call that has no fallback only as an LLMCallError."""
+
+    def wrap(fn):
+        @functools.wraps(fn)
+        def inner(*args, **kwargs):
+            try:
+                return fn(*args, **kwargs)
+            except OpenAIError as exc:
+                raise _call_error(operation, exc) from exc
+
+        return inner
+
+    return wrap
+
+
+# Providers differ in whether they accept a json_schema response_format. A 400, 404
+# or 422 on the structured request is the provider (or the model) saying it does not
+# support that schema, and it will say so every time, so the next diagnosis would
+# pay for a call that is known to fail before the prompt-JSON call that works. The
+# rejection is remembered for the life of the process, per model and per schema.
+#
+# Only an error that SAYS structured output is unsupported is remembered. A 400 can
+# just as well be about this prompt (over the context window, refused by a content
+# policy), and remembering that would switch structured output off for a provider that
+# supports it. A response that was merely unreadable (LengthFinishReason, ContentFilter,
+# a validation error) says nothing about the provider either, and is tried again.
+_STRUCTURED_UNSUPPORTED: set[tuple[str, str]] = set()
+_REMEMBERED_REJECTIONS = (BadRequestError, NotFoundError, UnprocessableEntityError)
+
+# An error names the feature, and says it is not available. Both are required: a
+# message that only mentions response_format (while refusing the prompt's content) is
+# not a statement about support.
+_STRUCTURED_FEATURE_WORDS = ("response_format", "json_schema", "structured output", "structured_output")
+_UNSUPPORTED_WORDS = (
+    "not supported", "unsupported", "does not support", "doesn't support", "not available",
+    "unrecognized", "unknown parameter", "invalid parameter", "invalid value", "not allowed",
+)
+
+
+def _says_structured_output_unsupported(exc: BaseException) -> bool:
+    parts = [str(exc)]
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        parts.extend(str(value) for value in body.values())
+    elif body:
+        parts.append(str(body))
+    text = " ".join(parts).lower()
+    return any(w in text for w in _STRUCTURED_FEATURE_WORDS) and any(w in text for w in _UNSUPPORTED_WORDS)
+
+
+def _structured_known_unsupported(schema) -> bool:
+    return (LLM_MODEL, schema.__name__) in _STRUCTURED_UNSUPPORTED
+
+
+def _remember_structured_rejection(schema, exc: BaseException) -> None:
+    if isinstance(exc, _REMEMBERED_REJECTIONS) and _says_structured_output_unsupported(exc):
+        _STRUCTURED_UNSUPPORTED.add((LLM_MODEL, schema.__name__))
 
 
 class ToolCallDecision(NamedTuple):
@@ -223,6 +359,7 @@ TOOL_SCHEMAS = [
 ]
 
 
+@_outage_is_unavailable("decide_tool_calls")
 def decide_tool_calls(
     service_name: str,
     evidence_so_far: list[dict],
@@ -410,32 +547,33 @@ def decide_hypotheses(
 
     tokens = 0
 
-    try:
-        completion = client.beta.chat.completions.parse(
-            model=LLM_MODEL, temperature=TEMPERATURE,
-            messages=messages,
-            response_format=DiagnoserOutput,
-        )
-    except (
-        BadRequestError,
-        NotFoundError,
-        UnprocessableEntityError,
-        LengthFinishReasonError,
-        ContentFilterFinishReasonError,
-        ValidationError,
-    ) as exc:
-        print(f"[llm_client] structured hypotheses rejected, falling back to prompt JSON: {exc}")
-    except OpenAIError as exc:
-        print(f"[llm_client] hypothesis generation failed, LLM call failed: {exc}")
-        return HypothesisDecision(DiagnoserOutput.model_construct(hypotheses=[]), tokens)
-    else:
-        tokens = _tokens(completion)
-        if not completion.choices:
-            print("[llm_client] structured response carried no choices, falling back to prompt JSON")
-        parsed = completion.choices[0].message.parsed if completion.choices else None
-        if parsed is not None:
-            return HypothesisDecision(parsed, tokens)
-        print("[llm_client] structured hypotheses came back unparsed, falling back to prompt JSON")
+    if not _structured_known_unsupported(DiagnoserOutput):
+        try:
+            completion = client.beta.chat.completions.parse(
+                model=LLM_MODEL, temperature=TEMPERATURE,
+                messages=messages,
+                response_format=DiagnoserOutput,
+            )
+        except (
+            BadRequestError,
+            NotFoundError,
+            UnprocessableEntityError,
+            LengthFinishReasonError,
+            ContentFilterFinishReasonError,
+            ValidationError,
+        ) as exc:
+            _remember_structured_rejection(DiagnoserOutput, exc)
+            print(f"[llm_client] structured hypotheses rejected, falling back to prompt JSON: {exc}")
+        except OpenAIError as exc:
+            raise _call_error("decide_hypotheses", exc) from exc
+        else:
+            tokens = _tokens(completion)
+            if not completion.choices:
+                print("[llm_client] structured response carried no choices, falling back to prompt JSON")
+            parsed = completion.choices[0].message.parsed if completion.choices else None
+            if parsed is not None:
+                return HypothesisDecision(parsed, tokens)
+            print("[llm_client] structured hypotheses came back unparsed, falling back to prompt JSON")
 
     try:
         fallback = client.chat.completions.create(
@@ -456,8 +594,7 @@ def decide_hypotheses(
             ],
         )
     except OpenAIError as exc:
-        print(f"[llm_client] discarding hypothesis generation, LLM call failed: {exc}")
-        return HypothesisDecision(DiagnoserOutput.model_construct(hypotheses=[]), tokens)
+        raise _call_error("decide_hypotheses", exc) from exc
 
     tokens += _tokens(fallback)
     if not fallback.choices:
@@ -598,6 +735,7 @@ _SCAFFOLDING_GUIDANCE = (
 )
 
 
+@_outage_is_unavailable("decide_code_investigation_calls")
 def decide_code_investigation_calls(
     service_name: str, hypothesis_description: str, evidence_so_far: list[dict], repo_context: dict | None = None
 ) -> ToolCallDecision:
@@ -715,24 +853,25 @@ def decide_defect(service_name: str, hypothesis_description: str, evidence: list
     ]
 
     tokens = 0
-    try:
-        completion = client.beta.chat.completions.parse(
-            model=LLM_MODEL, temperature=TEMPERATURE, messages=messages, response_format=CodeDefect,
-        )
-    except (
-        BadRequestError, NotFoundError, UnprocessableEntityError,
-        LengthFinishReasonError, ContentFilterFinishReasonError, ValidationError,
-    ) as exc:
-        print(f"[llm_client] structured defect rejected, falling back to prompt JSON: {exc}")
-    except OpenAIError as exc:
-        print(f"[llm_client] defect decision failed, LLM call failed: {exc}")
-        return DefectDecision(_NO_DEFECT, tokens)
-    else:
-        tokens = _tokens(completion)
-        parsed = completion.choices[0].message.parsed if completion.choices else None
-        if parsed is not None:
-            return DefectDecision(parsed, tokens)
-        print("[llm_client] structured defect came back unparsed, falling back to prompt JSON")
+    if not _structured_known_unsupported(CodeDefect):
+        try:
+            completion = client.beta.chat.completions.parse(
+                model=LLM_MODEL, temperature=TEMPERATURE, messages=messages, response_format=CodeDefect,
+            )
+        except (
+            BadRequestError, NotFoundError, UnprocessableEntityError,
+            LengthFinishReasonError, ContentFilterFinishReasonError, ValidationError,
+        ) as exc:
+            _remember_structured_rejection(CodeDefect, exc)
+            print(f"[llm_client] structured defect rejected, falling back to prompt JSON: {exc}")
+        except OpenAIError as exc:
+            raise _call_error("decide_defect", exc) from exc
+        else:
+            tokens = _tokens(completion)
+            parsed = completion.choices[0].message.parsed if completion.choices else None
+            if parsed is not None:
+                return DefectDecision(parsed, tokens)
+            print("[llm_client] structured defect came back unparsed, falling back to prompt JSON")
 
     try:
         fallback = client.chat.completions.create(
@@ -753,8 +892,7 @@ def decide_defect(service_name: str, hypothesis_description: str, evidence: list
             ],
         )
     except OpenAIError as exc:
-        print(f"[llm_client] discarding defect decision, LLM call failed: {exc}")
-        return DefectDecision(_NO_DEFECT, tokens)
+        raise _call_error("decide_defect", exc) from exc
 
     tokens += _tokens(fallback)
     content = _extract_json(fallback.choices[0].message.content or "") if fallback.choices else None
@@ -843,8 +981,7 @@ def decide_patch(old_content: str, target: PatchTarget, feedback: str | None = N
     try:
         response = client.chat.completions.create(model=LLM_MODEL, temperature=TEMPERATURE, messages=messages, max_tokens=MAX_OUTPUT_TOKENS)
     except OpenAIError as exc:
-        print(f"[llm_client] patch generation failed, LLM call failed: {exc}")
-        return PatchDecision(None, 0)
+        raise _call_error("decide_patch", exc) from exc
 
     tokens = _tokens(response)
     content = response.choices[0].message.content if response.choices else None

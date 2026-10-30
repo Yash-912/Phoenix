@@ -8,7 +8,7 @@ from langgraph.graph import END
 from langgraph.types import Command, interrupt
 
 from phoenix.graph import approvals, investigation, safety_policy, scoring, verification
-from phoenix.graph.llm_client import decide_hypotheses, decide_tool_calls
+from phoenix.graph.llm_client import LLMCallError, LLMUnavailableError, decide_hypotheses, decide_tool_calls
 from phoenix.graph.persist import (
     get_incident_first_seen,
     record_audit,
@@ -26,6 +26,11 @@ from phoenix.tools.health_tool import inspect_health
 from phoenix.tools.loki_tool import query_loki
 from phoenix.graph.symptom import blocks_action, current_symptom
 from phoenix.tools.latency_tool import query_prometheus_with_latency_measure
+
+
+# Statuses a node sets when its model call failed. The diagnoser and the router stop on
+# them; no other node sets "escalated" before the router has run.
+LLM_STOPPED = ("llm_unavailable", "escalated")
 
 
 def _say(message: str = "") -> None:
@@ -186,6 +191,39 @@ def _diagnosis_line(scored: ScoredHypothesis) -> str:
     )
 
 
+def _mark_llm_failure(state: AgentState, node: str, exc: LLMCallError) -> AgentState:
+    """End the run because the model call failed, with the audit row that says why.
+
+    An unreachable model is neither "no hypotheses" nor "the evidence is ambiguous":
+    nothing was weighed. Recording it as either would file an outage under a finding,
+    so it gets its own status (llm_unavailable), set on the state the node returns, and
+    its own row. A request the provider rejected is not an outage and will be rejected
+    again, so it is an escalation with its own event, and the watcher does not retry it.
+    The router stops on either status and the diagnoser does not call the model again.
+    """
+    unavailable = isinstance(exc, LLMUnavailableError)
+    event = "llm_unavailable" if unavailable else "llm_request_rejected"
+    status = "llm_unavailable" if unavailable else "escalated"
+    reason = str(exc)
+    _say(f"[{node}] {reason} -> end ({status})")
+    record_audit(
+        state.incident_id,
+        node,
+        event,
+        {
+            "iteration": state.iteration,
+            "operation": exc.operation,
+            "error": reason,
+            "tokens_spent": state.tokens_spent,
+            "evidence_collected": len(state.evidence),
+        },
+        reason,
+    )
+    state.status = status
+    state.escalation_reason = reason
+    return state
+
+
 def observer_node(state: AgentState) -> AgentState:
     """Slice 2.3, completed: the LLM decides which tool(s) to call next;
     this code executes exactly what it decides and nothing else. The diagnoser's
@@ -239,12 +277,15 @@ def observer_node(state: AgentState) -> AgentState:
     # in code. The first pass has no leader to report on, so its call is exactly
     # the one it always was.
     evidence_state = investigation.build_evidence_state(state)
-    decision = decide_tool_calls(
-        state.service_name,
-        state.evidence,
-        state.needs_evidence,
-        **({"evidence_state": evidence_state} if evidence_state else {}),
-    )
+    try:
+        decision = decide_tool_calls(
+            state.service_name,
+            state.evidence,
+            state.needs_evidence,
+            **({"evidence_state": evidence_state} if evidence_state else {}),
+        )
+    except LLMCallError as exc:
+        return _mark_llm_failure(state, "observer", exc)
     state.tokens_spent += decision.tokens
     requested_calls = decision.calls
     dispatched: list[str] = []
@@ -355,7 +396,12 @@ def diagnoser_node(state: AgentState) -> AgentState:
     category column, so this is where a family survives. Nothing here recomputes
     a score: the row is the scorer's answer written down, not a second opinion.
     """
-    decision = decide_hypotheses(state.service_name, state.evidence)
+    if state.status in LLM_STOPPED:
+        return state
+    try:
+        decision = decide_hypotheses(state.service_name, state.evidence)
+    except LLMCallError as exc:
+        return _mark_llm_failure(state, "diagnoser", exc)
     state.tokens_spent += decision.tokens
     proposed = decision.output.hypotheses
 
