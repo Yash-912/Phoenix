@@ -5,7 +5,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py db.py schemas.py .
+COPY main.py db.py schemas.py incident_trace.py redact.py .
+COPY dashboard ./dashboard
 
 RUN useradd --create-home --shell /bin/false phoenix
 USER phoenix

@@ -1,10 +1,16 @@
 import hmac
 import os
 from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Literal
 
+# pyrefly: ignore [missing-import]
+import psycopg
 from fastapi import FastAPI, Header, HTTPException
+from fastapi.staticfiles import StaticFiles
 
 import db
+import incident_trace
 from schemas import AlertmanagerWebhookPayload, ApprovalDecision
 
 
@@ -41,6 +47,58 @@ def receive_alertmanager_webhook(payload: AlertmanagerWebhookPayload):
 @app.get("/incidents")
 def get_incidents():
     return db.list_incidents()
+
+
+# --- dashboard reads ---------------------------------------------------------
+# Read-only. Nothing here writes, and nothing here decides an approval: the dashboard's
+# Approve and Deny buttons call POST /approvals/{id}/decision below, behind its token.
+
+
+def _read(fetch, *args):
+    """Run a database read; a database that cannot be reached is a 503, not a stack trace."""
+    try:
+        return fetch(*args)
+    except psycopg.Error as exc:
+        raise HTTPException(status_code=503, detail=f"database unavailable: {type(exc).__name__}") from exc
+
+
+@app.get("/dashboard-config")
+def dashboard_config():
+    """What the page needs before it can draw: the outcome vocabulary and whether
+    approving is switched on. The token itself is never returned."""
+    return {
+        "approvals_enabled": bool(os.environ.get("PHOENIX_APPROVAL_TOKEN")) and bool(_approver_list()),
+        "outcomes": incident_trace.OUTCOMES,
+        "tiers": incident_trace.TIERS,
+    }
+
+
+@app.get("/incidents/overview")
+def incidents_overview(limit: int = 200):
+    rows = _read(db.overview, max(1, min(limit, 500)))
+    return {"incidents": [incident_trace.overview_row(row) for row in rows]}
+
+
+@app.get("/incidents/{incident_id}/trace")
+def incident_trace_view(incident_id: int):
+    rows = _read(db.incident_rows, incident_id)
+    if rows is None:
+        raise HTTPException(status_code=404, detail=f"no incident {incident_id}")
+    return incident_trace.build_trace(rows)
+
+
+@app.get("/incidents/{incident_id}/audit")
+def incident_audit_view(incident_id: int):
+    """The raw audit rows, redacted. The detail page's one-click-deeper layer."""
+    rows = _read(db.incident_rows, incident_id)
+    if rows is None:
+        raise HTTPException(status_code=404, detail=f"no incident {incident_id}")
+    return incident_trace.audit_rows(rows["audit"])
+
+
+@app.get("/approvals")
+def list_approvals(status: Literal["pending"] = "pending"):
+    return {"approvals": incident_trace.approval_queue(_read(db.pending_approvals))}
 
 
 def _approver_list() -> frozenset[str]:
@@ -91,3 +149,10 @@ def decide_approval(
         status_code=409,
         detail={"status": detail["status"], "result": "ignored: the first answer already won"},
     )
+
+
+# The page is plain files, served from the same origin as the API. Mounted last so it
+# can never shadow a route above. Absent in a checkout that has no dashboard directory.
+_DASHBOARD_DIR = Path(__file__).parent / "dashboard"
+if _DASHBOARD_DIR.is_dir():
+    app.mount("/dashboard", StaticFiles(directory=_DASHBOARD_DIR, html=True), name="dashboard")

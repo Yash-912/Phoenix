@@ -1,0 +1,65 @@
+/*
+  Design tokens. This is the only file that decides how the dashboard looks.
+
+  base.css and components.css read these variables and hold no colour, font or
+  spacing value of their own, so a different look is a different copy of this file.
+  Values were sampled from the reference video the owner supplied (a warm paper page
+  with dashed hairline grid lines, a light grotesk, and near-black square buttons).
+*/
+:root {
+  /* paper and ink */
+  --paper: #f5f4f0;
+  --paper-raised: #faf9f6;
+  --paper-sunk: #edece8;
+  --ink: #14130f;
+  --ink-muted: #5f5e5a;
+  --ink-faint: #8b8a85;
+  --ink-on-solid: #f5f4f0;
+
+  /* the dashed hairlines that draw the grid */
+  --rule: #d5d4d0;
+  --rule-strong: #b9b8b3;
+  --rule-dash: 4px 4px;
+
+  /* meaning, used sparingly and always beside a word, never alone */
+  --tone-good: #3d6a4b;
+  --tone-warn: #9a6a1c;
+  --tone-bad: #a03a2d;
+  --tone-attention: var(--ink);
+  --tone-neutral: var(--ink-faint);
+
+  /* type */
+  --font-sans: "Inter", "Inter Tight", "Segoe UI Variable Text", "Segoe UI", "Helvetica Neue", Arial, system-ui, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "Cascadia Mono", "Consolas", "Liberation Mono", monospace;
+  --weight-light: 300;
+  --weight-regular: 400;
+  --weight-medium: 500;
+  --tracking-display: -0.025em;
+  --tracking-label: 0.01em;
+
+  --size-label: 0.8125rem;
+  --size-small: 0.875rem;
+  --size-body: 0.9375rem;
+  --size-lead: clamp(1.25rem, 1.6vw + 0.8rem, 1.75rem);
+  --size-title: clamp(1.9rem, 3.4vw + 0.6rem, 3.25rem);
+  --size-numeral: clamp(2rem, 3vw + 0.6rem, 3rem);
+
+  --leading-tight: 1.1;
+  --leading-body: 1.5;
+
+  /* space and shape */
+  --gutter: clamp(16px, 4vw, 56px);
+  --page-max: 1240px;
+  --label-col: 17rem;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 40px;
+  --space-7: 64px;
+  --radius: 0;
+
+  --focus: 2px solid var(--ink);
+  --transition: 120ms ease-out;
+}

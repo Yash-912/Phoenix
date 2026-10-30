@@ -74,6 +74,84 @@ def list_incidents() -> list[dict]:
     return [dict(zip(columns, row)) for row in rows]
 
 
+# --- dashboard reads ---------------------------------------------------------
+# Everything below is a SELECT. The dashboard never writes through these.
+
+# The list the dashboard shows: the alert state beside the investigation outcome. Only
+# terminal runs reach incident_memory, so a model outage, a crashed investigation and a
+# run paused for approval are read from the audit trail and the approvals table instead.
+OVERVIEW = """
+SELECT i.id, i.service_name, i.alertname, i.severity, i.status,
+       i.first_seen_at, i.last_seen_at, i.alert_count,
+       m.status AS investigation_status,
+       m.root_cause_category,
+       (m.record ->> 'tier_used')::int AS tier_used,
+       EXISTS (SELECT 1 FROM audit_log a WHERE a.incident_id = i.id AND a.event_type = 'llm_unavailable') AS llm_unavailable,
+       EXISTS (SELECT 1 FROM audit_log a WHERE a.incident_id = i.id AND a.event_type = 'investigation_failed') AS investigation_failed,
+       (SELECT count(*) FROM approvals p
+         WHERE p.incident_id = i.id AND p.status = 'pending' AND p.expires_at > now()) AS pending_approvals,
+       (SELECT count(*) FROM audit_log a WHERE a.incident_id = i.id) AS audit_events
+FROM incidents i
+LEFT JOIN incident_memory m ON m.incident_id = i.id
+ORDER BY i.first_seen_at DESC
+LIMIT %(limit)s;
+"""
+
+TRACE_INCIDENT = "SELECT id, service_name, alertname, severity, status, first_seen_at, last_seen_at, alert_count FROM incidents WHERE id = %(id)s;"
+TRACE_EVIDENCE = "SELECT id, source, iteration, collected_at, summary, raw_data FROM evidence WHERE incident_id = %(id)s ORDER BY id;"
+TRACE_HYPOTHESES = "SELECT id, iteration, created_at, description, score, score_breakdown FROM hypotheses WHERE incident_id = %(id)s ORDER BY id;"
+TRACE_AUDIT = "SELECT id, created_at, node, event_type, detail, reasoning_text FROM audit_log WHERE incident_id = %(id)s ORDER BY id;"
+TRACE_APPROVALS = """
+SELECT id, action, container, args, tier, status, incident_summary, plan_reasoning, evidence,
+       requested_at, expires_at, decided_at, decided_by, decision_channel
+FROM approvals WHERE incident_id = %(id)s ORDER BY id;
+"""
+TRACE_MEMORY = "SELECT incident_id, service_name, root_cause_category, status, record, created_at FROM incident_memory WHERE incident_id = %(id)s;"
+
+PENDING_APPROVALS = """
+SELECT p.id, p.incident_id, i.service_name, p.action, p.container, p.args, p.tier, p.status,
+       p.incident_summary, p.plan_reasoning, p.evidence, p.requested_at, p.expires_at,
+       p.decided_at, p.decided_by, p.decision_channel
+FROM approvals p JOIN incidents i ON i.id = p.incident_id
+WHERE p.status = 'pending' AND p.expires_at > now()
+ORDER BY p.requested_at DESC;
+"""
+
+
+def _rows(conn, sql: str, params: dict | None = None) -> list[dict]:
+    cursor = conn.execute(sql, params or {})
+    names = [column.name for column in cursor.description]
+    return [dict(zip(names, row)) for row in cursor.fetchall()]
+
+
+def overview(limit: int = 200) -> list[dict]:
+    with pool.connection() as conn:
+        return _rows(conn, OVERVIEW, {"limit": limit})
+
+
+def incident_rows(incident_id: int) -> dict | None:
+    """Every row Phoenix wrote for one incident, or None when there is no such incident."""
+    params = {"id": incident_id}
+    with pool.connection() as conn:
+        incident = _rows(conn, TRACE_INCIDENT, params)
+        if not incident:
+            return None
+        memory = _rows(conn, TRACE_MEMORY, params)
+        return {
+            "incident": incident[0],
+            "evidence": _rows(conn, TRACE_EVIDENCE, params),
+            "hypotheses": _rows(conn, TRACE_HYPOTHESES, params),
+            "audit": _rows(conn, TRACE_AUDIT, params),
+            "approvals": _rows(conn, TRACE_APPROVALS, params),
+            "memory": memory[0] if memory else None,
+        }
+
+
+def pending_approvals() -> list[dict]:
+    with pool.connection() as conn:
+        return _rows(conn, PENDING_APPROVALS)
+
+
 # The first answer wins because this UPDATE only matches a row still pending and
 # not yet expired. A second answer matches nothing and changes nothing. Expiry
 # is refused here, not left to the sweep, so an answer that arrives after the

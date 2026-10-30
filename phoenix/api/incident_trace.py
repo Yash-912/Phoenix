@@ -444,10 +444,11 @@ def _tier(audit: list[dict], approvals: list[dict], memory: dict | None, actions
         mode = _dict(row.get("detail")).get("policy_mode")
         if mode:
             policy_mode = mode
-    why = next((a["why"] for a in actions if a.get("why")), None)
-    if why is None:
-        handoff = next((row.get("reasoning_text") for row in audit if row["event_type"] == "tier3_handoff"), None)
-        why = handoff
+    handoff = next((row.get("reasoning_text") for row in audit if row["event_type"] == "tier3_handoff"), None)
+    action_why = next((a["why"] for a in actions if a.get("why")), None)
+    # A run that ended in code carries the reason for the handoff; an earlier restart's
+    # reason is still shown with that action, in its own row.
+    why = (handoff or action_why) if tier == 3 else (action_why or handoff)
     gate = None
     if approvals:
         gate = "held for approval"

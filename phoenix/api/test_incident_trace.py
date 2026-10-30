@@ -204,6 +204,7 @@ def test_an_opened_pr_keeps_its_branch_and_the_run_started_at_tier_1():
     assert t["tier3"]["pr"] == {"status": "opened", "url": "https://github.com/example/lab/pull/44", "number": 44, "error": None}
     assert t["tier3"]["branch_cleanup"]["result"] == "kept"
     assert t["tier"]["tier"] == 3
+    assert "handing off to Tier 3" in t["tier"]["why"]
     assert t["actions"][0]["action"] == "restart_service"
     assert "pull request" in " ".join(t["narrative"])
 
