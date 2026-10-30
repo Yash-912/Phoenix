@@ -7,6 +7,7 @@ import os
 
 import requests
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from prometheus_fastapi_instrumentator import Instrumentator
 
 app = FastAPI(title="API Gateway")
@@ -33,16 +34,16 @@ def health():
 def route(service: str):
     if BROKEN:
         # Scenario 1: bad deploy returns 500s
-        return {"error": "bad gateway deploy v18"}, 500
+        return JSONResponse({"error": "bad gateway deploy v18"}, status_code=500)
     targets = {"auth": AUTH_URL, "payment": PAYMENT_URL, "checkout": CHECKOUT_URL}
     base = targets.get(service)
     if not base:
-        return {"error": f"unknown service {service}"}, 404
+        return JSONResponse({"error": f"unknown service {service}"}, status_code=404)
     try:
         r = requests.get(f"{base}/health", timeout=3)
         return {"service": service, "upstream": r.json()}
     except requests.RequestException as exc:
-        return {"error": str(exc)}, 502
+        return JSONResponse({"error": str(exc)}, status_code=502)
 
 
 @app.post("/chaos/break")
