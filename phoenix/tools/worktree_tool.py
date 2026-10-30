@@ -30,6 +30,11 @@ _SAFE_BRANCH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$")
 # gets the category routing wrong.
 PROTECTED_BRANCHES = {"main", "master"}
 
+# Every branch new_branch_name creates starts with this. delete_remote_branch will
+# not touch a branch that does not, so the one remote deletion this module can do is
+# confined to branches Phoenix's own Tier 3 runs create.
+TIER3_BRANCH_PREFIX = "phoenix/tier3-"
+
 
 def _run_git(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
     return subprocess.run(
@@ -179,8 +184,36 @@ def push_branch(worktree_path: str, branch: str) -> dict:
     return {"status": "ok", "branch": branch}
 
 
+def delete_remote_branch(branch: str) -> dict:
+    """Delete one branch from origin: exactly `refs/heads/<branch>`, nothing else.
+
+    Only a branch this module's own naming could have produced (_SAFE_BRANCH, not
+    protected, and under TIER3_BRANCH_PREFIX) is accepted, and the ref is passed in
+    full so no pattern or abbreviation can widen it. Whether it is safe to delete --
+    that no open PR uses it and that this run is the one that pushed it -- is the
+    caller's decision; this only refuses what is never deletable. A branch that is
+    already gone is reported ok, since the goal state holds.
+    """
+    if not _safe_branch(branch) or not branch.startswith(TIER3_BRANCH_PREFIX):
+        return {"status": "error", "error": f"'{branch}' is not a Tier 3 branch this module will delete"}
+
+    try:
+        result = _run_git(["push", "origin", "--delete", f"refs/heads/{branch}"], cwd=REPO_ROOT)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        if "remote ref does not exist" in stderr:
+            return {"status": "ok", "branch": branch, "already_gone": True}
+        return {"status": "error", "error": stderr or "git push --delete failed"}
+    return {"status": "ok", "branch": branch}
+
+
 def discard_worktree(worktree_path: str, branch: str | None = None) -> dict:
     """Remove the worktree and (best-effort) its local branch.
+
+    Local only. A branch that was pushed is removed from origin separately, by
+    delete_remote_branch, and only once the caller knows no PR uses it.
 
     Called on any Tier 3 failure path so a rejected or failed patch never
     lingers as stray state next to the primary checkout. Best-effort: a

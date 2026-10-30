@@ -137,6 +137,30 @@ def find_open_duplicate(diff: str) -> dict:
     return {"status": "ok", "duplicate": None}
 
 
+def has_open_pull_request_for(branch: str) -> dict:
+    """Whether any open PR has `branch` as its head: `{"status": "ok", "open": bool}`.
+
+    Read-only, and the answer a branch cleanup needs before it removes anything. A
+    listing that fails or cannot be read is the error envelope and never `open: False`,
+    because "could not tell" must not be mistaken for "no PR".
+    """
+    if not branch or branch in PROTECTED_BRANCHES:
+        return {"status": "error", "error": f"refusing to look up PRs for '{branch}'"}
+
+    listed = _gh(["gh", "pr", "list", "--state", "open", "--head", branch, "--json", "number"])
+    if isinstance(listed, dict):
+        return listed
+    if listed.returncode != 0:
+        return {"status": "error", "error": listed.stderr.strip() or "gh pr list failed"}
+    try:
+        prs = json.loads(listed.stdout)
+    except ValueError:
+        return {"status": "error", "error": "gh pr list returned something that is not a PR listing"}
+    if not isinstance(prs, list):
+        return {"status": "error", "error": "gh pr list returned something that is not a PR listing"}
+    return {"status": "ok", "open": bool(prs)}
+
+
 def comment_on_pull_request(number: int, body: str) -> dict:
     """`gh pr comment <number> --body ...` -- a note on a PR that already exists.
 

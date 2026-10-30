@@ -98,3 +98,60 @@ def test_discard_worktree_actually_removes_the_checkout():
     worktree_tool.discard_worktree(created["path"], branch)
 
     assert not Path(created["path"]).exists()
+
+
+# ---- delete_remote_branch -----------------------------------------------------------------
+
+
+def _record_git(monkeypatch, returncode=0, stderr=""):
+    import subprocess
+
+    calls = []
+
+    def fake(args, cwd):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, returncode, stdout="", stderr=stderr)
+
+    monkeypatch.setattr(worktree_tool, "_run_git", fake)
+    return calls
+
+
+def test_delete_remote_branch_deletes_exactly_the_named_ref(monkeypatch):
+    calls = _record_git(monkeypatch)
+    branch = "phoenix/tier3-incident-4-payment-service-1700000000"
+
+    result = worktree_tool.delete_remote_branch(branch)
+
+    assert result == {"status": "ok", "branch": branch}
+    assert calls == [["push", "origin", "--delete", f"refs/heads/{branch}"]]
+
+
+@pytest.mark.parametrize("branch", [
+    "main", "master", "", "phoenix/tier3-*", "phoenix/tier3-x y", "feature/someone-elses-work",
+    "phoenix/test-abc", "../phoenix/tier3-x", "-d", "phoenix/tier3-x;rm",
+])
+def test_delete_remote_branch_refuses_anything_that_is_not_a_tier3_branch(monkeypatch, branch):
+    calls = _record_git(monkeypatch)
+
+    result = worktree_tool.delete_remote_branch(branch)
+
+    assert result["status"] == "error"
+    assert calls == []
+
+
+def test_a_failed_remote_delete_is_reported_not_raised(monkeypatch):
+    _record_git(monkeypatch, returncode=1, stderr="permission denied")
+
+    result = worktree_tool.delete_remote_branch("phoenix/tier3-incident-4-x-1")
+
+    assert result["status"] == "error"
+    assert "permission denied" in result["error"]
+
+
+def test_a_remote_branch_that_is_already_gone_is_not_an_error(monkeypatch):
+    _record_git(monkeypatch, returncode=1, stderr="error: unable to delete 'x': remote ref does not exist")
+
+    result = worktree_tool.delete_remote_branch("phoenix/tier3-incident-4-x-1")
+
+    assert result["status"] == "ok"
+    assert result.get("already_gone") is True
