@@ -13,7 +13,7 @@
   --paper-sunk: #edece8;
   --ink: #14130f;
   --ink-muted: #5f5e5a;
-  --ink-faint: #8b8a85;
+  --ink-faint: #6f6e69;
   --ink-on-solid: #f5f4f0;
 
   /* the dashed hairlines that draw the grid */
@@ -26,7 +26,7 @@
   --tone-warn: #9a6a1c;
   --tone-bad: #a03a2d;
   --tone-attention: var(--ink);
-  --tone-neutral: var(--ink-faint);
+  --tone-neutral: #8b8a85;
 
   /* type */
   --font-sans: "Inter", "Inter Tight", "Segoe UI Variable Text", "Segoe UI", "Helvetica Neue", Arial, system-ui, sans-serif;

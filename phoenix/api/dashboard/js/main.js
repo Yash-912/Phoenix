@@ -13,7 +13,7 @@ const REFRESH_MS = 8000;
 const state = {
   config: { approvals_enabled: false, outcomes: {}, tiers: {} },
   filter: "all",
-  ui: { showMinor: false, audit: null, auditLoading: false, auditError: "", decision: null, creds: loadCredentials(window.sessionStorage) },
+  ui: { showMinor: false, showAllSteps: false, audit: null, auditLoading: false, auditError: "", decision: null, creds: loadCredentials(window.sessionStorage) },
   last: { key: "", data: null },
 };
 
@@ -38,6 +38,21 @@ function setNav(route, pending) {
 
 function paint(markup) {
   app.innerHTML = toString(markup);
+}
+
+// The tab title says where you are, and moving to a new page puts keyboard focus on its
+// heading, so a screen reader announces the page instead of staying on the old link.
+function titleFor(route, data) {
+  if (route.name === "detail" && data.trace) return `${data.trace.incident.alertname} on ${data.trace.incident.service_name} · Phoenix`;
+  if (route.name === "approvals") return "Approvals · Phoenix";
+  return "Incidents · Phoenix";
+}
+
+function focusHeading() {
+  const heading = app.querySelector("h1");
+  if (!heading) return;
+  heading.setAttribute("tabindex", "-1");
+  heading.focus({ preventScroll: true });
 }
 
 function failure(error) {
@@ -70,6 +85,11 @@ async function show({ force = false } = {}) {
     if (!force && key === state.last.key) return;
     state.last = { key, data };
     paint(view(route, data));
+    document.title = titleFor(route, data);
+    if (force && state.focusNext) {
+      state.focusNext = false;
+      focusHeading();
+    }
     const pending = route.name === "approvals" ? data.approvals.length : route.name === "list" ? data.incidents.reduce((n, r) => n + (r.pending_approvals ? 1 : 0), 0) : null;
     if (pending !== null) state.pending = pending;
     setNav(route, state.pending || 0);
@@ -89,8 +109,9 @@ function rerender() {
 
 window.addEventListener("hashchange", () => {
   // A different page starts with its own raw rows, its own message and its own folds.
-  state.ui = { ...state.ui, audit: null, auditLoading: false, auditError: "", decision: null };
+  state.ui = { ...state.ui, audit: null, auditLoading: false, auditError: "", decision: null, showAllSteps: false };
   state.last = { key: "", data: null };
+  state.focusNext = true;
   window.scrollTo(0, 0);
   show({ force: true });
 });
@@ -107,6 +128,9 @@ app.addEventListener("click", async (event) => {
     state.ui.showMinor = !state.ui.showMinor;
     rerender();
     app.querySelector('[data-action="toggle-minor"]')?.focus();
+  } else if (action === "show-all-steps") {
+    state.ui.showAllSteps = true;
+    rerender();
   } else if (action === "load-audit") {
     const route = parseRoute();
     state.ui.auditLoading = true;

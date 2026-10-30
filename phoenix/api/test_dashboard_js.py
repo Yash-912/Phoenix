@@ -29,6 +29,7 @@ def test_dashboard_js_suite_passes(tmp_path):
     (tmp_path / "overview.json").write_text(json.dumps({"incidents": overview}))
     for incident_id, rows in incidents.items():
         (tmp_path / f"trace_{incident_id}.json").write_text(json.dumps(incident_trace.build_trace(rows, now=now)))
+    (tmp_path / "trace_long.json").write_text(json.dumps(incident_trace.build_trace(fixture_store.long_incident(), now=now)))
     (tmp_path / "audit_33.json").write_text(json.dumps(incident_trace.audit_rows(incidents[33]["audit"])))
     pending = [
         {**a, "incident_id": rows["incident"]["id"], "service_name": rows["incident"]["service_name"]}

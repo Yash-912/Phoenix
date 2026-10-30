@@ -42,3 +42,30 @@ def overview_rows(incidents: dict[int, dict]) -> list[dict]:
             "audit_events": len(audit),
         })
     return sorted(rows, key=lambda row: row["first_seen_at"], reverse=True)
+
+
+def long_incident(passes: int = 60) -> dict:
+    """A synthetic investigation that ran far longer than any fixture, for stress tests.
+
+    Not a fixture file: it exists to check that a long trace stays fast, bounded and
+    readable. Every pass reads two sources, scores two hypotheses and routes back for more.
+    """
+    base = {"id": 900, "service_name": "checkout-service", "alertname": "HighErrorRate", "severity": "critical", "status": "active",
+            "first_seen_at": "2026-10-30T10:00:00+00:00", "last_seen_at": "2026-10-30T12:00:00+00:00", "alert_count": 3}
+    evidence, hypotheses, audit = [], [], []
+    for n in range(1, passes + 1):
+        for source in ("query_prometheus", "query_loki"):
+            evidence.append({"id": len(evidence) + 1, "source": source, "iteration": n, "collected_at": "2026-10-30T10:30:00+00:00",
+                             "summary": f"{source} pass {n}", "raw_data": {"status": "ok", "lines": ["x" * 120] * 400}})
+        for category, score in (("deploy", 0.4), ("config", 0.1)):
+            hypotheses.append({"id": len(hypotheses) + 1, "iteration": n, "created_at": "2026-10-30T10:30:00+00:00",
+                               "description": f"{category} hypothesis on pass {n}", "score": score, "score_breakdown": {"sources_supporting": 1}})
+        audit.append({"id": len(audit) + 1, "created_at": "2026-10-30T10:30:00+00:00", "node": "observer", "event_type": "observer_pass",
+                      "detail": {"iteration": n, "dispatched_tools": ["query_prometheus", "query_loki"]}, "reasoning_text": None})
+        audit.append({"id": len(audit) + 1, "created_at": "2026-10-30T10:31:00+00:00", "node": "diagnoser", "event_type": "diagnosis",
+                      "detail": {"iteration": n, "confidence": 0.4, "confidence_threshold": 0.75,
+                                 "hypotheses": [{"description": f"deploy hypothesis on pass {n}", "category": "deploy", "score": 0.4}]},
+                      "reasoning_text": f"deploy scores 0.40: deploy hypothesis on pass {n}"})
+        audit.append({"id": len(audit) + 1, "created_at": "2026-10-30T10:32:00+00:00", "node": "router", "event_type": "continuing",
+                      "detail": {"iteration": n, "confidence": 0.4}, "reasoning_text": "confidence too low (0.40)"})
+    return {"incident": base, "evidence": evidence, "hypotheses": hypotheses, "audit": audit, "approvals": [], "memory": None}

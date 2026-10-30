@@ -265,3 +265,28 @@ def test_every_fixture_builds_and_is_json_serialisable():
     for incident_id in FIXTURES:
         json.dumps(trace(incident_id))
         json.dumps(audit_rows(FIXTURES[incident_id]["audit"]))
+
+
+# --- a long investigation -----------------------------------------------------------------
+
+
+def test_a_long_trace_is_fast_and_its_raw_evidence_is_bounded():
+    import json
+    import time
+
+    rows = fixture_store.long_incident(passes=60)
+    started = time.perf_counter()
+    t = build_trace(rows, now=NOW)
+    elapsed = time.perf_counter() - started
+    size = len(json.dumps(t))
+    assert elapsed < 2.0
+    assert len(t["timeline"]) == 180 and len(t["evidence"]) == 120
+    assert all(item["raw_data"].get("truncated") for item in t["evidence"])
+    # 120 evidence rows at the 4000-character cap, plus the rest, stays well under a few MB.
+    assert size < 2_000_000
+
+
+def test_a_long_trace_still_names_the_final_leader_and_how_many_passes_ran():
+    t = build_trace(fixture_store.long_incident(passes=60), now=NOW)
+    assert [p["iteration"] for p in t["hypotheses"]["passes"]][-1] == 60
+    assert t["hypotheses"]["leader"]["description"] == "deploy hypothesis on pass 60"

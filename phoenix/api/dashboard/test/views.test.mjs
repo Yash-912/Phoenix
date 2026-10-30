@@ -111,3 +111,71 @@ test("the approvals queue links to the incident where the answer is given", opts
   assert.match(out, /href="#\/incidents\/39"/);
   assert.match(toString(renderApprovals({ approvals: [], now: NOW })), /Nothing is waiting/);
 });
+
+test("the incident record gives the whole story on one card", opts, () => {
+  const out = detail(33);
+  assert.match(out, /Incident record/);
+  for (const text of ["checkout-service", "Resolved", "deploy · 0.80", "Tier 2", "approved by tester", "rollback_deployment", "pass"]) {
+    assert.ok(out.includes(text), text);
+  }
+});
+
+test("the record says plainly when there was no action or no approval", opts, () => {
+  const out = detail(36);
+  assert.match(out, /Incident record/);
+  assert.match(out, /no action/);
+  assert.doesNotMatch(out, /<dt>approval<\/dt>/);
+});
+
+test("a Tier 3 record links the PR and says it needed no approval", opts, () => {
+  const out = detail(35);
+  assert.match(out, /not needed, stops at a PR/);
+  assert.match(out, /PR #44 \(opened\)/);
+});
+
+test("a long trace caps the steps shown and offers the rest", opts, () => {
+  const trace = load("trace_long.json");
+  const started = performance.now();
+  const capped = toString(renderDetail({ trace, ui: ui({ showMinor: true }), config: { approvals_enabled: false }, now: NOW }));
+  const elapsed = performance.now() - started;
+  assert.ok(elapsed < 1000, `rendered in ${elapsed}ms`);
+  assert.equal((capped.match(/<li class="step/g) || []).length, 60);
+  assert.match(capped, /Show the other 120 steps/);
+  const all = toString(renderDetail({ trace, ui: ui({ showMinor: true, showAllSteps: true }), config: { approvals_enabled: false }, now: NOW }));
+  assert.equal((all.match(/<li class="step/g) || []).length, 180);
+  assert.doesNotMatch(all, /Show the other/);
+});
+
+test("routine steps stay folded away by default, even on a long trace", opts, () => {
+  const out = toString(renderDetail({ trace: load("trace_long.json"), ui: ui(), config: { approvals_enabled: false }, now: NOW }));
+  assert.equal((out.match(/<li class="step/g) || []).length, 60);
+  assert.match(out, /Show 60 routine steps/);
+});
+
+test("an incident waiting on an approval does not say that no action was taken", opts, () => {
+  const out = detail(39);
+  assert.match(out, /Waiting for an approval before it acts/);
+  assert.doesNotMatch(out, /No action was taken/);
+  assert.match(out, /not acted yet/);
+});
+
+test("an incident that stopped without acting still says no action was taken", opts, () => {
+  assert.match(detail(36), /No action was taken/);
+});
+
+test("every form field has a visible label and the page has one h1", opts, () => {
+  const out = detail(39);
+  const inputs = out.match(/<input\b/g) || [];
+  const labelled = out.match(/<label class="field">[^<]*<input\b/g) || [];
+  assert.equal(inputs.length, 2);
+  assert.equal(labelled.length, inputs.length);
+  assert.equal((out.match(/<h1\b/g) || []).length, 1);
+  assert.doesNotMatch(out, /<button[^>]*><\/button>/);
+});
+
+test("every section has a labelled heading for screen readers", opts, () => {
+  const out = detail(33);
+  const sections = out.match(/<section class="section" aria-labelledby="(s\d)"/g) || [];
+  assert.equal(sections.length, 7);
+  for (const [, id] of out.matchAll(/aria-labelledby="(s\d)"/g)) assert.ok(out.includes(`id="${id}"`), id);
+});

@@ -18,6 +18,45 @@ function facts(object) {
   return html`<dl class="facts">${entries.map(([k, v]) => html`<dt>${humanKey(k)}</dt><dd>${typeof v === "object" && !Array.isArray(v) ? html`<span class="mono">${JSON.stringify(v)}</span>` : factValue(v)}</dd>`)}</dl>`;
 }
 
+// The reference's "call record": a dashed card of mono key/value rows with one row lit.
+// rows are [key, value, hot?]; a null or empty value is left out rather than shown blank.
+function record(title, meta, rows, foot) {
+  const shown = rows.filter(([, value]) => value !== null && value !== undefined && value !== "");
+  return html`<div class="record"><div class="record__head"><b>${title}</b><span>${meta}</span></div>
+    <dl>${shown.map(([key, value, hot]) => html`<div class="record__row ${hot ? "record__row--hot" : ""}"><dt>${key}</dt><dd>${value}</dd></div>`)}</dl>
+    ${foot ? html`<div class="record__foot">${foot}</div>` : ""}</div>`;
+}
+
+// Everything someone needs to narrate the incident, on one card.
+function incidentRecord(trace) {
+  const i = trace.incident;
+  const leader = trace.hypotheses.leader;
+  const approval = trace.approvals[trace.approvals.length - 1];
+  const approvalText = approval
+    ? approval.can_decide ? "open, waiting for an answer"
+      : approval.decided_by ? `${approval.status} by ${approval.decided_by}` : approval.status
+    : trace.tier.tier === 3 ? "not needed, stops at a PR" : trace.tier.tier ? "not required" : null;
+  const pr = trace.tier3 && trace.tier3.pr;
+  const fix = pr && pr.url
+    ? (safeUrl(pr.url) ? html`<a href="${safeUrl(pr.url)}" rel="noopener noreferrer" target="_blank">PR ${pr.number ? `#${pr.number}` : ""} (${pr.status})</a>` : `PR ${pr.status}`)
+    : trace.actions.length ? trace.actions.map((a) => a.action).join(", ") : null;
+  return record(
+    "Incident record",
+    `#${i.id} · ${fullTime(i.first_seen_at)}`,
+    [
+      ["service", i.service_name],
+      ["alert", `${i.alertname} · ${i.severity}`],
+      ["outcome", i.outcome.label, true],
+      ["root cause", leader ? `${leader.category || "unclassified"} · ${score(leader.score)}` : "none named"],
+      ["tier", trace.tier.tier ? `${trace.tier.label} · ${trace.tier.gate || ""}` : approval && approval.can_decide ? "not acted yet" : "no action"],
+      ["approval", approvalText],
+      ["fix", fix],
+      ["verified", trace.verification ? trace.verification.outcome : trace.actions.length ? "no verdict recorded" : null],
+    ],
+    i.outcome.summary,
+  );
+}
+
 function rawJson(title, value) {
   if (value === null || value === undefined) return "";
   return html`<details><summary>${title}</summary><pre class="code">${pretty(value)}</pre></details>`;
@@ -43,18 +82,15 @@ function approvalCard(approval, ui, config, now) {
     : approval.overdue
       ? html`<span class="chip chip--warn">Past its deadline, unanswered</span>`
       : html`<span class="chip chip--${approval.status === "approved" ? "good" : approval.status === "denied" ? "bad" : "warn"}">${approval.status[0].toUpperCase() + approval.status.slice(1)}</span>`;
-  const decided = approval.decided_by
-    ? html`<dt>Answered by</dt><dd>${approval.decided_by} via ${approval.decision_channel || "unknown"} at ${clockTime(approval.decided_at)}</dd>`
-    : "";
   return html`<div class="callout ${open ? "" : "callout--soft"}">
     <div><h3>${approval.action.replace(/_/g, " ")} on ${approval.container}</h3><p class="muted">${approval.plan_reasoning}</p></div>
-    <dl class="facts">
-      <dt>Status</dt><dd>${status}</dd>
-      <dt>Arguments</dt><dd class="mono">${(approval.args || []).join(" ") || "none"}</dd>
-      <dt>Tier</dt><dd>${approval.tier}</dd>
-      <dt>Asked at</dt><dd>${fullTime(approval.requested_at)}</dd>
-      <dt>Expires</dt><dd>${fullTime(approval.expires_at)}</dd>${decided}
-    </dl>
+    ${record(`Approval request #${approval.id}`, `tier ${approval.tier}`, [
+      ["status", status, true],
+      ["arguments", (approval.args || []).join(" ") || "none"],
+      ["asked", fullTime(approval.requested_at)],
+      ["expires", fullTime(approval.expires_at)],
+      ["answered by", approval.decided_by ? `${approval.decided_by} via ${approval.decision_channel || "unknown"} at ${clockTime(approval.decided_at)}` : null],
+    ])}
     ${open ? decisionForm(approval, ui, config, state) : ""}
     ${rawJson("Incident summary and evidence sent with the request", { incident_summary: approval.incident_summary, evidence: approval.evidence })}
   </div>`;
@@ -86,7 +122,7 @@ function verificationBlock(v) {
   return html`<div class="block"><p class="block__title">Did it work?</p>
     <p><span class="chip chip--${chip}">Verification ${v.outcome}</span></p>
     <p class="muted" style="margin-top: var(--space-2); max-width: 62ch">${v.reason}</p>
-    <dl class="facts" style="margin-top: var(--space-3)"><dt>Check</dt><dd>${v.check}</dd><dt>After action</dt><dd>${v.action}</dd><dt>At</dt><dd>${fullTime(v.at)}</dd></dl>
+    <div style="margin-top: var(--space-3)">${record("Verification", fullTime(v.at), [["check", v.check], ["after action", v.action], ["verdict", v.outcome, true]])}</div>
     ${rawJson("What the check measured", v.detail)}</div>`;
 }
 
@@ -116,8 +152,11 @@ function didBody(trace, ui, config, now) {
     ? html`<p class="lead">${tier.label} — ${tier.meaning}.</p>
       ${tier.why ? html`<p class="muted" style="max-width: 62ch; margin-top: var(--space-2)">${tier.why}</p>` : ""}
       ${facts({ "policy mode": tier.policy_mode, gate: tier.gate })}`
-    : html`<p class="lead">No action was taken.</p>
-      ${trace.stop_reason ? html`<p class="muted" style="max-width: 62ch; margin-top: var(--space-2)">${trace.stop_reason}</p>` : ""}`;
+    : trace.approvals.some((a) => a.can_decide)
+      ? html`<p class="lead">Waiting for an approval before it acts.</p>
+        <p class="muted" style="max-width: 62ch; margin-top: var(--space-2)">Nothing has been changed yet. The request is at the top of this page.</p>`
+      : html`<p class="lead">No action was taken.</p>
+        ${trace.stop_reason ? html`<p class="muted" style="max-width: 62ch; margin-top: var(--space-2)">${trace.stop_reason}</p>` : ""}`;
   return html`<div class="block">${tierLine}</div>
     ${answered.length ? html`<div class="block"><p class="block__title">Approval</p>${answered.map((a) => approvalCard(a, ui, config, now))}</div>` : ""}
     ${trace.actions.length ? html`<div class="block"><p class="block__title">What it changed</p><div class="table-wrap"><table class="table">
@@ -175,12 +214,19 @@ function stepItem(step) {
   </div></li>`;
 }
 
+// A long investigation shows its first steps and says how many it is holding back, so the
+// page stays readable and fast. The raw audit rows below always have all of them.
+export const STEP_LIMIT = 60;
+
 function stepsBody(trace, ui) {
   const minor = trace.timeline.filter((s) => s.minor).length;
   const steps = ui.showMinor ? trace.timeline : trace.timeline.filter((s) => !s.minor);
   if (!trace.timeline.length) return emptyState("No steps recorded yet", "Phoenix has not written anything to the audit trail for this incident.");
+  const capped = !ui.showAllSteps && steps.length > STEP_LIMIT;
+  const visible = capped ? steps.slice(0, STEP_LIMIT) : steps;
   return html`${minor ? html`<p style="margin-bottom: var(--space-4)"><button type="button" class="btn btn--link" data-action="toggle-minor" aria-pressed="${String(ui.showMinor)}">${ui.showMinor ? "Hide" : "Show"} ${minor} routine step${minor > 1 ? "s" : ""}</button></p>` : ""}
-    <ol class="timeline">${steps.map(stepItem)}</ol>`;
+    <ol class="timeline">${visible.map(stepItem)}</ol>
+    ${capped ? html`<p style="margin-top: var(--space-4)"><button type="button" class="btn btn--quiet" data-action="show-all-steps">Show the other ${steps.length - STEP_LIMIT} steps</button></p>` : ""}`;
 }
 
 // --- 05 evidence ------------------------------------------------------------------------
@@ -229,8 +275,11 @@ export function renderDetail({ trace, ui, config, now }) {
   const open = trace.approvals.filter((a) => a.can_decide);
   return html`<nav class="crumb" aria-label="Breadcrumb"><a href="#/">Incidents</a> / <span>#${i.id}</span></nav>
     <header class="detail-head">
-      <h1 class="display">${i.alertname} on ${i.service_name}</h1>
-      <div class="meta">${outcomeChip(i.outcome)}${alertChip(i.alert_status)}<span>severity ${i.severity}</span><span>first seen ${fullTime(i.first_seen_at)}</span>${i.alert_count > 1 ? html`<span>fired ${i.alert_count} times</span>` : ""}</div>
+      <div>
+        <h1 class="display" id="page-title" tabindex="-1">${i.alertname} on ${i.service_name}</h1>
+        <div class="meta">${outcomeChip(i.outcome)}${alertChip(i.alert_status)}${i.alert_count > 1 ? html`<span>fired ${i.alert_count} times</span>` : ""}</div>
+      </div>
+      ${incidentRecord(trace)}
     </header>
     ${open.length ? html`<div class="block" role="region" aria-label="Needs an answer"><p class="block__title">Needs an answer</p>${open.map((a) => approvalCard(a, ui, config, now))}</div>` : ""}
     ${section(1, "Summary", "What happened", summary(trace))}
