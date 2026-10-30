@@ -154,3 +154,82 @@ def test_a_suggestion_is_always_a_path_that_exists():
     for guess in ("payment_service", "worker", "payment", "services/payment_service/app.py"):
         for suggested in repo_tool.suggest_paths(guess):
             assert (repo_tool.REPO_ROOT / suggested).exists(), (guess, suggested)
+
+
+# ---- secrets are not readable or searchable --------------------------------------------
+
+import pytest
+
+SECRET_PATHS = [
+    ".env",
+    ".env.local",
+    ".env.production",
+    ".git/config",
+    ".git/HEAD",
+    "keys/server.pem",
+    "keys/server.key",
+    "id_rsa",
+    "home/.ssh/id_rsa.pub",
+    "id_rsa_backup",
+    "ID_RSA",
+    ".ENV",
+]
+
+
+@pytest.fixture
+def fake_repo(tmp_path, monkeypatch):
+    for rel in SECRET_PATHS:
+        target = tmp_path / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("SUPERSECRET_TOKEN=abc123\n", encoding="utf-8")
+    (tmp_path / "app.py").write_text("# SUPERSECRET_TOKEN is read from the environment\n", encoding="utf-8")
+    monkeypatch.setattr(repo_tool, "REPO_ROOT", tmp_path.resolve())
+    return tmp_path
+
+
+@pytest.mark.parametrize("rel", SECRET_PATHS)
+def test_read_file_refuses_secret_files(fake_repo, rel):
+    result = repo_tool.read_file(rel)
+
+    assert result["status"] == "error"
+    assert "SUPERSECRET" not in str(result)
+
+
+def test_read_file_refuses_a_secret_reached_through_dot_segments(fake_repo):
+    result = repo_tool.read_file("app/../.env")
+
+    assert result["status"] == "error"
+    assert "SUPERSECRET" not in str(result)
+
+
+def test_read_file_still_reads_ordinary_files(fake_repo):
+    result = repo_tool.read_file("app.py")
+
+    assert result["status"] == "ok"
+    assert "SUPERSECRET_TOKEN" in result["content"]
+
+
+def test_search_never_returns_a_match_from_a_secret_file(fake_repo):
+    result = repo_tool.search_repository("SUPERSECRET_TOKEN")
+
+    assert result["status"] == "ok"
+    assert [m["file"] for m in result["matches"]] == ["app.py"]
+
+
+@pytest.mark.parametrize("rel", [".env", ".git/config", "keys/server.pem"])
+def test_search_pointed_straight_at_a_secret_file_returns_nothing(fake_repo, rel):
+    result = repo_tool.search_repository("SUPERSECRET_TOKEN", path=rel)
+
+    assert "SUPERSECRET" not in str(result.get("matches", ""))
+    assert not result.get("matches")
+
+
+def test_a_symlink_to_a_secret_is_not_a_way_around_the_rule(fake_repo):
+    link = fake_repo / "innocent.txt"
+    try:
+        link.symlink_to(fake_repo / ".env")
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks are not available here")
+
+    assert repo_tool.read_file("innocent.txt")["status"] == "error"
+    assert [m["file"] for m in repo_tool.search_repository("SUPERSECRET_TOKEN")["matches"]] == ["app.py"]
