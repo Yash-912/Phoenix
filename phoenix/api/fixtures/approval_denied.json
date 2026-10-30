@@ -1,0 +1,256 @@
+{
+  "_provenance": "Shaped from the Gate 0 run dumps, not exported from a database. Row shapes follow phoenix/db/init/001-008 and the detail objects follow the graph's record_audit calls. Reasoning text is copied from real runs where a run had it; evidence rows, hypothesis rows and detail objects were composed to match the code because the dumps do not hold them.",
+  "incident": {
+    "id": 37,
+    "service_name": "auth-service",
+    "alertname": "HighErrorRate",
+    "severity": "critical",
+    "status": "active",
+    "first_seen_at": "2026-10-30T17:40:00+00:00",
+    "last_seen_at": "2026-10-30T17:43:00+00:00",
+    "alert_count": 1
+  },
+  "evidence": [
+    {
+      "id": 3701,
+      "incident_id": 37,
+      "source": "query_prometheus",
+      "iteration": 1,
+      "collected_at": "2026-10-30T17:40:24+00:00",
+      "summary": "auth-service 5xx ratio 41% since the DB_POOL_SIZE change",
+      "raw_data": {
+        "status": "ok",
+        "service": "auth-service",
+        "error_ratio": 0.41
+      }
+    },
+    {
+      "id": 3702,
+      "incident_id": 37,
+      "source": "query_loki",
+      "iteration": 1,
+      "collected_at": "2026-10-30T17:40:48+00:00",
+      "summary": "pool exhausted: QueuePool limit of size 2 overflow 0 reached",
+      "raw_data": {
+        "status": "ok",
+        "matches": 233
+      }
+    }
+  ],
+  "hypotheses": [
+    {
+      "id": 3701,
+      "incident_id": 37,
+      "iteration": 1,
+      "created_at": "2026-10-30T17:41:36+00:00",
+      "description": "DB_POOL_SIZE was lowered to 2, so connections are exhausted under normal load.",
+      "score": 0.8,
+      "score_breakdown": {
+        "has_prometheus_signal": 1,
+        "has_loki_signal": 1,
+        "has_docker_signal": 0,
+        "has_health_signal": 0,
+        "has_deploy_signal": 0,
+        "sources_supporting": 2,
+        "agreement_bonus": 0.2,
+        "contradiction_penalty": 0.0,
+        "weights": {
+          "prometheus": 0.4,
+          "loki": 0.3,
+          "docker": 0.3,
+          "health": 0.15,
+          "deploy": 0.15
+        }
+      }
+    },
+    {
+      "id": 3702,
+      "incident_id": 37,
+      "iteration": 1,
+      "created_at": "2026-10-30T17:42:00+00:00",
+      "description": "A deploy regressed auth-service.",
+      "score": 0.0,
+      "score_breakdown": {
+        "has_prometheus_signal": 0,
+        "has_loki_signal": 0,
+        "has_docker_signal": 0,
+        "has_health_signal": 0,
+        "has_deploy_signal": 0,
+        "sources_supporting": 0,
+        "agreement_bonus": 0.0,
+        "contradiction_penalty": 0.3,
+        "weights": {
+          "prometheus": 0.4,
+          "loki": 0.3,
+          "docker": 0.3,
+          "health": 0.15,
+          "deploy": 0.15
+        }
+      }
+    }
+  ],
+  "audit": [
+    {
+      "id": 3701,
+      "incident_id": 37,
+      "created_at": "2026-10-30T17:41:12+00:00",
+      "node": "observer",
+      "event_type": "observer_pass",
+      "detail": {
+        "iteration": 1,
+        "requested_tools": [
+          "query_prometheus",
+          "query_loki"
+        ],
+        "dispatched_tools": [
+          "query_prometheus",
+          "query_loki"
+        ],
+        "failed_tools": [],
+        "skipped_duplicates": [],
+        "observation_exhausted": false,
+        "evidence_collected": 2,
+        "tokens_spent": 1900
+      },
+      "reasoning_text": null
+    },
+    {
+      "id": 3702,
+      "incident_id": 37,
+      "created_at": "2026-10-30T17:42:24+00:00",
+      "node": "diagnoser",
+      "event_type": "diagnosis",
+      "detail": {
+        "iteration": 1,
+        "confidence": 0.8,
+        "confidence_threshold": 0.75,
+        "tokens_spent": 3400,
+        "progress": {
+          "progressed": true,
+          "reasons": [
+            "leader score changed"
+          ],
+          "stagnant_passes": 0,
+          "failed_reads_last_pass": 0,
+          "signature": [
+            "config",
+            0.8
+          ]
+        },
+        "hypotheses": [
+          {
+            "description": "DB_POOL_SIZE was lowered to 2, so connections are exhausted under normal load.",
+            "category": "config",
+            "score": 0.8
+          },
+          {
+            "description": "A deploy regressed auth-service.",
+            "category": "deploy",
+            "score": 0.0
+          }
+        ]
+      },
+      "reasoning_text": "config scores 0.80: DB_POOL_SIZE was lowered to 2, so connections are exhausted under normal load.\ndeploy scores 0.00: A deploy regressed auth-service."
+    },
+    {
+      "id": 3703,
+      "incident_id": 37,
+      "created_at": "2026-10-30T17:42:48+00:00",
+      "node": "router",
+      "event_type": "threshold_reached",
+      "detail": {
+        "iteration": 1,
+        "max_iterations": 5,
+        "confidence": 0.8,
+        "confidence_threshold": 0.75,
+        "tokens_spent": 3400,
+        "token_budget": 60000,
+        "destination": "remediator",
+        "escalation_reason": null
+      },
+      "reasoning_text": "confidence threshold met (0.80 >= 0.75)"
+    },
+    {
+      "id": 3704,
+      "incident_id": 37,
+      "created_at": "2026-10-30T17:43:12+00:00",
+      "node": "remediator",
+      "event_type": "approval_requested",
+      "detail": {
+        "approval_id": 14,
+        "action": "rollback_config",
+        "container": "auth-service",
+        "args": [
+          "DB_POOL_SIZE",
+          "10"
+        ],
+        "tier": 2,
+        "policy_mode": "guarded",
+        "expires_at": "2026-10-30T18:12:48+00:00"
+      },
+      "reasoning_text": "rollback_config on auth-service is held for approval"
+    },
+    {
+      "id": 3705,
+      "incident_id": 37,
+      "created_at": "2026-10-30T17:45:06+00:00",
+      "node": "remediator",
+      "event_type": "approval_not_granted",
+      "detail": {
+        "iteration": 1,
+        "remediation_attempts": 0,
+        "max_remediation_attempts": 2,
+        "policy_mode": "guarded",
+        "reason": "tester denied rollback_config on auth-service"
+      },
+      "reasoning_text": "tester denied rollback_config on auth-service"
+    }
+  ],
+  "approvals": [
+    {
+      "id": 14,
+      "incident_id": 37,
+      "request_key": "inc37-rollback_config-auth-service",
+      "action": "rollback_config",
+      "container": "auth-service",
+      "args": [
+        "DB_POOL_SIZE",
+        "10"
+      ],
+      "tier": 2,
+      "incident_summary": "HighErrorRate on auth-service: DB_POOL_SIZE was lowered to 2",
+      "plan_reasoning": "top hypothesis is config, which maps to rollback_config",
+      "evidence": [],
+      "status": "denied",
+      "requested_at": "2026-10-30T17:42:48+00:00",
+      "expires_at": "2026-10-30T18:12:48+00:00",
+      "decided_at": "2026-10-30T17:44:18+00:00",
+      "decided_by": "tester",
+      "decision_channel": "api"
+    }
+  ],
+  "memory": {
+    "incident_id": 37,
+    "service_name": "auth-service",
+    "root_cause_category": "config",
+    "status": "escalated",
+    "record": {
+      "incident_id": 37,
+      "service": "auth-service",
+      "status": "escalated",
+      "symptoms": [
+        "auth-service 5xx ratio 41%"
+      ],
+      "root_cause": {
+        "category": "config",
+        "description": "pool size lowered",
+        "score": 0.8
+      },
+      "tier_used": null,
+      "fix": null,
+      "verification": null,
+      "escalation_reason": "tester denied rollback_config on auth-service"
+    },
+    "created_at": "2026-10-30T17:46:06+00:00"
+  }
+}

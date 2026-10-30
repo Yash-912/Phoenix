@@ -1,0 +1,541 @@
+{
+  "_provenance": "Shaped from the Gate 0 run dumps, not exported from a database. Row shapes follow phoenix/db/init/001-008 and the detail objects follow the graph's record_audit calls. Reasoning text is copied from real runs where a run had it; evidence rows, hypothesis rows and detail objects were composed to match the code because the dumps do not hold them.",
+  "incident": {
+    "id": 33,
+    "service_name": "checkout-service",
+    "alertname": "HighErrorRate",
+    "severity": "critical",
+    "status": "resolved",
+    "first_seen_at": "2026-10-30T15:00:00+00:00",
+    "last_seen_at": "2026-10-30T15:03:00+00:00",
+    "alert_count": 1
+  },
+  "evidence": [
+    {
+      "id": 3301,
+      "incident_id": 33,
+      "source": "query_prometheus",
+      "iteration": 1,
+      "collected_at": "2026-10-30T15:00:24+00:00",
+      "summary": "error rate on checkout-service is 38% over 5m",
+      "raw_data": {
+        "status": "ok",
+        "service": "checkout-service",
+        "error_ratio": 0.38,
+        "window": "5m"
+      }
+    },
+    {
+      "id": 3302,
+      "incident_id": 33,
+      "source": "query_loki",
+      "iteration": 1,
+      "collected_at": "2026-10-30T15:00:48+00:00",
+      "summary": "412 'inventory reservation timed out' lines in 5m",
+      "raw_data": {
+        "status": "ok",
+        "matches": 412,
+        "sample": [
+          "ERROR reserve_inventory timeout after 2000ms order=8812"
+        ]
+      }
+    },
+    {
+      "id": 3303,
+      "incident_id": 33,
+      "source": "get_recent_deployments",
+      "iteration": 2,
+      "collected_at": "2026-10-30T15:03:12+00:00",
+      "summary": "v18 deployed 72 seconds before the alert; v17 is the previous release",
+      "raw_data": {
+        "status": "ok",
+        "deployments": [
+          {
+            "version": "v18",
+            "at": "2026-10-30T14:51:08.111759+00:00"
+          },
+          {
+            "version": "v17",
+            "at": "2026-10-29T09:12:00+00:00"
+          }
+        ]
+      }
+    },
+    {
+      "id": 3304,
+      "incident_id": 33,
+      "source": "get_container_state",
+      "iteration": 2,
+      "collected_at": "2026-10-30T15:03:36+00:00",
+      "summary": "checkout-service running v18, restarts=0, healthy",
+      "raw_data": {
+        "status": "ok",
+        "image": "checkout-service:v18",
+        "restart_count": 0,
+        "state": "running"
+      }
+    }
+  ],
+  "hypotheses": [
+    {
+      "id": 3301,
+      "incident_id": 33,
+      "iteration": 1,
+      "created_at": "2026-10-30T15:01:36+00:00",
+      "description": "A regression was introduced in the recently deployed v18 image that causes service failures or degraded behavior.",
+      "score": 0.5,
+      "score_breakdown": {
+        "has_prometheus_signal": 1,
+        "has_loki_signal": 0,
+        "has_docker_signal": 0,
+        "has_health_signal": 0,
+        "has_deploy_signal": 0,
+        "sources_supporting": 1,
+        "agreement_bonus": 0.0,
+        "contradiction_penalty": 0.0,
+        "weights": {
+          "prometheus": 0.4,
+          "loki": 0.3,
+          "docker": 0.3,
+          "health": 0.15,
+          "deploy": 0.15
+        }
+      }
+    },
+    {
+      "id": 3302,
+      "incident_id": 33,
+      "iteration": 1,
+      "created_at": "2026-10-30T15:02:00+00:00",
+      "description": "A configuration parameter marked as regression is causing failures.",
+      "score": 0.0,
+      "score_breakdown": {
+        "has_prometheus_signal": 0,
+        "has_loki_signal": 0,
+        "has_docker_signal": 0,
+        "has_health_signal": 0,
+        "has_deploy_signal": 0,
+        "sources_supporting": 0,
+        "agreement_bonus": 0.0,
+        "contradiction_penalty": 0.3,
+        "weights": {
+          "prometheus": 0.4,
+          "loki": 0.3,
+          "docker": 0.3,
+          "health": 0.15,
+          "deploy": 0.15
+        }
+      }
+    },
+    {
+      "id": 3303,
+      "incident_id": 33,
+      "iteration": 2,
+      "created_at": "2026-10-30T15:04:24+00:00",
+      "description": "Version v18 was deployed 72 seconds before the incident and introduced a regression that causes inventory reservation timeouts during checkout operations.",
+      "score": 0.8,
+      "score_breakdown": {
+        "has_prometheus_signal": 1,
+        "has_loki_signal": 1,
+        "has_docker_signal": 0,
+        "has_health_signal": 0,
+        "has_deploy_signal": 1,
+        "sources_supporting": 3,
+        "agreement_bonus": 0.2,
+        "contradiction_penalty": 0.0,
+        "weights": {
+          "prometheus": 0.4,
+          "loki": 0.3,
+          "docker": 0.3,
+          "health": 0.15,
+          "deploy": 0.15
+        }
+      }
+    },
+    {
+      "id": 3304,
+      "incident_id": 33,
+      "iteration": 2,
+      "created_at": "2026-10-30T15:04:48+00:00",
+      "description": "A configuration parameter marked as regression is causing failures.",
+      "score": 0.0,
+      "score_breakdown": {
+        "has_prometheus_signal": 0,
+        "has_loki_signal": 0,
+        "has_docker_signal": 0,
+        "has_health_signal": 0,
+        "has_deploy_signal": 0,
+        "sources_supporting": 0,
+        "agreement_bonus": 0.0,
+        "contradiction_penalty": 0.3,
+        "weights": {
+          "prometheus": 0.4,
+          "loki": 0.3,
+          "docker": 0.3,
+          "health": 0.15,
+          "deploy": 0.15
+        }
+      }
+    }
+  ],
+  "audit": [
+    {
+      "id": 3301,
+      "incident_id": 33,
+      "created_at": "2026-10-30T15:01:12+00:00",
+      "node": "observer",
+      "event_type": "observer_pass",
+      "detail": {
+        "iteration": 1,
+        "requested_tools": [
+          "query_prometheus",
+          "query_loki"
+        ],
+        "dispatched_tools": [
+          "query_prometheus",
+          "query_loki"
+        ],
+        "failed_tools": [],
+        "skipped_duplicates": [],
+        "observation_exhausted": false,
+        "evidence_collected": 2,
+        "tokens_spent": 1850
+      },
+      "reasoning_text": null
+    },
+    {
+      "id": 3302,
+      "incident_id": 33,
+      "created_at": "2026-10-30T15:02:24+00:00",
+      "node": "diagnoser",
+      "event_type": "diagnosis",
+      "detail": {
+        "iteration": 1,
+        "confidence": 0.5,
+        "confidence_threshold": 0.75,
+        "tokens_spent": 3100,
+        "progress": {
+          "progressed": true,
+          "reasons": [
+            "leader score changed"
+          ],
+          "stagnant_passes": 0,
+          "failed_reads_last_pass": 0,
+          "signature": [
+            "deploy",
+            0.5
+          ]
+        },
+        "hypotheses": [
+          {
+            "description": "A regression was introduced in the recently deployed v18 image that causes service failures or degraded behavior.",
+            "category": "deploy",
+            "score": 0.5
+          },
+          {
+            "description": "A configuration parameter marked as regression is causing failures.",
+            "category": "config",
+            "score": 0.0
+          }
+        ]
+      },
+      "reasoning_text": "deploy scores 0.50: A regression was introduced in the recently deployed v18 image that causes service failures or degraded behavior.\nconfig scores 0.00: A configuration parameter marked as regression is causing failures."
+    },
+    {
+      "id": 3303,
+      "incident_id": 33,
+      "created_at": "2026-10-30T15:02:48+00:00",
+      "node": "router",
+      "event_type": "continuing",
+      "detail": {
+        "iteration": 1,
+        "max_iterations": 5,
+        "confidence": 0.5,
+        "confidence_threshold": 0.75,
+        "tokens_spent": 3100,
+        "token_budget": 60000,
+        "destination": "observer",
+        "escalation_reason": null
+      },
+      "reasoning_text": "confidence too low (0.50)"
+    },
+    {
+      "id": 3304,
+      "incident_id": 33,
+      "created_at": "2026-10-30T15:04:00+00:00",
+      "node": "observer",
+      "event_type": "observer_pass",
+      "detail": {
+        "iteration": 2,
+        "requested_tools": [
+          "get_recent_deployments",
+          "get_container_state"
+        ],
+        "dispatched_tools": [
+          "get_recent_deployments",
+          "get_container_state"
+        ],
+        "failed_tools": [],
+        "skipped_duplicates": [],
+        "observation_exhausted": false,
+        "evidence_collected": 4,
+        "tokens_spent": 4300
+      },
+      "reasoning_text": null
+    },
+    {
+      "id": 3305,
+      "incident_id": 33,
+      "created_at": "2026-10-30T15:05:12+00:00",
+      "node": "diagnoser",
+      "event_type": "diagnosis",
+      "detail": {
+        "iteration": 2,
+        "confidence": 0.8,
+        "confidence_threshold": 0.75,
+        "tokens_spent": 6200,
+        "progress": {
+          "progressed": true,
+          "reasons": [
+            "leader score changed"
+          ],
+          "stagnant_passes": 0,
+          "failed_reads_last_pass": 0,
+          "signature": [
+            "deploy",
+            0.8
+          ]
+        },
+        "hypotheses": [
+          {
+            "description": "Version v18 was deployed 72 seconds before the incident and introduced a regression that causes inventory reservation timeouts during checkout operations.",
+            "category": "deploy",
+            "score": 0.8
+          },
+          {
+            "description": "A configuration parameter marked as regression is causing failures.",
+            "category": "config",
+            "score": 0.0
+          }
+        ]
+      },
+      "reasoning_text": "deploy scores 0.80: Version v18 was deployed 72 seconds before the incident and introduced a regression that causes inventory reservation timeouts during checkout operations.\nconfig scores 0.00: A configuration parameter marked as regression is causing failures."
+    },
+    {
+      "id": 3306,
+      "incident_id": 33,
+      "created_at": "2026-10-30T15:05:36+00:00",
+      "node": "router",
+      "event_type": "threshold_reached",
+      "detail": {
+        "iteration": 2,
+        "max_iterations": 5,
+        "confidence": 0.8,
+        "confidence_threshold": 0.75,
+        "tokens_spent": 6200,
+        "token_budget": 60000,
+        "destination": "remediator",
+        "escalation_reason": null
+      },
+      "reasoning_text": "confidence threshold met (0.80 >= 0.75)"
+    },
+    {
+      "id": 3307,
+      "incident_id": 33,
+      "created_at": "2026-10-30T15:06:00+00:00",
+      "node": "remediator",
+      "event_type": "symptom_checked",
+      "detail": {
+        "iteration": 2,
+        "category": "deploy",
+        "observed": {
+          "state": "present",
+          "error_ratio": 0.37
+        }
+      },
+      "reasoning_text": "the deploy symptom is present on checkout-service"
+    },
+    {
+      "id": 3308,
+      "incident_id": 33,
+      "created_at": "2026-10-30T15:06:24+00:00",
+      "node": "remediator",
+      "event_type": "approval_requested",
+      "detail": {
+        "approval_id": 13,
+        "action": "rollback_deployment",
+        "container": "checkout-service",
+        "args": [
+          "v17"
+        ],
+        "tier": 2,
+        "policy_mode": "guarded",
+        "expires_at": "2026-10-30T15:36:00+00:00"
+      },
+      "reasoning_text": "rollback_deployment on checkout-service is held for approval"
+    },
+    {
+      "id": 3309,
+      "incident_id": 33,
+      "created_at": "2026-10-30T15:08:18+00:00",
+      "node": "remediator",
+      "event_type": "approval_granted",
+      "detail": {
+        "approval_id": 13,
+        "decided_by": "tester",
+        "decision_channel": "api"
+      },
+      "reasoning_text": "tester approved rollback_deployment on checkout-service"
+    },
+    {
+      "id": 3310,
+      "incident_id": 33,
+      "created_at": "2026-10-30T15:08:42+00:00",
+      "node": "remediator",
+      "event_type": "action_started",
+      "detail": {
+        "iteration": 2,
+        "action": "rollback_deployment",
+        "container": "checkout-service",
+        "args": [
+          "v17"
+        ],
+        "action_at": "2026-10-30T15:08:18+00:00",
+        "approval": {
+          "required": true,
+          "approval_id": 13,
+          "status": "approved",
+          "decided_by": "tester",
+          "tier": 2,
+          "policy_mode": "guarded"
+        }
+      },
+      "reasoning_text": "rollback_deployment on checkout-service started"
+    },
+    {
+      "id": 3311,
+      "incident_id": 33,
+      "created_at": "2026-10-30T15:09:06+00:00",
+      "node": "remediator",
+      "event_type": "action_finished",
+      "detail": {
+        "action": "rollback_deployment",
+        "container": "checkout-service",
+        "ok": true,
+        "result": {
+          "status": "ok",
+          "image": "checkout-service:v17"
+        }
+      },
+      "reasoning_text": "rollback_deployment on checkout-service finished"
+    },
+    {
+      "id": 3312,
+      "incident_id": 33,
+      "created_at": "2026-10-30T15:09:30+00:00",
+      "node": "remediator",
+      "event_type": "action_executed",
+      "detail": {
+        "iteration": 2,
+        "action": "rollback_deployment",
+        "container": "checkout-service",
+        "check": "deploy",
+        "action_at": "2026-10-30T15:09:06+00:00",
+        "remediation_attempts": 1,
+        "snapshot_usable": true,
+        "result": {
+          "status": "ok"
+        }
+      },
+      "reasoning_text": "top hypothesis is deploy, which maps to rollback_deployment; newest non-regression artifact in deployment history is v17, reverting v18 deployed at 2026-10-30T14:51:08.111759+00:00; snapshot taken at 2026-10-30T15:06:41+00:00"
+    },
+    {
+      "id": 3313,
+      "incident_id": 33,
+      "created_at": "2026-10-30T15:11:54+00:00",
+      "node": "verifier",
+      "event_type": "verification",
+      "detail": {
+        "outcome": "pass",
+        "check": "deploy",
+        "action": "rollback_deployment",
+        "detail": {
+          "running_version": "v17",
+          "business_endpoint_status": 200,
+          "reason": "the running container reports v17 and its business endpoint answered HTTP 200"
+        },
+        "remediation_attempts": 1,
+        "max_remediation_attempts": 2
+      },
+      "reasoning_text": "the running container reports v17 and its business endpoint answered HTTP 200, so the bad release was genuinely reverted"
+    },
+    {
+      "id": 3314,
+      "incident_id": 33,
+      "created_at": "2026-10-30T15:12:18+00:00",
+      "node": "memory",
+      "event_type": "prior_incident_match",
+      "detail": {
+        "matches_incident": 23,
+        "prior_status": "resolved",
+        "service": "checkout-service",
+        "root_cause_category": "deploy",
+        "supporting_context_only": true
+      },
+      "reasoning_text": "this matches incident #23: same service (checkout-service) and root-cause category (deploy); that incident ended resolved, tier 2, root cause deploy. Recorded as context only; it did not influence this run's investigation, scoring or action."
+    }
+  ],
+  "approvals": [
+    {
+      "id": 13,
+      "incident_id": 33,
+      "request_key": "inc33-rollback_deployment-checkout-service",
+      "action": "rollback_deployment",
+      "container": "checkout-service",
+      "args": [
+        "v17"
+      ],
+      "tier": 2,
+      "incident_summary": "HighErrorRate on checkout-service: v18 introduced inventory reservation timeouts",
+      "plan_reasoning": "top hypothesis is deploy, which maps to rollback_deployment",
+      "evidence": [],
+      "status": "approved",
+      "requested_at": "2026-10-30T15:06:00+00:00",
+      "expires_at": "2026-10-30T15:36:00+00:00",
+      "decided_at": "2026-10-30T15:07:30+00:00",
+      "decided_by": "tester",
+      "decision_channel": "api"
+    }
+  ],
+  "memory": {
+    "incident_id": 33,
+    "service_name": "checkout-service",
+    "root_cause_category": "deploy",
+    "status": "resolved",
+    "record": {
+      "incident_id": 33,
+      "service": "checkout-service",
+      "status": "resolved",
+      "symptoms": [
+        "error rate on checkout-service is 38% over 5m"
+      ],
+      "root_cause": {
+        "category": "deploy",
+        "description": "v18 regression",
+        "score": 0.8
+      },
+      "tier_used": 2,
+      "fix": {
+        "action": "rollback_deployment",
+        "container": "checkout-service",
+        "rollback_target": "v17"
+      },
+      "verification": {
+        "outcome": "pass",
+        "check": "deploy"
+      },
+      "escalation_reason": null
+    },
+    "created_at": "2026-10-30T15:13:18+00:00"
+  }
+}

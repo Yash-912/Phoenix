@@ -1,0 +1,70 @@
+{
+  "_provenance": "Shaped from the Gate 0 run dumps, not exported from a database. Row shapes follow phoenix/db/init/001-008 and the detail objects follow the graph's record_audit calls. Reasoning text is copied from real runs where a run had it; evidence rows, hypothesis rows and detail objects were composed to match the code because the dumps do not hold them.",
+  "incident": {
+    "id": 38,
+    "service_name": "checkout-service",
+    "alertname": "HighErrorRate",
+    "severity": "critical",
+    "status": "active",
+    "first_seen_at": "2026-10-30T18:20:00+00:00",
+    "last_seen_at": "2026-10-30T18:23:00+00:00",
+    "alert_count": 1
+  },
+  "evidence": [
+    {
+      "id": 3801,
+      "incident_id": 38,
+      "source": "query_prometheus",
+      "iteration": 1,
+      "collected_at": "2026-10-30T18:20:24+00:00",
+      "summary": "error rate on checkout-service is 12% over 5m",
+      "raw_data": {
+        "status": "ok",
+        "service": "checkout-service",
+        "error_ratio": 0.12
+      }
+    }
+  ],
+  "hypotheses": [],
+  "audit": [
+    {
+      "id": 3801,
+      "incident_id": 38,
+      "created_at": "2026-10-30T18:20:48+00:00",
+      "node": "observer",
+      "event_type": "observer_pass",
+      "detail": {
+        "iteration": 1,
+        "requested_tools": [
+          "query_prometheus"
+        ],
+        "dispatched_tools": [
+          "query_prometheus"
+        ],
+        "failed_tools": [],
+        "skipped_duplicates": [],
+        "observation_exhausted": false,
+        "evidence_collected": 1,
+        "tokens_spent": 900
+      },
+      "reasoning_text": null
+    },
+    {
+      "id": 3802,
+      "incident_id": 38,
+      "created_at": "2026-10-30T18:21:12+00:00",
+      "node": "diagnoser",
+      "event_type": "llm_unavailable",
+      "detail": {
+        "iteration": 1,
+        "operation": "decide_hypotheses",
+        "error": "the model provider did not answer after 3 attempts (timeout)",
+        "tokens_spent": 900,
+        "evidence_collected": 1
+      },
+      "reasoning_text": "the model provider did not answer after 3 attempts (timeout)"
+    }
+  ],
+  "approvals": [],
+  "memory": null
+}

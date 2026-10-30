@@ -1,0 +1,379 @@
+{
+  "_provenance": "Shaped from the Gate 0 run dumps, not exported from a database. Row shapes follow phoenix/db/init/001-008 and the detail objects follow the graph's record_audit calls. Reasoning text is copied from real runs where a run had it; evidence rows, hypothesis rows and detail objects were composed to match the code because the dumps do not hold them.",
+  "incident": {
+    "id": 34,
+    "service_name": "payment-service",
+    "alertname": "HighLatency",
+    "severity": "high",
+    "status": "active",
+    "first_seen_at": "2026-10-30T15:40:00+00:00",
+    "last_seen_at": "2026-10-30T15:43:00+00:00",
+    "alert_count": 1
+  },
+  "evidence": [
+    {
+      "id": 3401,
+      "incident_id": 34,
+      "source": "query_prometheus",
+      "iteration": 1,
+      "collected_at": "2026-10-30T15:40:24+00:00",
+      "summary": "p95 latency on payment-service is 0.97s against a 1.0s alert threshold",
+      "raw_data": {
+        "status": "ok",
+        "service": "payment-service",
+        "latest_p95_seconds": 0.972,
+        "threshold_seconds": 1.0
+      }
+    },
+    {
+      "id": 3402,
+      "incident_id": 34,
+      "source": "query_loki",
+      "iteration": 1,
+      "collected_at": "2026-10-30T15:40:48+00:00",
+      "summary": "slow charge lookups logged: _find_charge_slow scanned 48,000 rows",
+      "raw_data": {
+        "status": "ok",
+        "matches": 61
+      }
+    }
+  ],
+  "hypotheses": [
+    {
+      "id": 3401,
+      "incident_id": 34,
+      "iteration": 1,
+      "created_at": "2026-10-30T15:41:36+00:00",
+      "description": "Charge lookups scan the charges table instead of using the primary key index, so latency grows with table size.",
+      "score": 0.75,
+      "score_breakdown": {
+        "has_prometheus_signal": 1,
+        "has_loki_signal": 1,
+        "has_docker_signal": 0,
+        "has_health_signal": 0,
+        "has_deploy_signal": 0,
+        "sources_supporting": 2,
+        "agreement_bonus": 0.2,
+        "contradiction_penalty": 0.0,
+        "weights": {
+          "prometheus": 0.4,
+          "loki": 0.3,
+          "docker": 0.3,
+          "health": 0.15,
+          "deploy": 0.15
+        }
+      }
+    },
+    {
+      "id": 3402,
+      "incident_id": 34,
+      "iteration": 1,
+      "created_at": "2026-10-30T15:42:00+00:00",
+      "description": "The payment-service container is CPU starved.",
+      "score": 0.15,
+      "score_breakdown": {
+        "has_prometheus_signal": 0,
+        "has_loki_signal": 0,
+        "has_docker_signal": 1,
+        "has_health_signal": 0,
+        "has_deploy_signal": 0,
+        "sources_supporting": 1,
+        "agreement_bonus": 0.0,
+        "contradiction_penalty": 0.0,
+        "weights": {
+          "prometheus": 0.4,
+          "loki": 0.3,
+          "docker": 0.3,
+          "health": 0.15,
+          "deploy": 0.15
+        }
+      }
+    }
+  ],
+  "audit": [
+    {
+      "id": 3401,
+      "incident_id": 34,
+      "created_at": "2026-10-30T15:41:12+00:00",
+      "node": "observer",
+      "event_type": "observer_pass",
+      "detail": {
+        "iteration": 1,
+        "requested_tools": [
+          "query_prometheus",
+          "query_loki"
+        ],
+        "dispatched_tools": [
+          "query_prometheus",
+          "query_loki"
+        ],
+        "failed_tools": [],
+        "skipped_duplicates": [],
+        "observation_exhausted": false,
+        "evidence_collected": 2,
+        "tokens_spent": 1700
+      },
+      "reasoning_text": null
+    },
+    {
+      "id": 3402,
+      "incident_id": 34,
+      "created_at": "2026-10-30T15:42:24+00:00",
+      "node": "diagnoser",
+      "event_type": "diagnosis",
+      "detail": {
+        "iteration": 1,
+        "confidence": 0.75,
+        "confidence_threshold": 0.75,
+        "tokens_spent": 3300,
+        "progress": {
+          "progressed": true,
+          "reasons": [
+            "leader score changed"
+          ],
+          "stagnant_passes": 0,
+          "failed_reads_last_pass": 0,
+          "signature": [
+            "slow_query",
+            0.75
+          ]
+        },
+        "hypotheses": [
+          {
+            "description": "Charge lookups scan the charges table instead of using the primary key index, so latency grows with table size.",
+            "category": "slow_query",
+            "score": 0.75
+          },
+          {
+            "description": "The payment-service container is CPU starved.",
+            "category": "overload",
+            "score": 0.15
+          }
+        ]
+      },
+      "reasoning_text": "slow_query scores 0.75: Charge lookups scan the charges table instead of using the primary key index, so latency grows with table size.\noverload scores 0.15: The payment-service container is CPU starved."
+    },
+    {
+      "id": 3403,
+      "incident_id": 34,
+      "created_at": "2026-10-30T15:42:48+00:00",
+      "node": "router",
+      "event_type": "threshold_reached",
+      "detail": {
+        "iteration": 1,
+        "max_iterations": 5,
+        "confidence": 0.75,
+        "confidence_threshold": 0.75,
+        "tokens_spent": 3300,
+        "token_budget": 60000,
+        "destination": "remediator",
+        "escalation_reason": null
+      },
+      "reasoning_text": "confidence threshold met (0.75 >= 0.75)"
+    },
+    {
+      "id": 3404,
+      "incident_id": 34,
+      "created_at": "2026-10-30T15:43:12+00:00",
+      "node": "remediator",
+      "event_type": "symptom_checked",
+      "detail": {
+        "iteration": 1,
+        "category": "slow_query",
+        "observed": {
+          "state": "present"
+        }
+      },
+      "reasoning_text": "the slow_query symptom is present on payment-service"
+    },
+    {
+      "id": 3405,
+      "incident_id": 34,
+      "created_at": "2026-10-30T15:43:36+00:00",
+      "node": "remediator",
+      "event_type": "tier3_handoff",
+      "detail": {
+        "iteration": 1,
+        "category": "slow_query"
+      },
+      "reasoning_text": "top hypothesis is slow_query; no Tier 1/2 action applies, handing off to Tier 3"
+    },
+    {
+      "id": 3406,
+      "incident_id": 34,
+      "created_at": "2026-10-30T15:44:00+00:00",
+      "node": "code_investigator",
+      "event_type": "investigation_context",
+      "detail": {
+        "service_dir": "services/payment-service",
+        "service_file_count": 6
+      },
+      "reasoning_text": null
+    },
+    {
+      "id": 3407,
+      "incident_id": 34,
+      "created_at": "2026-10-30T15:44:24+00:00",
+      "node": "code_investigator",
+      "event_type": "investigation_pass",
+      "detail": {
+        "iteration": 1,
+        "tools_called": [
+          "read_file",
+          "search_code"
+        ],
+        "evidence_collected": 2
+      },
+      "reasoning_text": null
+    },
+    {
+      "id": 3408,
+      "incident_id": 34,
+      "created_at": "2026-10-30T15:44:48+00:00",
+      "node": "code_investigator",
+      "event_type": "investigation_concluded",
+      "detail": {
+        "iteration": 1,
+        "defect_found": true,
+        "file_path": "services/payment-service/app.py",
+        "function_name": "_find_charge_slow",
+        "fix_approach": "use the indexed primary key lookup",
+        "evidence_collected": 2
+      },
+      "reasoning_text": "The function fetches all rows from the charges table and filters in Python instead of using the indexed PRIMARY KEY lookup, causing O(n) query latency that scales with table size rather than O(1) index lookup."
+    },
+    {
+      "id": 3409,
+      "incident_id": 34,
+      "created_at": "2026-10-30T15:45:12+00:00",
+      "node": "patch_generator",
+      "event_type": "patch_target",
+      "detail": {
+        "file_path": "services/payment-service/app.py",
+        "target_function": "_find_charge_slow"
+      },
+      "reasoning_text": null
+    },
+    {
+      "id": 3410,
+      "incident_id": 34,
+      "created_at": "2026-10-30T15:45:36+00:00",
+      "node": "patch_generator",
+      "event_type": "patch_proposed",
+      "detail": {
+        "attempt": 1,
+        "file_path": "services/payment-service/app.py",
+        "changed_lines": 7,
+        "hunks": 1,
+        "scope_ok": true,
+        "diff": "--- a/services/payment-service/app.py\n+++ b/services/payment-service/app.py\n@@ def _find_charge_slow(charge_id):\n-    rows = conn.execute('SELECT * FROM charges').fetchall()\n-    return next((r for r in rows if r['id'] == charge_id), None)\n+    return conn.execute('SELECT * FROM charges WHERE id = %s', (charge_id,)).fetchone()\n",
+        "target_function": "_find_charge_slow",
+        "declared_target_function": "_find_charge_slow"
+      },
+      "reasoning_text": "patch to 'services/payment-service/app.py' changes 7 lines across 1 hunk(s), within scope (only the target function '_find_charge_slow' changed)"
+    },
+    {
+      "id": 3411,
+      "incident_id": 34,
+      "created_at": "2026-10-30T15:46:00+00:00",
+      "node": "patch_validator",
+      "event_type": "validation_result",
+      "detail": {
+        "tests_passed": true,
+        "lint_passed": true,
+        "test_result": {
+          "returncode": 0
+        },
+        "lint_result": {
+          "returncode": 0
+        }
+      },
+      "reasoning_text": "tests_passed=True lint_passed=True"
+    },
+    {
+      "id": 3412,
+      "incident_id": 34,
+      "created_at": "2026-10-30T15:46:24+00:00",
+      "node": "patch_validator",
+      "event_type": "branch_pushed",
+      "detail": {
+        "branch": "phoenix/fix-payment-service-slow-query-b34"
+      },
+      "reasoning_text": "pushed phoenix/fix-payment-service-slow-query-b34 to origin"
+    },
+    {
+      "id": 3413,
+      "incident_id": 34,
+      "created_at": "2026-10-30T15:46:48+00:00",
+      "node": "pr_opener",
+      "event_type": "pr_duplicate",
+      "detail": {
+        "existing_pr": {
+          "number": 38,
+          "url": "https://github.com/example/lab/pull/38",
+          "branch": "phoenix/fix-payment-service-slow-query-b31"
+        },
+        "comment": {
+          "status": "ok"
+        },
+        "branch": "phoenix/fix-payment-service-slow-query-b34"
+      },
+      "reasoning_text": "an open PR (#38) already carries this change; no new PR opened"
+    },
+    {
+      "id": 3414,
+      "incident_id": 34,
+      "created_at": "2026-10-30T15:47:12+00:00",
+      "node": "pr_opener",
+      "event_type": "remote_branch_deleted",
+      "detail": {
+        "branch": "phoenix/fix-payment-service-slow-query-b34",
+        "why": "an open PR already carries this change"
+      },
+      "reasoning_text": "deleted unused phoenix/fix-payment-service-slow-query-b34 from origin (an open PR already carries this change)"
+    },
+    {
+      "id": 3415,
+      "incident_id": 34,
+      "created_at": "2026-10-30T15:47:36+00:00",
+      "node": "memory",
+      "event_type": "prior_incident_match",
+      "detail": {
+        "matches_incident": 31,
+        "prior_status": "pr_exists",
+        "service": "payment-service",
+        "root_cause_category": "slow_query",
+        "supporting_context_only": true
+      },
+      "reasoning_text": "this matches incident #31: same service (payment-service) and root-cause category (slow_query); that incident ended pr_exists, tier 3, root cause slow_query. Recorded as context only; it did not influence this run's investigation, scoring or action."
+    }
+  ],
+  "approvals": [],
+  "memory": {
+    "incident_id": 34,
+    "service_name": "payment-service",
+    "root_cause_category": "slow_query",
+    "status": "pr_exists",
+    "record": {
+      "incident_id": 34,
+      "service": "payment-service",
+      "status": "pr_exists",
+      "symptoms": [
+        "p95 latency on payment-service is 0.97s"
+      ],
+      "root_cause": {
+        "category": "slow_query",
+        "description": "full table scan",
+        "score": 0.75
+      },
+      "tier_used": 3,
+      "fix": {
+        "pr_url": "https://github.com/example/lab/pull/38",
+        "pr_status": "exists"
+      },
+      "verification": null,
+      "escalation_reason": null
+    },
+    "created_at": "2026-10-30T15:48:36+00:00"
+  }
+}

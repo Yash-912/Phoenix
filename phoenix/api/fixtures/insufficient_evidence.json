@@ -1,0 +1,441 @@
+{
+  "_provenance": "Shaped from the Gate 0 run dumps, not exported from a database. Row shapes follow phoenix/db/init/001-008 and the detail objects follow the graph's record_audit calls. Reasoning text is copied from real runs where a run had it; evidence rows, hypothesis rows and detail objects were composed to match the code because the dumps do not hold them.",
+  "incident": {
+    "id": 36,
+    "service_name": "payment-service",
+    "alertname": "HighLatency",
+    "severity": "high",
+    "status": "active",
+    "first_seen_at": "2026-10-30T17:00:00+00:00",
+    "last_seen_at": "2026-10-30T17:03:00+00:00",
+    "alert_count": 1
+  },
+  "evidence": [
+    {
+      "id": 3601,
+      "incident_id": 36,
+      "source": "query_prometheus",
+      "iteration": 1,
+      "collected_at": "2026-10-30T17:00:24+00:00",
+      "summary": "p95 latency query returned no samples for payment-service",
+      "raw_data": {
+        "status": "error",
+        "error": "Prometheus returned 503 Service Unavailable"
+      }
+    },
+    {
+      "id": 3602,
+      "incident_id": 36,
+      "source": "query_loki",
+      "iteration": 1,
+      "collected_at": "2026-10-30T17:00:48+00:00",
+      "summary": "no error lines for payment-service in 10m",
+      "raw_data": {
+        "status": "ok",
+        "matches": 0
+      }
+    },
+    {
+      "id": 3603,
+      "incident_id": 36,
+      "source": "get_container_state",
+      "iteration": 1,
+      "collected_at": "2026-10-30T17:01:12+00:00",
+      "summary": "payment-service running, restarts=0",
+      "raw_data": {
+        "status": "ok",
+        "state": "running",
+        "restart_count": 0
+      }
+    },
+    {
+      "id": 3604,
+      "incident_id": 36,
+      "source": "inspect_health",
+      "iteration": 2,
+      "collected_at": "2026-10-30T17:04:00+00:00",
+      "summary": "payment-service /health answered 200",
+      "raw_data": {
+        "status": "ok",
+        "http_status": 200
+      }
+    }
+  ],
+  "hypotheses": [
+    {
+      "id": 3601,
+      "incident_id": 36,
+      "iteration": 1,
+      "created_at": "2026-10-30T17:02:00+00:00",
+      "description": "Database connection saturation on payment-service.",
+      "score": 0.15,
+      "score_breakdown": {
+        "has_prometheus_signal": 0,
+        "has_loki_signal": 0,
+        "has_docker_signal": 1,
+        "has_health_signal": 0,
+        "has_deploy_signal": 0,
+        "sources_supporting": 1,
+        "agreement_bonus": 0.0,
+        "contradiction_penalty": 0.0,
+        "weights": {
+          "prometheus": 0.4,
+          "loki": 0.3,
+          "docker": 0.3,
+          "health": 0.15,
+          "deploy": 0.15
+        }
+      }
+    },
+    {
+      "id": 3602,
+      "incident_id": 36,
+      "iteration": 1,
+      "created_at": "2026-10-30T17:02:24+00:00",
+      "description": "A recent deploy regressed latency.",
+      "score": 0.0,
+      "score_breakdown": {
+        "has_prometheus_signal": 0,
+        "has_loki_signal": 0,
+        "has_docker_signal": 0,
+        "has_health_signal": 0,
+        "has_deploy_signal": 0,
+        "sources_supporting": 0,
+        "agreement_bonus": 0.0,
+        "contradiction_penalty": 0.3,
+        "weights": {
+          "prometheus": 0.4,
+          "loki": 0.3,
+          "docker": 0.3,
+          "health": 0.15,
+          "deploy": 0.15
+        }
+      }
+    },
+    {
+      "id": 3603,
+      "incident_id": 36,
+      "iteration": 1,
+      "created_at": "2026-10-30T17:02:48+00:00",
+      "description": "A slow query on the charges table.",
+      "score": 0.15,
+      "score_breakdown": {
+        "has_prometheus_signal": 0,
+        "has_loki_signal": 0,
+        "has_docker_signal": 1,
+        "has_health_signal": 0,
+        "has_deploy_signal": 0,
+        "sources_supporting": 1,
+        "agreement_bonus": 0.0,
+        "contradiction_penalty": 0.0,
+        "weights": {
+          "prometheus": 0.4,
+          "loki": 0.3,
+          "docker": 0.3,
+          "health": 0.15,
+          "deploy": 0.15
+        }
+      }
+    },
+    {
+      "id": 3604,
+      "incident_id": 36,
+      "iteration": 2,
+      "created_at": "2026-10-30T17:04:48+00:00",
+      "description": "Database connection saturation on payment-service.",
+      "score": 0.15,
+      "score_breakdown": {
+        "has_prometheus_signal": 0,
+        "has_loki_signal": 0,
+        "has_docker_signal": 1,
+        "has_health_signal": 0,
+        "has_deploy_signal": 0,
+        "sources_supporting": 1,
+        "agreement_bonus": 0.0,
+        "contradiction_penalty": 0.0,
+        "weights": {
+          "prometheus": 0.4,
+          "loki": 0.3,
+          "docker": 0.3,
+          "health": 0.15,
+          "deploy": 0.15
+        }
+      }
+    },
+    {
+      "id": 3605,
+      "incident_id": 36,
+      "iteration": 2,
+      "created_at": "2026-10-30T17:05:12+00:00",
+      "description": "A slow query on the charges table.",
+      "score": 0.15,
+      "score_breakdown": {
+        "has_prometheus_signal": 0,
+        "has_loki_signal": 0,
+        "has_docker_signal": 1,
+        "has_health_signal": 0,
+        "has_deploy_signal": 0,
+        "sources_supporting": 1,
+        "agreement_bonus": 0.0,
+        "contradiction_penalty": 0.0,
+        "weights": {
+          "prometheus": 0.4,
+          "loki": 0.3,
+          "docker": 0.3,
+          "health": 0.15,
+          "deploy": 0.15
+        }
+      }
+    },
+    {
+      "id": 3606,
+      "incident_id": 36,
+      "iteration": 2,
+      "created_at": "2026-10-30T17:05:36+00:00",
+      "description": "A recent deploy regressed latency.",
+      "score": 0.0,
+      "score_breakdown": {
+        "has_prometheus_signal": 0,
+        "has_loki_signal": 0,
+        "has_docker_signal": 0,
+        "has_health_signal": 0,
+        "has_deploy_signal": 0,
+        "sources_supporting": 0,
+        "agreement_bonus": 0.0,
+        "contradiction_penalty": 0.3,
+        "weights": {
+          "prometheus": 0.4,
+          "loki": 0.3,
+          "docker": 0.3,
+          "health": 0.15,
+          "deploy": 0.15
+        }
+      }
+    }
+  ],
+  "audit": [
+    {
+      "id": 3601,
+      "incident_id": 36,
+      "created_at": "2026-10-30T17:01:36+00:00",
+      "node": "observer",
+      "event_type": "observer_pass",
+      "detail": {
+        "iteration": 1,
+        "requested_tools": [
+          "query_prometheus",
+          "query_loki",
+          "get_container_state"
+        ],
+        "dispatched_tools": [
+          "query_loki",
+          "get_container_state"
+        ],
+        "failed_tools": [
+          "query_prometheus"
+        ],
+        "skipped_duplicates": [],
+        "observation_exhausted": false,
+        "evidence_collected": 3,
+        "tokens_spent": 2100
+      },
+      "reasoning_text": null
+    },
+    {
+      "id": 3602,
+      "incident_id": 36,
+      "created_at": "2026-10-30T17:03:12+00:00",
+      "node": "diagnoser",
+      "event_type": "diagnosis",
+      "detail": {
+        "iteration": 1,
+        "confidence": 0.15,
+        "confidence_threshold": 0.75,
+        "tokens_spent": 3800,
+        "progress": {
+          "progressed": true,
+          "reasons": [
+            "leader score changed"
+          ],
+          "stagnant_passes": 0,
+          "failed_reads_last_pass": 0,
+          "signature": [
+            "overload",
+            0.15
+          ]
+        },
+        "hypotheses": [
+          {
+            "description": "Database connection saturation on payment-service.",
+            "category": "overload",
+            "score": 0.15
+          },
+          {
+            "description": "A slow query on the charges table.",
+            "category": "slow_query",
+            "score": 0.15
+          },
+          {
+            "description": "A recent deploy regressed latency.",
+            "category": "deploy",
+            "score": 0.0
+          }
+        ]
+      },
+      "reasoning_text": "overload scores 0.15: Database connection saturation on payment-service.\nslow_query scores 0.15: A slow query on the charges table.\ndeploy scores 0.00: A recent deploy regressed latency."
+    },
+    {
+      "id": 3603,
+      "incident_id": 36,
+      "created_at": "2026-10-30T17:03:36+00:00",
+      "node": "router",
+      "event_type": "continuing",
+      "detail": {
+        "iteration": 1,
+        "max_iterations": 5,
+        "confidence": 0.15,
+        "confidence_threshold": 0.75,
+        "tokens_spent": 3800,
+        "token_budget": 60000,
+        "destination": "observer",
+        "escalation_reason": null
+      },
+      "reasoning_text": "confidence too low (0.15)"
+    },
+    {
+      "id": 3604,
+      "incident_id": 36,
+      "created_at": "2026-10-30T17:04:24+00:00",
+      "node": "observer",
+      "event_type": "observer_pass",
+      "detail": {
+        "iteration": 2,
+        "requested_tools": [
+          "inspect_health"
+        ],
+        "dispatched_tools": [
+          "inspect_health"
+        ],
+        "failed_tools": [],
+        "skipped_duplicates": [],
+        "observation_exhausted": false,
+        "evidence_collected": 4,
+        "tokens_spent": 5200
+      },
+      "reasoning_text": null
+    },
+    {
+      "id": 3605,
+      "incident_id": 36,
+      "created_at": "2026-10-30T17:06:00+00:00",
+      "node": "diagnoser",
+      "event_type": "diagnosis",
+      "detail": {
+        "iteration": 2,
+        "confidence": 0.15,
+        "confidence_threshold": 0.75,
+        "tokens_spent": 6900,
+        "progress": {
+          "progressed": true,
+          "reasons": [
+            "leader score changed"
+          ],
+          "stagnant_passes": 0,
+          "failed_reads_last_pass": 0,
+          "signature": [
+            "overload",
+            0.15
+          ]
+        },
+        "hypotheses": [
+          {
+            "description": "Database connection saturation on payment-service.",
+            "category": "overload",
+            "score": 0.15
+          },
+          {
+            "description": "A slow query on the charges table.",
+            "category": "slow_query",
+            "score": 0.15
+          },
+          {
+            "description": "A recent deploy regressed latency.",
+            "category": "deploy",
+            "score": 0.0
+          }
+        ]
+      },
+      "reasoning_text": "overload scores 0.15: Database connection saturation on payment-service.\nslow_query scores 0.15: A slow query on the charges table.\ndeploy scores 0.00: A recent deploy regressed latency."
+    },
+    {
+      "id": 3606,
+      "incident_id": 36,
+      "created_at": "2026-10-30T17:06:24+00:00",
+      "node": "router",
+      "event_type": "insufficient_evidence",
+      "detail": {
+        "iteration": 2,
+        "max_iterations": 5,
+        "confidence": 0.15,
+        "confidence_threshold": 0.75,
+        "tokens_spent": 6900,
+        "token_budget": 60000,
+        "destination": "__end__",
+        "escalation_reason": "the stagnation limit was reached",
+        "evidence_report": {
+          "summary": "Insufficient evidence after 3 pass(es): 3 hypothesis(es) considered, none supported by two independent sources. Answered without support: get_container_state, inspect_health, query_loki. Failed: query_prometheus.",
+          "considered": [
+            {
+              "category": "overload",
+              "description": "Database connection saturation on payment-service.",
+              "score": 0.15,
+              "supporting_sources": [
+                "get_container_state"
+              ],
+              "contradicted": false
+            },
+            {
+              "category": "slow_query",
+              "description": "A slow query on the charges table.",
+              "score": 0.15,
+              "supporting_sources": [
+                "get_container_state"
+              ],
+              "contradicted": false
+            }
+          ],
+          "failed_reads": [
+            {
+              "source": "query_prometheus",
+              "query": "p95 latency payment-service",
+              "error": "Prometheus returned 503 Service Unavailable"
+            }
+          ],
+          "never_read": [
+            "get_recent_deployments"
+          ]
+        }
+      },
+      "reasoning_text": "Insufficient evidence after 3 pass(es): 3 hypothesis(es) considered, none supported by two independent sources. Answered without support: get_container_state, inspect_health, query_loki. Failed: query_prometheus."
+    }
+  ],
+  "approvals": [],
+  "memory": {
+    "incident_id": 36,
+    "service_name": "payment-service",
+    "root_cause_category": null,
+    "status": "insufficient_evidence",
+    "record": {
+      "incident_id": 36,
+      "service": "payment-service",
+      "status": "insufficient_evidence",
+      "symptoms": [],
+      "root_cause": null,
+      "tier_used": null,
+      "fix": null,
+      "verification": null,
+      "escalation_reason": "the stagnation limit was reached"
+    },
+    "created_at": "2026-10-30T17:07:24+00:00"
+  }
+}
