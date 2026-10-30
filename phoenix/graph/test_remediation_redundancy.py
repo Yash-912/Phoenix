@@ -129,11 +129,17 @@ def test_the_verifiers_thresholds_are_what_they_were():
     assert verification.SLOPE_TOLERANCE == 1024
 
 
-def test_the_verifier_still_fails_a_restart_that_misses_its_strict_drop():
+def test_the_verifier_passes_a_restart_that_lands_at_the_fresh_process_level():
+    # 100.5 MB -> 51.9 MB is a real release to a new process's baseline; the old
+    # strict-half rule graded it a fail and sent the run to Tier 3.
     first, _ = verification._check_overload({"bytes": FRESH, "slope": 7865.0, "window_seconds": 90}, {"bytes": ELEVATED})
+
+    assert first == verification.OUTCOME_PASS
+
+
+def test_the_verifier_still_fails_a_restart_that_released_nothing():
     second, _ = verification._check_overload({"bytes": FRESH + 274_432, "slope": 7865.0, "window_seconds": 90}, {"bytes": FRESH})
 
-    assert first == verification.OUTCOME_FAIL
     assert second == verification.OUTCOME_FAIL
 
 
