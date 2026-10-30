@@ -19,7 +19,8 @@ The product requirements are in [phoenix-prd.md](phoenix-prd.md) and the build s
 This is a lab project under active development, not a production system.
 
 - Phases 0 to 6 are complete: the lab, deterministic chaos injection, investigation, Tier 1, Tier 2, Tier 3, and the escalation path. All five scenarios have been run live.
-- Not built yet: the execution-policy model (Phase 7), incident memory (Phase 8) and the dashboard (Phase 9).
+- Phases 7 and 8 are built: the execution-policy model with human approvals, and incident memory.
+- Not built yet: the dashboard (Phase 9).
 - Remediation is deliberately narrow. Rollback only covers `checkout-service` (`v17` and `v18`), and config rollback only covers `auth-service` `DB_POOL_SIZE`. The tools re-check every argument against allowlists, so the model can never supply an arbitrary service, version or command.
 
 ## How it works

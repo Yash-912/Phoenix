@@ -1,8 +1,9 @@
 """Remediation via docker-socket-proxy with tool-level allowlist.
 
-Proxy has POST=1 globally, but this module is the enforcement point:
-only actions in ALLOWED_DOCKER_ACTIONS can ever execute. No raw exec,
-no image build, no network/volume management.
+The proxy's own allowlist (infra/docker-socket-proxy/haproxy.cfg.template) permits
+POST only on /containers/{name}/restart, /pause and /unpause, and this module
+re-checks the same thing: only actions in ALLOWED_DOCKER_ACTIONS can ever execute.
+No raw exec, no image build, no network/volume management.
 
 **Why rollback is here and not in the proxy.** Tier 1 acts on a *running*
 container: restart, pause, unpause are single POST verbs. Tier 2 replaces one,

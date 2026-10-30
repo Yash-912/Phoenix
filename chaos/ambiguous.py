@@ -16,7 +16,8 @@ no config marker is written, the container never restarts, and the log line
 ("payment request failed, please retry") matches none of
 phoenix.graph.scoring.CATEGORY_KEYWORDS. An agent that investigates this
 should find real evidence of failure and nothing that discriminates a cause --
-the correct terminal state is the iteration cap, escalated, not a guess.
+the correct terminal state is insufficient_evidence (a report of what was and was
+not found, and no remediation reached), not a guess.
 
 payment-service, not checkout-service, is the target on purpose. checkout-
 service's container always carries an app.version Docker label ("v17" or
@@ -70,7 +71,7 @@ def inject() -> None:
         time.sleep(REQUEST_INTERVAL_SECONDS)
 
     print("ambiguous: burst complete; the service has already self-recovered.")
-    print("Expected agent outcome: insufficient evidence, escalate.")
+    print("Expected agent outcome: insufficient_evidence, no action taken.")
 
 
 def reset() -> None:

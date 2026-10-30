@@ -18,6 +18,7 @@ os.environ.setdefault("LLM_BASE_URL", "http://localhost:1/v1")
 os.environ.setdefault("LLM_API_KEY", "test-key")
 os.environ.setdefault("LLM_MODEL", "test-model")
 
+import pytest
 from langgraph.graph import END
 
 from phoenix.graph import graph, nodes, verification
