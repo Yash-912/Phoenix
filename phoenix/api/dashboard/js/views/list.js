@@ -24,12 +24,16 @@ function row(incident, now, index) {
   </a>`;
 }
 
-// A ridge line that draws itself on entry. Line work only; pathLength=1 lets one dash value fit every path.
-const RIDGE_ART = raw(`<svg class="hero__art" viewBox="0 0 420 170" aria-hidden="true" focusable="false">
-  <path pathLength="1" d="M0 160 L46 118 L78 138 L130 66 L160 98 L206 34 L246 108 L276 80 L330 140 L372 108 L420 160"/>
-  <path pathLength="1" d="M0 166 L60 140 L104 152 L170 112 L214 140 L284 104 L346 150 L420 130"/>
-  <path pathLength="1" d="M206 34 L206 12 L228 19 L206 26"/>
-  <circle cx="206" cy="34" r="2.5"/>
+// A plan of the lab, drawn as a blueprint that builds itself on entry: the gateway, four services,
+// the database, and Phoenix watching them. Line work only; pathLength=1 lets one dash value fit every
+// path. The two orange squares stand for services with an open incident.
+const SYSTEM_PLAN = raw(`<svg class="hero__art" viewBox="0 0 480 210" aria-hidden="true" focusable="false">
+  <path pathLength="1" d="M6 82h74v46H6zM138 12h104v44H138zM138 82h104v46H138zM138 152h104v46H138zM304 44h96v46H304zM304 118h96v46H304zM418 82h56v46h-56z"/>
+  <path pathLength="1" d="M80 105h29V34h29M109 105h29M109 105v68h29M242 34h31v33h31M242 105h31V67M242 175h31v-34h31M400 67h9v38h9M400 141h9v-36"/>
+  <path pathLength="1" d="M6 204h468M6 199v10M138 199v10M304 199v10M474 199v10"/>
+  <text x="10" y="76">GATEWAY</text><text x="142" y="7">CHECKOUT</text><text x="142" y="77">PAYMENT</text><text x="142" y="147">AUTH</text>
+  <text x="308" y="39">WORKER</text><text x="308" y="113">POSTGRES</text><text x="422" y="77">PHOENIX</text>
+  <rect class="mark" x="228" y="20" width="8" height="8"/><rect class="mark" x="386" y="52" width="8" height="8"/>
 </svg>`);
 
 export function renderList({ incidents, filter, now }) {
@@ -40,7 +44,7 @@ export function renderList({ incidents, filter, now }) {
   const counts = filterCounts(incidents);
   const shown = applyFilter(incidents, filter);
   return html`<header class="page-head hero">
-      ${RIDGE_ART}
+      ${SYSTEM_PLAN}
       <p class="label">Incidents</p>
       <h1 class="display">What Phoenix saw, and what it did about it.</h1>
       <p class="lead">Open an incident to read the whole investigation: what it believed, why, and what it changed.</p>

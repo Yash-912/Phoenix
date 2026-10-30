@@ -32,6 +32,7 @@ TEXT_ON = {
     "ink-muted": ["paper", "paper-raised", "paper-sunk"],
     "ink-faint": ["paper", "paper-raised"],
     "ink-on-solid": ["ink", "ink-muted"],
+    "brand-ink": ["paper", "paper-raised"],
     # the diff view colours text, not just a dot
     "tone-good": ["paper-raised"],
     "tone-bad": ["paper-raised"],

@@ -1,56 +1,77 @@
 /*
   Design tokens. This is the only file that decides how the dashboard looks.
 
-  base.css and components.css read these variables and hold no colour, font or
-  spacing value of their own, so a different look is a different copy of this file.
-  Values were sampled from the reference video the owner supplied (a warm paper page
-  with dashed hairline grid lines, a light grotesk, and near-black square buttons).
+  base.css, components.css and motion.css read these variables and hold no colour, font,
+  hairline or timing of their own, so a different look is a different copy of this file.
+  The current values follow a reference site the owner chose (heronaiapp.com): warm
+  paper with a fine grain, a hairline frame with corner crosses and tick marks, bold
+  uppercase grotesk headings, small mono uppercase labels, and one orange-red accent.
+  The previous look (dashed rules, near-black on cooler paper) is the same file with
+  --hairline set back to dashed.
 */
 :root {
   /* paper and ink */
-  --paper: #f5f4f0;
-  --paper-raised: #faf9f6;
-  --paper-sunk: #edece8;
-  --ink: #14130f;
-  --ink-muted: #5f5e5a;
-  --ink-faint: #6f6e69;
-  --ink-on-solid: #f5f4f0;
+  --paper: #f5f5ee;
+  --paper-raised: #fafaf6;
+  --paper-sunk: #ebebe4;
+  --ink: #282828;
+  --ink-muted: #52524f;
+  --ink-faint: #686865;
+  --ink-on-solid: #f5f5ee;
 
-  /* the dashed hairlines that draw the grid */
-  --rule: #d5d4d0;
-  --rule-strong: #b9b8b3;
-  --rule-dash: 4px 4px;
+  /* the one accent. --brand fills and marks; --brand-ink is the same hue dark enough for small text */
+  --brand: #fa3600;
+  --brand-ink: #b92700;
+
+  /* hairlines: change --hairline-style to dashed for the older look */
+  --rule: #d3d3cc;
+  --rule-strong: #b3b3af;
+  --hairline-style: solid;
+  --hairline: 1px var(--hairline-style) var(--rule);
+  --hairline-strong: 1px var(--hairline-style) var(--rule-strong);
+  --hairline-ink: 1px var(--hairline-style) var(--ink);
 
   /* meaning, used sparingly and always beside a word, never alone */
   --tone-good: #3d6a4b;
   --tone-warn: #9a6a1c;
   --tone-bad: #a03a2d;
-  --tone-attention: var(--ink);
+  --tone-attention: var(--brand);
   --tone-neutral: #8b8a85;
 
-  /* type */
-  --font-sans: "Inter", "Inter Tight", "Segoe UI Variable Text", "Segoe UI", "Helvetica Neue", Arial, system-ui, sans-serif;
-  --font-mono: ui-monospace, "SF Mono", "Cascadia Mono", "Consolas", "Liberation Mono", monospace;
+  /* paper grain, drawn by the browser: no image file to ship */
+  --grain: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='180' height='180'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 .15  0 0 0 0 .15  0 0 0 0 .13  0 0 0 .55 0'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
+  --grain-opacity: 0.13;
+
+  /* type. Swap in BT Grotesk and Geist Mono here if they are hosted; the stacks fall back cleanly. */
+  --font-sans: "BT Grotesk", "Inter Tight", "Inter", "Segoe UI Variable Display", "Segoe UI", "Helvetica Neue", Arial, system-ui, sans-serif;
+  --font-mono: "Geist Mono", ui-monospace, "SF Mono", "Cascadia Mono", "Consolas", "Liberation Mono", monospace;
   --weight-light: 300;
   --weight-regular: 400;
   --weight-medium: 500;
-  --tracking-display: -0.025em;
-  --tracking-label: 0.01em;
+  --weight-display: 700;
+  --weight-strong: 600;
+  --tracking-display: -0.03em;
+  --tracking-label: 0.05em;
+  --display-transform: uppercase;
+  --label-transform: uppercase;
 
-  --size-label: 0.8125rem;
+  --size-label: 0.6875rem;
   --size-small: 0.875rem;
   --size-body: 0.9375rem;
-  --size-lead: clamp(1.25rem, 1.6vw + 0.8rem, 1.75rem);
-  --size-title: clamp(1.9rem, 3.4vw + 0.6rem, 3.25rem);
+  --size-lead: clamp(1.0625rem, 1vw + 0.8rem, 1.375rem);
+  --size-heading: clamp(1.25rem, 1.4vw + 0.9rem, 1.75rem);
+  --size-title: clamp(1.75rem, 3.2vw + 0.4rem, 3.4rem);
   --size-numeral: clamp(2rem, 3vw + 0.6rem, 3rem);
 
-  --leading-tight: 1.1;
+  --leading-tight: 1.02;
   --leading-body: 1.5;
 
   /* space and shape */
-  --gutter: clamp(16px, 4vw, 56px);
+  --gutter: clamp(24px, 4vw, 64px);
   --page-max: 1240px;
   --label-col: 17rem;
+  --frame-inset: 8px;
+  --topbar-h: 4.4rem;
   --space-1: 4px;
   --space-2: 8px;
   --space-3: 12px;
@@ -60,7 +81,7 @@
   --space-7: 64px;
   --radius: 0;
 
-  --focus: 2px solid var(--ink);
+  --focus: 2px solid var(--brand);
   --transition: 120ms ease-out;
 
   /* motion: one place to slow it down, speed it up, or turn the flourish off */

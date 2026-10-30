@@ -6,7 +6,7 @@ import { renderList } from "./views/list.js";
 import { renderDetail, renderNotFound } from "./views/detail.js";
 import { renderApprovals } from "./views/approvals.js";
 import { emptyState } from "./views/shared.js";
-import { bindChrome, countUp, jumpTo, reveal, watchSections } from "./motion.js";
+import { bindChrome, countUp, intro, jumpTo, reveal, watchSections } from "./motion.js";
 
 const app = document.getElementById("app");
 const REFRESH_MS = 8000;
@@ -193,6 +193,7 @@ setInterval(() => {
 }, REFRESH_MS);
 
 bindChrome();
+intro();
 
 // The skip link cannot be a #anchor: the page routes on the URL hash.
 document.querySelector(".skip-link")?.addEventListener("click", (event) => {

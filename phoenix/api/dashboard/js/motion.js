@@ -114,3 +114,35 @@ export function jumpTo(id) {
   const target = document.getElementById(`section-${id}`);
   if (target) target.scrollIntoView({ behavior: reducedMotion() ? "auto" : "smooth", block: "start" });
 }
+
+// The first visit in a tab opens with an orange line sweeping the frame and a 0 to 100% count, as
+// the reference does. It is a veil over a page that is already loading beneath it, never a gate:
+// a timer removes it whatever else happens, and later visits in the same tab skip it.
+export function intro() {
+  if (reducedMotion() || typeof document === "undefined") return;
+  try {
+    if (window.sessionStorage.getItem("phoenix.intro")) return;
+    window.sessionStorage.setItem("phoenix.intro", "1");
+  } catch {
+    return;
+  }
+  const veil = document.createElement("div");
+  veil.className = "intro";
+  veil.setAttribute("aria-hidden", "true");
+  veil.innerHTML = '<span class="intro__pct">0%</span><i class="intro__line"></i>';
+  document.body.append(veil);
+  const pct = veil.querySelector(".intro__pct");
+  const line = veil.querySelector(".intro__line");
+  const started = performance.now();
+  const duration = 950;
+  const tick = (now) => {
+    const progress = Math.min(1, (now - started) / duration);
+    const eased = easeOutCubic(progress);
+    pct.textContent = `${Math.round(eased * 100)}%`;
+    line.style.transform = `scaleX(${eased})`;
+    if (progress < 1) requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
+  setTimeout(() => veil.classList.add("is-done"), duration + 150);
+  setTimeout(() => veil.remove(), duration + 800);
+}
