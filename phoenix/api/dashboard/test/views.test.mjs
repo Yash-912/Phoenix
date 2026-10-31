@@ -209,3 +209,8 @@ test("a run that climbed from a restart to the code lists each rung with its own
   assert.match(out, /Tier 3<\/strong> — looked for the defect in the code/);
   assert.doesNotMatch(detail(33), /It climbed/);
 });
+
+test("a long CamelCase alert name becomes words so the title can wrap", opts, () => {
+  const out = toString(renderDetail({ trace: { ...load("trace_33.json"), incident: { ...load("trace_33.json").incident, alertname: "WorkerServiceMemoryGrowth" } }, ui: ui(), config: { approvals_enabled: true }, now: NOW }));
+  assert.match(out, /Worker Service Memory Growth on /);
+});

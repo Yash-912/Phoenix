@@ -41,6 +41,11 @@ export function percent(value) {
   return Math.round(Math.min(1, Math.max(0, value)) * 100);
 }
 
+// WorkerServiceMemoryGrowth -> "Worker Service Memory Growth": a title that can wrap at its words.
+export function splitWords(name) {
+  return String(name).replace(/([a-z0-9])([A-Z])/g, "$1 $2").replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2");
+}
+
 export function humanKey(key) {
   return String(key).replace(/_/g, " ");
 }
@@ -64,11 +69,11 @@ export const FILTERS = [
   {
     id: "attention",
     label: "Needs a person",
-    test: (row) => ["awaiting_approval", "escalated", "action_unavailable", "llm_unavailable", "investigation_failed"].includes(row.outcome.key),
+    test: (row) => ["awaiting_approval", "escalated", "action_unavailable", "llm_unavailable", "investigation_failed", "no_outcome"].includes(row.outcome.key),
   },
   { id: "done", label: "Resolved or fixed by PR", test: (row) => ["resolved", "pr_opened", "pr_exists"].includes(row.outcome.key) },
-  { id: "nofinding", label: "No finding", test: (row) => row.outcome.key === "insufficient_evidence" },
-  { id: "open", label: "In progress", test: (row) => ["investigating", "not_started"].includes(row.outcome.key) },
+  { id: "noaction", label: "No action taken", test: (row) => ["insufficient_evidence", "symptom_cleared", "not_started"].includes(row.outcome.key) },
+  { id: "open", label: "In progress", test: (row) => row.outcome.key === "investigating" },
 ];
 
 export function applyFilter(rows, filterId) {

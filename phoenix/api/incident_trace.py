@@ -65,15 +65,22 @@ OUTCOMES: dict[str, dict[str, str]] = {
         "label": "Awaiting approval", "tone": "attention",
         "summary": "Phoenix chose an action and is paused until an approver answers.",
     },
+    "no_outcome": {
+        "label": "Stopped without an outcome", "tone": "warn",
+        "summary": "The run began and then went quiet without writing a final status. The trail shows how far it got.",
+    },
     "investigating": {
         "label": "Investigating", "tone": "neutral",
         "summary": "Phoenix has started and has not reached an outcome yet.",
     },
     "not_started": {
         "label": "Not started", "tone": "neutral",
-        "summary": "The alert is recorded but Phoenix has not picked it up yet.",
+        "summary": "The alert is recorded and Phoenix has no investigation for it.",
     },
 }
+
+# A run takes a couple of minutes. Quiet for longer than this with no final status, and it is over.
+STALE_AFTER_SECONDS = 30 * 60
 
 TIER_2_ACTIONS = frozenset({"rollback_deployment", "rollback_config"})
 
@@ -208,7 +215,7 @@ def _facts(detail: dict) -> dict:
         elif isinstance(value, str):
             if value and len(value) <= FACT_TEXT_LIMIT:
                 facts[key] = value
-        elif isinstance(value, list) and value and len(value) <= FACT_LIMIT and all(isinstance(v, (str, int, float)) for v in value):
+        elif isinstance(value, list) and value and len(value) <= FACT_LIMIT and all(isinstance(v, (str, int, float)) for v in value) and sum(len(str(v)) for v in value) <= FACT_TEXT_LIMIT * 2:
             facts[key] = value
         if len(facts) >= FACT_LIMIT:
             break
@@ -226,6 +233,7 @@ def derive_outcome(
     pending_approvals: int = 0,
     audit_events: int = 0,
     symptom_cleared: bool = False,
+    quiet_seconds: float | None = None,
 ) -> str:
     """How the investigation stands. The memory row is the graph's own final word and wins.
 
@@ -244,7 +252,16 @@ def derive_outcome(
         return "awaiting_approval"
     if llm_unavailable:
         return "llm_unavailable"
+    if audit_events and quiet_seconds is not None and quiet_seconds > STALE_AFTER_SECONDS:
+        return "no_outcome"
     return "investigating" if audit_events else "not_started"
+
+
+def _quiet_seconds(last, now: datetime | None) -> float | None:
+    moment = _parse(last)
+    if moment is None:
+        return None
+    return ((now or datetime.now(timezone.utc)) - moment).total_seconds()
 
 
 def outcome_entry(key: str) -> dict:
@@ -255,7 +272,7 @@ def outcome_entry(key: str) -> dict:
     return {"key": key, **meta}
 
 
-def overview_row(row: dict) -> dict:
+def overview_row(row: dict, now: datetime | None = None) -> dict:
     """One incident-list row, with the outcome worked out and named."""
     key = derive_outcome(
         row.get("investigation_status"),
@@ -264,6 +281,7 @@ def overview_row(row: dict) -> dict:
         pending_approvals=int(row.get("pending_approvals") or 0),
         audit_events=int(row.get("audit_events") or 0),
         symptom_cleared=bool(row.get("symptom_cleared")),
+        quiet_seconds=_quiet_seconds(row.get("last_audit_at"), now),
     )
     return {
         "id": row["id"],
@@ -633,11 +651,17 @@ def _narrative(header: dict, hypotheses: dict, actions: list[dict], approvals: l
             lines.append(f"No one answered the request for {approval['action']} on {approval['container']}, so it expired and was not approved.")
         elif approval["can_decide"]:
             lines.append(f"Waiting for an approver to answer: {approval['action']} on {approval['container']}.")
+    ran: dict[str, int] = {}
     for action in actions:
         if action["ok"] is True:
-            lines.append(f"Ran {action['action']} on {action['container']}.")
+            line = f"Ran {action['action']} on {action['container']}."
         elif action["ok"] is False:
-            lines.append(f"{action['action']} on {action['container']} failed.")
+            line = f"{action['action']} on {action['container']} failed."
+        else:
+            continue
+        ran[line] = ran.get(line, 0) + 1
+    # A run that retried says each thing once, with a count, not a dozen identical lines.
+    lines.extend(line if n == 1 else f"{line[:-1]} ({n} times)." for line, n in ran.items())
     if verification:
         verdict = {"pass": "passed", "fail": "failed", "inconclusive": "was inconclusive"}.get(verification["outcome"], str(verification["outcome"]))
         lines.append(f"Verification {verdict}: {verification['reason']}" if verification["reason"] else f"Verification {verdict}.")
@@ -678,6 +702,7 @@ def build_trace(rows: dict, now: datetime | None = None) -> dict:
         pending_approvals=pending,
         audit_events=len(audit),
         symptom_cleared=any(row["event_type"] == "symptom_cleared" for row in audit),
+        quiet_seconds=_quiet_seconds(audit[-1].get("created_at"), now) if audit else None,
     )
     header = {
         "id": incident["id"],

@@ -6,7 +6,7 @@ incident, not what the live system measured.
 """
 
 import copy
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import fixture_store
 import incident_trace
@@ -347,3 +347,30 @@ def test_a_restart_that_leads_to_a_code_search_with_no_result_says_so_in_the_sto
     rows["audit"].append(audit_row(2, "no_defect_found", "could not pin the defect", node="code_investigator"))
     t = build_trace(rows, now=NOW)
     assert any("looked in the code" in line and "could not pin one down" in line for line in t["narrative"])
+
+
+def test_a_long_list_in_an_audit_detail_stays_out_of_the_one_line_facts():
+    long_list = ["every function other than the target function, including any dispatcher"] * 5
+    assert "forbidden_areas" not in incident_trace._facts({"forbidden_areas": long_list, "target_file": "app.py"})
+    assert incident_trace._facts({"queries": ["a", "b"]}) == {"queries": ["a", "b"]}
+
+
+def test_a_run_with_no_final_status_that_went_quiet_is_not_called_investigating():
+    assert derive_outcome(None, audit_events=12, quiet_seconds=60) == "investigating"
+    assert derive_outcome(None, audit_events=12, quiet_seconds=incident_trace.STALE_AFTER_SECONDS + 1) == "no_outcome"
+    assert derive_outcome(None, audit_events=0, quiet_seconds=None) == "not_started"
+    assert derive_outcome("resolved", audit_events=12, quiet_seconds=99999) == "resolved"
+    row = {**FIXTURES[33]["incident"], "investigation_status": None, "audit_events": 5, "last_audit_at": "2026-10-30T10:00:00+00:00"}
+    assert overview_row(row, now=NOW)["outcome"]["key"] == "no_outcome"
+    rows = copy.deepcopy(FIXTURES[36])
+    rows["memory"] = None
+    rows["approvals"] = []
+    assert build_trace(rows, now=NOW + timedelta(days=1))["incident"]["outcome"]["key"] == "no_outcome"
+
+
+def test_repeated_actions_are_said_once_with_a_count():
+    rows = copy.deepcopy(FIXTURES[33])
+    repeat = [r for r in rows["audit"] if r["event_type"] in ("action_started", "action_finished", "action_executed")]
+    rows["audit"] = rows["audit"] + [{**r, "id": r["id"] + 5000 * n} for n in (1, 2) for r in repeat]
+    lines = [line for line in build_trace(rows, now=NOW)["narrative"] if line.startswith("Ran ")]
+    assert len(lines) == 1 and "(3 times)" in lines[0]

@@ -2,7 +2,7 @@
 // why did it think so, what were the steps, what did it read, has this happened before, and
 // the raw record behind all of it. Decisions come first; the raw layer is one click deeper.
 import { html, raw } from "../html.js";
-import { clockTime, diffLines, factValue, fullTime, humanKey, percent, pretty, safeUrl, score, timeLeft } from "../format.js";
+import { clockTime, diffLines, factValue, fullTime, humanKey, percent, pretty, safeUrl, score, splitWords, timeLeft } from "../format.js";
 import { alertChip, emptyState, outcomeChip } from "./shared.js";
 
 function section(number, label, heading, body, note) {
@@ -48,7 +48,7 @@ function incidentRecord(trace) {
       ["alert", `${i.alertname} · ${i.severity}`],
       ["outcome", i.outcome.label, true],
       ["root cause", leader ? `${leader.category || "unclassified"} · ${score(leader.score)}` : "none named"],
-      ["tier", trace.tier.tier ? `${trace.tier.label} · ${trace.tier.gate || ""}` : approval && approval.can_decide ? "not acted yet" : "no action"],
+      ["tier", trace.tier.tier ? `${(trace.tier.steps || []).length > 1 ? trace.tier.steps.map((r) => r.label).join(" → ") : trace.tier.label} · ${trace.tier.gate || ""}` : approval && approval.can_decide ? "not acted yet" : "no action"],
       ["approval", approvalText],
       ["fix", fix],
       ["verified", trace.verification ? trace.verification.outcome : trace.actions.length ? "no verdict recorded" : null],
@@ -290,7 +290,7 @@ export function renderDetail({ trace, ui, config, now }) {
   return html`<nav class="crumb" aria-label="Breadcrumb"><a href="#/">Incidents</a> / <span>#${i.id}</span></nav>
     <header class="detail-head">
       <div>
-        <h1 class="display" id="page-title" tabindex="-1">${i.alertname} on ${i.service_name}</h1>
+        <h1 class="display" id="page-title" tabindex="-1">${splitWords(i.alertname)} on ${i.service_name}</h1>
         <div class="meta">${outcomeChip(i.outcome)}${alertChip(i.alert_status)}${i.alert_count > 1 ? html`<span>fired ${i.alert_count} times</span>` : ""}</div>
       </div>
       ${incidentRecord(trace)}

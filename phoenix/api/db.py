@@ -91,7 +91,8 @@ SELECT i.id, i.service_name, i.alertname, i.severity, i.status,
        EXISTS (SELECT 1 FROM audit_log a WHERE a.incident_id = i.id AND a.event_type = 'symptom_cleared') AS symptom_cleared,
        (SELECT count(*) FROM approvals p
          WHERE p.incident_id = i.id AND p.status = 'pending' AND p.expires_at > now()) AS pending_approvals,
-       (SELECT count(*) FROM audit_log a WHERE a.incident_id = i.id) AS audit_events
+       (SELECT count(*) FROM audit_log a WHERE a.incident_id = i.id) AS audit_events,
+       (SELECT max(a.created_at) FROM audit_log a WHERE a.incident_id = i.id) AS last_audit_at
 FROM incidents i
 LEFT JOIN incident_memory m ON m.incident_id = i.id
 ORDER BY i.first_seen_at DESC

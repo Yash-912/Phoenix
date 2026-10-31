@@ -159,7 +159,7 @@
 .step__time { font-family: var(--font-mono); font-size: var(--size-label); color: var(--ink-faint); margin-left: auto; font-variant-numeric: tabular-nums; }
 .step__text { margin-top: var(--space-1); color: var(--ink-muted); white-space: pre-line; overflow-wrap: anywhere; max-width: 70ch; }
 .step__facts { margin-top: var(--space-2); display: flex; flex-wrap: wrap; gap: var(--space-1) var(--space-4); font-size: var(--size-label); color: var(--ink-muted); }
-.step__facts span { white-space: nowrap; }
+.step__facts span { min-width: 0; overflow-wrap: anywhere; }
 .step__facts b { font-weight: var(--weight-regular); color: var(--ink); }
 .step--minor .step__title { font-size: var(--size-body); color: var(--ink-muted); }
 

@@ -54,7 +54,7 @@ const rows = [
 ];
 
 test("filters group the outcomes the way a reader would ask", () => {
-  assert.deepEqual(filterCounts(rows), { all: 6, attention: 2, done: 2, nofinding: 1, open: 1 });
+  assert.deepEqual(filterCounts(rows), { all: 6, attention: 2, done: 2, noaction: 1, open: 1 });
   assert.equal(applyFilter(rows, "attention").length, 2);
   assert.equal(applyFilter(rows, "no-such-filter").length, 6);
 });
