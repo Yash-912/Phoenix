@@ -148,7 +148,14 @@ function didBody(trace, ui, config, now) {
   const tier = trace.tier;
   // A request still open is shown once, at the top of the page, where it can be answered.
   const answered = trace.approvals.filter((a) => !a.can_decide);
-  const tierLine = tier.tier
+  const rungs = tier.steps || [];
+  const tierLine = rungs.length > 1
+    ? html`<p class="lead">It climbed ${rungs.length} rungs, in this order.</p>
+      <ol class="rungs">${rungs.map((r) => html`<li class="rung"><p><strong>${r.label}</strong> — ${r.what}</p>
+        <p class="muted">${r.meaning}. Gate: ${r.gate}.</p>
+        ${r.why ? html`<p class="muted" style="max-width: 62ch">${r.why}</p>` : ""}</li>`)}</ol>
+      ${facts({ "policy mode": tier.policy_mode })}`
+    : tier.tier
     ? html`<p class="lead">${tier.label} — ${tier.meaning}.</p>
       ${tier.why ? html`<p class="muted" style="max-width: 62ch; margin-top: var(--space-2)">${tier.why}</p>` : ""}
       ${facts({ "policy mode": tier.policy_mode, gate: tier.gate })}`

@@ -88,6 +88,7 @@ SELECT i.id, i.service_name, i.alertname, i.severity, i.status,
        (m.record ->> 'tier_used')::int AS tier_used,
        EXISTS (SELECT 1 FROM audit_log a WHERE a.incident_id = i.id AND a.event_type = 'llm_unavailable') AS llm_unavailable,
        EXISTS (SELECT 1 FROM audit_log a WHERE a.incident_id = i.id AND a.event_type = 'investigation_failed') AS investigation_failed,
+       EXISTS (SELECT 1 FROM audit_log a WHERE a.incident_id = i.id AND a.event_type = 'symptom_cleared') AS symptom_cleared,
        (SELECT count(*) FROM approvals p
          WHERE p.incident_id = i.id AND p.status = 'pending' AND p.expires_at > now()) AS pending_approvals,
        (SELECT count(*) FROM audit_log a WHERE a.incident_id = i.id) AS audit_events

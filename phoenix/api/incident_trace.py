@@ -45,6 +45,10 @@ OUTCOMES: dict[str, dict[str, str]] = {
         "label": "Escalated", "tone": "warn",
         "summary": "Phoenix stopped and handed the incident to a person, with the reason recorded.",
     },
+    "symptom_cleared": {
+        "label": "Symptom cleared", "tone": "neutral",
+        "summary": "Phoenix reached a finding, then saw the symptom was already gone and took no action. The graph records this run as escalated.",
+    },
     "action_unavailable": {
         "label": "No action available", "tone": "warn",
         "summary": "Phoenix identified a cause that has no allowed action, so it did nothing and stopped.",
@@ -221,12 +225,17 @@ def derive_outcome(
     investigation_failed: bool = False,
     pending_approvals: int = 0,
     audit_events: int = 0,
+    symptom_cleared: bool = False,
 ) -> str:
     """How the investigation stands. The memory row is the graph's own final word and wins.
 
     Only terminal runs reach incident_memory. A model outage, a failed investigation and
     a run paused for approval do not, so those are read from what the audit trail holds.
     """
+    if memory_status == "escalated" and symptom_cleared:
+        # The graph files "the symptom is gone, nothing to do" under escalated. Said that way
+        # the list would send a person looking for a problem that no longer exists.
+        return "symptom_cleared"
     if memory_status:
         return memory_status
     if investigation_failed:
@@ -254,6 +263,7 @@ def overview_row(row: dict) -> dict:
         investigation_failed=bool(row.get("investigation_failed")),
         pending_approvals=int(row.get("pending_approvals") or 0),
         audit_events=int(row.get("audit_events") or 0),
+        symptom_cleared=bool(row.get("symptom_cleared")),
     )
     return {
         "id": row["id"],
@@ -287,6 +297,9 @@ def _timeline(audit: list[dict], redactor: Redactor) -> list[dict]:
             ok = bool(detail.get("ok"))
             if not ok:
                 title = "Action failed"
+        text = redactor.text(row.get("reasoning_text") or "")
+        if event_type == "patch_target" and not text:
+            text = redactor.text(f"{detail.get('target_file') or 'no file named'}" + (f": {detail['required_change']}" if detail.get("required_change") else ""))
         steps.append({
             "id": row.get("id"),
             "at": iso(row.get("created_at")),
@@ -294,12 +307,16 @@ def _timeline(audit: list[dict], redactor: Redactor) -> list[dict]:
             "event_type": event_type,
             "kind": kind,
             "title": title,
-            "text": redactor.text(row.get("reasoning_text") or ""),
+            "text": text,
             "iteration": detail.get("iteration"),
             "minor": event_type in MINOR_EVENTS,
             "ok": ok,
             "facts": redactor.value(_facts(detail)),
         })
+    # The graph writes "why this action" after "action finished". A reader wants the reason first.
+    for i in range(1, len(steps)):
+        if steps[i]["event_type"] == "action_executed" and steps[i - 1]["event_type"] == "action_finished":
+            steps[i - 1], steps[i] = steps[i], steps[i - 1]
     return steps
 
 
@@ -429,33 +446,54 @@ def _actions(audit: list[dict], redactor: Redactor) -> list[dict]:
     return actions
 
 
+TIER_3_EVENTS = ("tier3_handoff", "investigation_context", "investigation_concluded", "patch_proposed", "pr_result", "pr_duplicate")
+
+
+def _tier_step(tier: int, what: str, gate: str, why: str | None) -> dict:
+    return {"tier": tier, "label": TIERS[tier]["label"], "meaning": TIERS[tier]["meaning"], "what": what, "gate": gate, "why": why}
+
+
 def _tier(audit: list[dict], approvals: list[dict], memory: dict | None, actions: list[dict]) -> dict:
-    """Which tier acted and why that one. The "why" is the agent's own recorded reason."""
-    tier = None
+    """Which tier acted and why that one. The "why" is the agent's own recorded reason.
+
+    A run can climb: a restart first, then a look at the code. `steps` lists each rung in
+    the order it happened, each with its own gate and reason, so one rung's reason is never
+    read as another's. `tier` is where the run ended.
+    """
     record = _dict(_dict(memory).get("record"))
-    if isinstance(record.get("tier_used"), int):
-        tier = record["tier_used"]
-    if tier is None and any(row["event_type"] in ("tier3_handoff", "patch_proposed", "pr_result", "pr_duplicate") for row in audit):
-        tier = 3
-    if tier is None and actions:
-        tier = 2 if actions[0]["action"] in TIER_2_ACTIONS else 1
+    tier3_ran = any(row["event_type"] in TIER_3_EVENTS for row in audit)
+    handoff = next((row.get("reasoning_text") for row in audit if row["event_type"] == "tier3_handoff"), None)
+    action_why = next((a["why"] for a in actions if a.get("why")), None)
+
+    steps: list[dict] = []
+    if actions:
+        first = actions[0]
+        rung = 2 if first["action"] in TIER_2_ACTIONS else 1
+        steps.append(_tier_step(rung, f"{first['action']} on {first['container']}", "held for approval" if approvals else "ran without a gate", action_why))
+    if tier3_ran:
+        if handoff:
+            why = handoff
+        elif steps:
+            why = f"Followed the {steps[-1]['label']} action. The audit trail records no separate reason for the step."
+        else:
+            why = None
+        steps.append(_tier_step(3, "looked for the defect in the code", "stops at a pull request", why))
+
+    tier = record["tier_used"] if isinstance(record.get("tier_used"), int) else (steps[-1]["tier"] if steps else None)
     policy_mode = None
     for row in audit:
         mode = _dict(row.get("detail")).get("policy_mode")
         if mode:
             policy_mode = mode
-    handoff = next((row.get("reasoning_text") for row in audit if row["event_type"] == "tier3_handoff"), None)
-    action_why = next((a["why"] for a in actions if a.get("why")), None)
-    # A run that ended in code carries the reason for the handoff; an earlier restart's
-    # reason is still shown with that action, in its own row.
-    why = (handoff or action_why) if tier == 3 else (action_why or handoff)
-    gate = None
-    if approvals:
-        gate = "held for approval"
-    elif tier in (1, 2):
-        gate = "ran without a gate"
-    elif tier == 3:
-        gate = "stops at a pull request"
+    last = steps[-1] if steps else None
+    if last and last["tier"] == tier:
+        gate, why = last["gate"], last["why"]
+    else:
+        gate, why = None, action_why if tier in (1, 2) else None
+        if tier in (1, 2):
+            gate = "held for approval" if approvals else "ran without a gate"
+        elif tier == 3:
+            gate = "stops at a pull request"
     return {
         "tier": tier,
         "label": TIERS[tier]["label"] if tier in TIERS else None,
@@ -463,6 +501,7 @@ def _tier(audit: list[dict], approvals: list[dict], memory: dict | None, actions
         "policy_mode": policy_mode,
         "gate": gate,
         "why": why,
+        "steps": steps,
     }
 
 
@@ -602,13 +641,15 @@ def _narrative(header: dict, hypotheses: dict, actions: list[dict], approvals: l
     if verification:
         verdict = {"pass": "passed", "fail": "failed", "inconclusive": "was inconclusive"}.get(verification["outcome"], str(verification["outcome"]))
         lines.append(f"Verification {verdict}: {verification['reason']}" if verification["reason"] else f"Verification {verdict}.")
+    if tier3 and actions and not tier3.get("pr"):
+        lines.append("Then looked in the code for the defect behind it." + (" It could not pin one down." if tier3.get("stopped") else ""))
     if tier3 and tier3.get("pr"):
         pr = tier3["pr"]
         if pr["status"] == "opened":
             lines.append(f"Opened a pull request for review: {pr['url']}")
         elif pr["status"] == "exists":
             lines.append(f"An open pull request already carries this fix: {pr['url']}")
-    if stop_reason and header["outcome"]["key"] in ("escalated", "insufficient_evidence", "action_unavailable", "llm_unavailable", "investigation_failed"):
+    if stop_reason and header["outcome"]["key"] in ("escalated", "symptom_cleared", "insufficient_evidence", "action_unavailable", "llm_unavailable", "investigation_failed"):
         lines.append(f"Stopped because: {stop_reason}")
     return lines
 
@@ -636,6 +677,7 @@ def build_trace(rows: dict, now: datetime | None = None) -> dict:
         investigation_failed=any(row["event_type"] == "investigation_failed" for row in audit),
         pending_approvals=pending,
         audit_events=len(audit),
+        symptom_cleared=any(row["event_type"] == "symptom_cleared" for row in audit),
     )
     header = {
         "id": incident["id"],

@@ -201,3 +201,11 @@ test("steps are staggered but the stagger is capped so a long trace is not slow"
   assert.equal(delays.length, 180);
   assert.equal(Math.max(...delays), 10);
 });
+
+test("a run that climbed from a restart to the code lists each rung with its own reason", opts, () => {
+  const out = detail(35);
+  assert.match(out, /It climbed 2 rungs/);
+  assert.match(out, /Tier 1<\/strong> — restart_service/);
+  assert.match(out, /Tier 3<\/strong> — looked for the defect in the code/);
+  assert.doesNotMatch(detail(33), /It climbed/);
+});

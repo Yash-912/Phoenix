@@ -4,7 +4,7 @@ This lowers the risk of a credential reaching a screen; it is not the graph's ow
 redaction and these tests do not claim it is.
 """
 
-from redact import Redactor
+from redact import Redactor, _luhn_ok
 
 JWT = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abcdefghijklmnopqrstuvwx"
 
@@ -85,3 +85,12 @@ def test_container_names_versions_and_timestamps_pass_through():
     out, redactor = run(value)
     assert out == value
     assert redactor.summary() == {}
+
+
+def test_a_loki_nanosecond_timestamp_is_not_a_card():
+    # 1793400289730104985 passes the Luhn check but begins 17, which no card does.
+    redactor = Redactor()
+    assert _luhn_ok("1793400289730104985")
+    line = "1793400289730104985 INFO GET /charge 200"
+    assert redactor.text(line) == line
+    assert "card" not in redactor.summary()

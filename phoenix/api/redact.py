@@ -96,7 +96,9 @@ class Redactor:
 
     def _card(self, match: re.Match[str]) -> str:
         digits = re.sub(r"\D", "", match.group(0))
-        if 13 <= len(digits) <= 19 and _luhn_ok(digits):
+        # Card numbers begin 2 to 6. Epoch timestamps (Loki sends them in nanoseconds, 19 digits
+        # starting 17) pass the Luhn check one time in ten, and masking them blanks real log lines.
+        if 13 <= len(digits) <= 19 and digits[0] in "23456" and _luhn_ok(digits):
             return self._label("card", digits)
         return match.group(0)
 

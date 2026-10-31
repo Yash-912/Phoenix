@@ -5,6 +5,7 @@ Fixtures are shaped from the Gate 0 dumps, not exported from a database
 incident, not what the live system measured.
 """
 
+import copy
 from datetime import datetime
 
 import fixture_store
@@ -121,7 +122,17 @@ def test_decisions_come_first_and_minor_steps_are_marked_not_dropped():
     steps = trace(33)["timeline"]
     assert [s["kind"] for s in steps if not s["minor"]][0] == "diagnose"
     assert any(s["minor"] and s["event_type"] == "observer_pass" for s in steps)
-    assert [s["id"] for s in steps] == sorted(s["id"] for s in steps)
+    # Ordered as the graph wrote them, except that the reason for an action reads before "finished".
+    ids = [s["id"] for s in steps]
+    reasons = [i for i, s in enumerate(steps) if s["event_type"] == "action_executed"]
+    finished = [i for i, s in enumerate(steps) if s["event_type"] == "action_finished"]
+    assert reasons and all(r + 1 == f for r, f in zip(reasons, finished))
+    assert sorted(ids) == sorted(set(ids))
+
+
+def test_a_patch_target_with_no_text_of_its_own_names_the_file():
+    step = next(s for i in FIXTURES for s in trace(i)["timeline"] if s["event_type"] == "patch_target")
+    assert step["text"]
 
 
 # --- approvals ------------------------------------------------------------------------------
@@ -290,3 +301,49 @@ def test_a_long_trace_still_names_the_final_leader_and_how_many_passes_ran():
     t = build_trace(fixture_store.long_incident(passes=60), now=NOW)
     assert [p["iteration"] for p in t["hypotheses"]["passes"]][-1] == 60
     assert t["hypotheses"]["leader"]["description"] == "deploy hypothesis on pass 60"
+
+
+# --- shapes the live Gate 0 runs showed ---------------------------------------------------------
+
+
+def with_audit(incident_id, edit):
+    rows = copy.deepcopy(FIXTURES[incident_id])
+    rows["audit"] = edit(rows["audit"])
+    return rows
+
+
+def audit_row(n, event_type, text="", detail=None, node="remediator"):
+    return {"id": 9000 + n, "incident_id": 0, "created_at": "2026-10-30T16:00:00+00:00", "node": node,
+            "event_type": event_type, "reasoning_text": text, "detail": detail or {}}
+
+
+def test_an_escalated_run_whose_symptom_had_cleared_is_named_for_what_happened():
+    assert derive_outcome("escalated", symptom_cleared=True) == "symptom_cleared"
+    assert derive_outcome("escalated") == "escalated"
+    assert derive_outcome("resolved", symptom_cleared=True) == "resolved"
+    rows = copy.deepcopy(FIXTURES[37])
+    rows["audit"] = [r for r in rows["audit"] if r["event_type"] != "approval_not_granted"] + [audit_row(1, "symptom_cleared", "the symptom is no longer observed")]
+    t = build_trace(rows, now=NOW)
+    assert t["incident"]["outcome"]["key"] == "symptom_cleared"
+    assert incident_trace.OUTCOMES["symptom_cleared"]["label"]
+    assert overview_row({**FIXTURES[37]["incident"], "investigation_status": "escalated", "symptom_cleared": True})["outcome"]["key"] == "symptom_cleared"
+
+
+def test_a_restart_then_a_code_search_shows_each_rung_with_its_own_reason():
+    rows = copy.deepcopy(FIXTURES[35])
+    rows["audit"] = [r for r in rows["audit"] if r["event_type"] != "tier3_handoff"]
+    rows["memory"] = {**rows["memory"], "record": {**rows["memory"]["record"], "tier_used": 3}}
+    tier = build_trace(rows, now=NOW)["tier"]
+    assert [step["tier"] for step in tier["steps"]] == [1, 3]
+    assert tier["tier"] == 3 and tier["gate"] == "stops at a pull request"
+    assert "restart" not in (tier["why"] or "")
+    assert "no separate reason" in tier["steps"][1]["why"]
+    assert "restart_service" in tier["steps"][0]["what"]
+
+
+def test_a_restart_that_leads_to_a_code_search_with_no_result_says_so_in_the_story():
+    rows = copy.deepcopy(FIXTURES[35])
+    rows["audit"] = [r for r in rows["audit"] if r["event_type"] not in ("patch_proposed", "patch_target", "validation_result", "branch_pushed", "pr_result", "remote_branch_kept", "tier3_handoff")]
+    rows["audit"].append(audit_row(2, "no_defect_found", "could not pin the defect", node="code_investigator"))
+    t = build_trace(rows, now=NOW)
+    assert any("looked in the code" in line and "could not pin one down" in line for line in t["narrative"])
