@@ -241,7 +241,7 @@ function stepsBody(trace, ui) {
 function evidenceBody(trace) {
   if (!trace.evidence.length) return emptyState("No evidence was read", "The agent stopped before it read anything, or the reads were not recorded.");
   return html`<div class="table-wrap"><table class="table"><thead><tr><th>Pass</th><th>Source</th><th>What it found</th><th>Read at</th></tr></thead>
-    <tbody>${trace.evidence.map((e) => html`<tr><td class="num">${e.iteration}</td><td><span class="mono">${e.source}</span></td>
+    <tbody>${trace.evidence.map((e) => html`<tr><td class="num">${e.iteration}</td><td style="white-space: nowrap"><span class="mono">${e.source}</span></td>
       <td>${e.failed ? html`<span class="chip chip--bad">read failed</span> ` : ""}${e.summary}${rawJson("Raw response", e.raw_data)}</td><td class="muted num">${clockTime(e.collected_at)}</td></tr>`)}</tbody></table></div>`;
 }
 
