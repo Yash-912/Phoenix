@@ -22,10 +22,15 @@ CREATE TABLE charges (
 -- against ~18ms -- clears the threshold with comfortable margin, the same
 -- "measured, not tuned" bar the memory-leak scenario's threshold margin was
 -- held to.
+--
+-- Re-measured on faster hardware: at 1,000,000 rows the slow path's p95 sat at
+-- 0.97-0.985s, just under the 1.0s alert line, so the symptom check read the
+-- regression as already gone and the run escalated instead of acting. 2,000,000
+-- rows puts it back at about twice the threshold.
 INSERT INTO charges (order_id, amount, status, created_at)
 SELECT
     'seed-order-' || i,
     (10 + (i % 500))::numeric / 100,
     'charged',
     now() - (interval '1 second' * i)
-FROM generate_series(1, 1000000) AS i;
+FROM generate_series(1, 2000000) AS i;
