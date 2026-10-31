@@ -23,14 +23,14 @@ Built:
 - **Phases 0 to 6**: the lab, deterministic chaos injection, investigation, Tier 1, Tier 2, Tier 3, and the escalation path. All five scenarios have been run live.
 - **Phase 7, the execution policy**: two modes, `guarded` (the default) and `autonomous_lab`. In `guarded` mode a Tier 2 action stops and waits for a person to approve it. The run pauses, and an approve or deny call resumes it. An unanswered request expires into an escalation, never an approval. See [Execution policy and approvals](#execution-policy-and-approvals).
 - **Phase 8, incident memory**: when an incident reaches a terminal status, a compact record is written to `incident_memory`. A later incident on the same service with the same root-cause category gets a "matches incident #X" note in the audit trail. The note is written after the run finishes, so it never influences scoring or the action taken.
+- **Phase 9, the dashboard**: a static page served by the API at `/dashboard/` that lists incidents, narrates each investigation from its audit trail, and shows pending approvals. It is read-only apart from the approve and deny buttons, which need `PHOENIX_APPROVAL_TOKEN`.
 - **Offline replay** (`python -m phoenix.graph.replay`): re-scores stored incidents with the current evidence logic, without calling a model.
 
 Not built yet:
 
-- The dashboard (Phase 9). Today the only views are the API (`/incidents`, `/docs`) and the `audit_log` table.
 - Slack approval buttons. Approvals are answered through the HTTP endpoint only.
 - Redaction of tool output before it reaches the model.
-- The evaluation runner and the stability gate (10 live runs per scenario). Scenarios have been run live, but there is no saved result file with a pass rate.
+- The evaluation runner and the full stability gate (10 live runs per scenario). A reduced gate of 5 valid runs per scenario passed on 2026-10-31 (every scenario 4 of 5 or better, no wrong or unsafe action), but there is no saved result file.
 - Alert grouping and per-service locks. The watcher investigates one incident at a time.
 - Traces. The lab exports metrics (Prometheus) and logs (Loki) only.
 

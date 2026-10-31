@@ -465,3 +465,276 @@ def test_every_model_call_in_the_module_passes_the_temperature():
 
     assert len(calls) >= 7
     assert missing == []
+
+
+# ---- an LLM outage is its own failure, not an empty answer -------------------------------
+
+import httpx
+import openai
+import pytest
+
+
+def _request() -> httpx.Request:
+    return httpx.Request("POST", "http://localhost:1/v1/chat/completions")
+
+
+def _connection_error() -> openai.APIConnectionError:
+    return openai.APIConnectionError(request=_request())
+
+
+def _status_error(cls, status: int, message: str = "boom", body=None):
+    return cls(message, response=httpx.Response(status, request=_request()), body=body)
+
+
+UNSUPPORTED = "Invalid parameter: response_format of type json_schema is not supported with this model"
+TOO_LONG = "This model's maximum context length is 8192 tokens. However, your messages resulted in 12000 tokens."
+
+
+@pytest.fixture(autouse=True)
+def _forget_structured_rejections(monkeypatch):
+    monkeypatch.setattr(llm_client, "_STRUCTURED_UNSUPPORTED", set())
+
+
+def _stub_raising_client(monkeypatch, error: Exception, *, parse_error: Exception | None = None) -> list[str]:
+    calls: list[str] = []
+
+    def fake_create(**kwargs):
+        calls.append("create")
+        raise error
+
+    def fake_parse(**kwargs):
+        calls.append("parse")
+        raise parse_error or error
+
+    monkeypatch.setattr(
+        llm_client, "client",
+        SimpleNamespace(
+            beta=SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(parse=fake_parse))),
+            chat=SimpleNamespace(completions=SimpleNamespace(create=fake_create)),
+        ),
+    )
+    return calls
+
+
+OUTAGES = [
+    pytest.param(_connection_error, id="connection"),
+    pytest.param(lambda: _status_error(openai.RateLimitError, 429), id="rate-limit"),
+    pytest.param(lambda: _status_error(openai.InternalServerError, 503), id="server-error"),
+    pytest.param(lambda: _status_error(openai.AuthenticationError, 401), id="auth"),
+]
+
+
+@pytest.mark.parametrize("make_error", OUTAGES)
+def test_the_observers_call_raises_llm_unavailable_on_an_outage(monkeypatch, make_error):
+    _stub_raising_client(monkeypatch, make_error())
+
+    with pytest.raises(llm_client.LLMUnavailableError) as raised:
+        llm_client.decide_tool_calls("svc", [], [])
+
+    assert raised.value.operation == "decide_tool_calls"
+    assert raised.value.__cause__ is not None
+
+
+@pytest.mark.parametrize("make_error", OUTAGES)
+def test_the_diagnosers_call_raises_llm_unavailable_instead_of_returning_no_hypotheses(monkeypatch, make_error):
+    _stub_raising_client(monkeypatch, make_error())
+
+    with pytest.raises(llm_client.LLMUnavailableError) as raised:
+        llm_client.decide_hypotheses("svc", EVIDENCE)
+
+    assert raised.value.operation == "decide_hypotheses"
+
+
+def test_an_outage_on_the_prompt_json_fallback_is_also_an_outage(monkeypatch):
+    _stub_raising_client(monkeypatch, _connection_error(), parse_error=_status_error(openai.BadRequestError, 400))
+
+    with pytest.raises(llm_client.LLMUnavailableError):
+        llm_client.decide_hypotheses("svc", EVIDENCE)
+
+
+@pytest.mark.parametrize("call", [
+    lambda: llm_client.decide_code_investigation_calls("svc", "slow", []),
+    lambda: llm_client.decide_defect("svc", "slow", []),
+    lambda: llm_client.decide_patch("x = 1\n", llm_client.PatchTarget(
+        target_file="a.py", target_function="f", defect_summary="d", required_change="c", forbidden_areas=[],
+    )),
+])
+def test_the_tier3_calls_raise_llm_unavailable_on_an_outage(monkeypatch, call):
+    _stub_raising_client(monkeypatch, _connection_error())
+
+    with pytest.raises(llm_client.LLMUnavailableError):
+        call()
+
+
+def test_a_response_the_model_gave_but_that_cannot_be_used_is_still_not_an_outage(monkeypatch):
+    _stub_hypotheses_client(monkeypatch, parsed=None, content="not json at all")
+
+    decision = llm_client.decide_hypotheses("svc", EVIDENCE)
+
+    assert decision.output.hypotheses == []
+
+
+# ---- a rejected structured request is remembered for the process ---------------------------
+
+
+def test_a_provider_that_rejected_structured_output_is_not_asked_again(monkeypatch):
+    calls = _stub_hypotheses_client(monkeypatch, parse_error=_status_error(openai.BadRequestError, 400, UNSUPPORTED))
+
+    llm_client.decide_hypotheses("svc", EVIDENCE)
+    llm_client.decide_hypotheses("svc", EVIDENCE)
+
+    assert calls == ["parse", "create", "create"]
+
+
+def test_a_rejection_of_one_schema_does_not_switch_off_another(monkeypatch):
+    _stub_hypotheses_client(monkeypatch, parse_error=_status_error(openai.BadRequestError, 400, UNSUPPORTED))
+    llm_client.decide_hypotheses("svc", EVIDENCE)
+
+    assert (llm_client.LLM_MODEL, "CodeDefect") not in llm_client._STRUCTURED_UNSUPPORTED
+    assert (llm_client.LLM_MODEL, "DiagnoserOutput") in llm_client._STRUCTURED_UNSUPPORTED
+
+
+def test_an_unreadable_single_response_is_not_remembered_as_a_provider_rejection(monkeypatch):
+    calls = _stub_hypotheses_client(monkeypatch, parse_error=ValidationError.from_exception_data("DiagnoserOutput", []))
+
+    llm_client.decide_hypotheses("svc", EVIDENCE)
+    llm_client.decide_hypotheses("svc", EVIDENCE)
+
+    assert calls == ["parse", "create", "parse", "create"]
+
+
+def test_a_defect_decision_also_skips_a_rejected_structured_request(monkeypatch):
+    calls = _stub_hypotheses_client(monkeypatch, parse_error=_status_error(openai.BadRequestError, 400, UNSUPPORTED), content="{}")
+
+    llm_client.decide_defect("svc", "slow", [])
+    llm_client.decide_defect("svc", "slow", [])
+
+    assert calls == ["parse", "create", "create"]
+
+
+# ---- the SDK's own bounded retry is explicit and configurable ----------------------------------
+
+
+def test_the_sdk_retry_count_is_explicit_and_comes_from_the_environment(monkeypatch):
+    assert llm_client.client.max_retries == llm_client.LLM_MAX_RETRIES
+
+    monkeypatch.setenv("LLM_MAX_RETRIES", "5")
+    assert llm_client._max_retries_from_env() == 5
+    monkeypatch.setenv("LLM_MAX_RETRIES", "oops")
+    assert llm_client._max_retries_from_env() == llm_client.DEFAULT_LLM_MAX_RETRIES
+    monkeypatch.setenv("LLM_MAX_RETRIES", "-1")
+    assert llm_client._max_retries_from_env() == llm_client.DEFAULT_LLM_MAX_RETRIES
+    monkeypatch.delenv("LLM_MAX_RETRIES")
+    assert llm_client._max_retries_from_env() == llm_client.DEFAULT_LLM_MAX_RETRIES
+
+
+# ---- a 400 is a rejected request, not an outage, and not proof structured output is unsupported ----
+
+
+def _stub_fallback_error(monkeypatch, error: Exception) -> list[str]:
+    """Structured call is unsupported; the prompt-JSON fallback fails with `error`."""
+    calls: list[str] = []
+
+    def fake_parse(**kwargs):
+        calls.append("parse")
+        raise _status_error(openai.BadRequestError, 400, UNSUPPORTED)
+
+    def fake_create(**kwargs):
+        calls.append("create")
+        raise error
+
+    monkeypatch.setattr(
+        llm_client, "client",
+        SimpleNamespace(
+            beta=SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(parse=fake_parse))),
+            chat=SimpleNamespace(completions=SimpleNamespace(create=fake_create)),
+        ),
+    )
+    return calls
+
+
+@pytest.mark.parametrize("make_error", [
+    pytest.param(lambda: _status_error(openai.BadRequestError, 400, TOO_LONG), id="too-long"),
+    pytest.param(lambda: _status_error(openai.BadRequestError, 400, "blocked by the content policy"), id="content-policy"),
+    pytest.param(lambda: _status_error(openai.UnprocessableEntityError, 422), id="unprocessable"),
+    pytest.param(lambda: _status_error(openai.NotFoundError, 404), id="not-found"),
+])
+def test_a_rejected_fallback_request_is_not_an_outage(monkeypatch, make_error):
+    _stub_fallback_error(monkeypatch, make_error())
+
+    with pytest.raises(llm_client.LLMRequestRejectedError) as raised:
+        llm_client.decide_hypotheses("svc", EVIDENCE)
+
+    assert not isinstance(raised.value, llm_client.LLMUnavailableError)
+    assert isinstance(raised.value, llm_client.LLMCallError)
+    assert raised.value.operation == "decide_hypotheses"
+
+
+def test_a_rejected_observer_request_is_not_an_outage(monkeypatch):
+    _stub_raising_client(monkeypatch, _status_error(openai.BadRequestError, 400, TOO_LONG))
+
+    with pytest.raises(llm_client.LLMRequestRejectedError):
+        llm_client.decide_tool_calls("svc", [], [])
+
+
+def test_a_rejected_patch_request_is_not_an_outage(monkeypatch):
+    _stub_raising_client(monkeypatch, _status_error(openai.BadRequestError, 400, TOO_LONG))
+    target = llm_client.PatchTarget(
+        target_file="a.py", target_function="f", defect_summary="d", required_change="c", forbidden_areas=[],
+    )
+
+    with pytest.raises(llm_client.LLMRequestRejectedError):
+        llm_client.decide_patch("x = 1\n", target)
+
+
+@pytest.mark.parametrize("make_error", [
+    pytest.param(_connection_error, id="connection"),
+    pytest.param(lambda: openai.APITimeoutError(request=_request()), id="timeout"),
+    pytest.param(lambda: _status_error(openai.RateLimitError, 429), id="429"),
+    pytest.param(lambda: _status_error(openai.InternalServerError, 500), id="500"),
+    pytest.param(lambda: _status_error(openai.InternalServerError, 503), id="503"),
+    pytest.param(lambda: _status_error(openai.AuthenticationError, 401), id="401"),
+    pytest.param(lambda: _status_error(openai.PermissionDeniedError, 403), id="403"),
+    pytest.param(lambda: _status_error(openai.APIStatusError, 408), id="408"),
+])
+def test_only_unreachable_throttled_server_and_auth_failures_are_outages(monkeypatch, make_error):
+    _stub_fallback_error(monkeypatch, make_error())
+
+    with pytest.raises(llm_client.LLMUnavailableError):
+        llm_client.decide_hypotheses("svc", EVIDENCE)
+
+
+def test_an_over_long_prompt_400_does_not_mark_structured_output_unsupported(monkeypatch):
+    calls = _stub_hypotheses_client(monkeypatch, parse_error=_status_error(openai.BadRequestError, 400, TOO_LONG))
+
+    llm_client.decide_hypotheses("svc", EVIDENCE)
+    llm_client.decide_hypotheses("svc", EVIDENCE)
+
+    assert calls == ["parse", "create", "parse", "create"]
+    assert llm_client._STRUCTURED_UNSUPPORTED == set()
+
+
+@pytest.mark.parametrize("error", [
+    pytest.param(_status_error(openai.BadRequestError, 400, UNSUPPORTED), id="message"),
+    pytest.param(_status_error(openai.BadRequestError, 400, "Bad request", {"message": "x", "param": "response_format", "code": "unsupported_parameter"}), id="param"),
+    pytest.param(_status_error(openai.BadRequestError, 400, "This model does not support structured outputs"), id="structured-outputs"),
+    pytest.param(_status_error(openai.UnprocessableEntityError, 422, "json_schema is unsupported"), id="422"),
+    pytest.param(_status_error(openai.NotFoundError, 404, "Unrecognized request argument: response_format"), id="404"),
+])
+def test_a_400_that_says_structured_output_is_unsupported_is_remembered(monkeypatch, error):
+    calls = _stub_hypotheses_client(monkeypatch, parse_error=error)
+
+    llm_client.decide_hypotheses("svc", EVIDENCE)
+    llm_client.decide_hypotheses("svc", EVIDENCE)
+
+    assert calls == ["parse", "create", "create"]
+
+
+def test_a_400_that_only_mentions_the_response_format_is_not_enough(monkeypatch):
+    error = _status_error(openai.BadRequestError, 400, "response_format is fine but the prompt contains disallowed content")
+    calls = _stub_hypotheses_client(monkeypatch, parse_error=error)
+
+    llm_client.decide_hypotheses("svc", EVIDENCE)
+    llm_client.decide_hypotheses("svc", EVIDENCE)
+
+    assert calls == ["parse", "create", "parse", "create"]

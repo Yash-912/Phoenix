@@ -222,3 +222,61 @@ def test_open_pull_request_never_fabricates_a_url_when_gh_reports_no_url(monkeyp
 
     assert result["status"] == "error"
     assert "no URL" in result["error"]
+
+
+# ---- has_open_pull_request_for ---------------------------------------------------------
+
+
+def _gh_result(monkeypatch, stdout="", returncode=0, stderr=""):
+    captured = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        captured["kwargs"] = kwargs
+        return subprocess.CompletedProcess(argv, returncode, stdout=stdout, stderr=stderr)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    return captured
+
+
+def test_a_branch_with_an_open_pr_is_reported_open(monkeypatch):
+    captured = _gh_result(monkeypatch, stdout='[{"number": 7}]')
+
+    result = github_tool.has_open_pull_request_for("phoenix/tier3-incident-1-x-1")
+
+    assert result == {"status": "ok", "open": True}
+    assert captured["argv"][:3] == ["gh", "pr", "list"]
+    assert captured["argv"][captured["argv"].index("--head") + 1] == "phoenix/tier3-incident-1-x-1"
+    assert captured["argv"][captured["argv"].index("--state") + 1] == "open"
+    assert captured["kwargs"]["shell"] is False
+
+
+def test_a_branch_with_no_open_pr_is_reported_not_open(monkeypatch):
+    _gh_result(monkeypatch, stdout="[]")
+
+    assert github_tool.has_open_pull_request_for("phoenix/tier3-x") == {"status": "ok", "open": False}
+
+
+def test_a_failed_listing_is_an_error_not_a_no(monkeypatch):
+    _gh_result(monkeypatch, returncode=1, stderr="rate limited")
+
+    result = github_tool.has_open_pull_request_for("phoenix/tier3-x")
+
+    assert result["status"] == "error"
+    assert "open" not in result
+
+
+def test_an_unreadable_listing_is_an_error_not_a_no(monkeypatch):
+    _gh_result(monkeypatch, stdout="not json")
+
+    assert github_tool.has_open_pull_request_for("phoenix/tier3-x")["status"] == "error"
+
+
+def test_a_protected_or_empty_branch_is_refused_without_calling_gh(monkeypatch):
+    def boom(*a, **k):
+        raise AssertionError("gh was called")
+
+    monkeypatch.setattr(subprocess, "run", boom)
+
+    assert github_tool.has_open_pull_request_for("main")["status"] == "error"
+    assert github_tool.has_open_pull_request_for("")["status"] == "error"

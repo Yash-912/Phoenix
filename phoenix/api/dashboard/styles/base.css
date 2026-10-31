@@ -1,0 +1,139 @@
+/* Page frame and typography. Reads tokens.css only. */
+*, *::before, *::after { box-sizing: border-box; }
+
+html { -webkit-text-size-adjust: 100%; scroll-padding-top: calc(var(--topbar-h) + 3rem); }
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  font-size: var(--size-body);
+  font-weight: var(--weight-regular);
+  line-height: var(--leading-body);
+  -webkit-font-smoothing: antialiased;
+}
+
+a { color: inherit; text-decoration-color: var(--rule-strong); text-underline-offset: 3px; }
+a:hover { text-decoration-color: var(--ink); }
+
+:focus-visible { outline: var(--focus); outline-offset: 2px; }
+
+h1, h2, h3, p, ul, ol, dl, dd, figure { margin: 0; padding: 0; }
+ul, ol { list-style: none; }
+
+.visually-hidden {
+  position: absolute; width: 1px; height: 1px; overflow: hidden;
+  clip: rect(0 0 0 0); white-space: nowrap;
+}
+
+.skip-link {
+  position: absolute; left: var(--space-3); top: -4rem; z-index: 20;
+  background: var(--ink); color: var(--ink-on-solid); padding: var(--space-2) var(--space-4);
+}
+.skip-link:focus { top: var(--space-3); }
+
+/* The content column. The page's own frame is drawn by the overlay near the end of this file. */
+.frame {
+  max-width: var(--page-max);
+  margin: 0 auto;
+  padding: 0 var(--gutter);
+  min-height: 100vh;
+}
+
+.display {
+  font-size: var(--size-title);
+  font-weight: var(--weight-display);
+  text-transform: var(--display-transform);
+  letter-spacing: var(--tracking-display);
+  line-height: var(--leading-tight);
+  text-wrap: balance;
+  overflow-wrap: anywhere;
+}
+
+.lead {
+  font-size: var(--size-lead);
+  font-weight: var(--weight-regular);
+  letter-spacing: -0.01em;
+  line-height: 1.35;
+  text-wrap: pretty;
+}
+
+.label {
+  font-family: var(--font-mono);
+  font-size: var(--size-label);
+  text-transform: var(--label-transform);
+  letter-spacing: var(--tracking-label);
+  color: var(--ink-muted);
+}
+
+.muted { color: var(--ink-muted); }
+.mono { font-family: var(--font-mono); font-size: 0.85em; }
+.num { font-variant-numeric: tabular-nums; }
+
+/* Sections: a label cell on the left and the content on the right, split by a hairline. */
+.section {
+  display: grid;
+  grid-template-columns: var(--label-col) minmax(0, 1fr);
+  border-top: var(--hairline);
+}
+.section__label {
+  padding: var(--space-6) var(--space-5) var(--space-6) 0;
+  border-right: var(--hairline);
+}
+.section__label h2 {
+  margin-top: var(--space-2);
+  font-size: var(--size-heading);
+  font-weight: var(--weight-strong);
+  text-transform: var(--display-transform);
+  letter-spacing: var(--tracking-display);
+  line-height: 1.05;
+  text-wrap: balance;
+}
+.section__label p { margin-top: var(--space-3); color: var(--ink-muted); font-size: var(--size-small); }
+.section__body { padding: var(--space-6) 0 var(--space-6) var(--space-5); min-width: 0; }
+
+/* The page frame, drawn over everything and never in the way of a click: a hairline inset from
+   the screen edge, a cross in each corner, and a ruler of ticks along the four sides. Plus the
+   paper grain. All of it is decoration, so it sits on the root element and takes no space. */
+html::before {
+  content: ""; position: fixed; inset: var(--frame-inset); z-index: 60; pointer-events: none;
+  border: var(--hairline-strong);
+}
+html::after {
+  content: ""; position: fixed; inset: 0; z-index: 60; pointer-events: none;
+  --tick: repeating-linear-gradient(90deg, var(--rule-strong) 0 1px, transparent 1px 8px);
+  --tick-v: repeating-linear-gradient(180deg, var(--rule-strong) 0 1px, transparent 1px 8px);
+  --cross: linear-gradient(var(--ink), var(--ink));
+  background:
+    var(--cross) left 15px top 20px / 11px 1px no-repeat,
+    var(--cross) left 20px top 15px / 1px 11px no-repeat,
+    var(--cross) right 15px top 20px / 11px 1px no-repeat,
+    var(--cross) right 20px top 15px / 1px 11px no-repeat,
+    var(--cross) left 15px bottom 20px / 11px 1px no-repeat,
+    var(--cross) left 20px bottom 15px / 1px 11px no-repeat,
+    var(--cross) right 15px bottom 20px / 11px 1px no-repeat,
+    var(--cross) right 20px bottom 15px / 1px 11px no-repeat,
+    var(--tick) left 36px top 18px / calc(100% - 72px) 5px no-repeat,
+    var(--tick) left 36px bottom 18px / calc(100% - 72px) 5px no-repeat,
+    var(--tick-v) left 18px top 36px / 5px calc(100% - 72px) no-repeat,
+    var(--tick-v) right 18px top 36px / 5px calc(100% - 72px) no-repeat;
+}
+body::before {
+  content: ""; position: fixed; inset: 0; z-index: 59; pointer-events: none;
+  background-image: var(--grain); opacity: var(--grain-opacity);
+}
+@media (max-width: 860px) {
+  html::after { display: none; }
+}
+
+@media (max-width: 860px) {
+  .section { grid-template-columns: minmax(0, 1fr); }
+  .section__label { border-right: 0; padding: var(--space-5) 0 0; }
+  .section__body { padding: var(--space-4) 0 var(--space-5); }
+  .frame { border-inline: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; scroll-behavior: auto !important; }
+}

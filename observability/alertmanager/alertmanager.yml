@@ -11,8 +11,8 @@ route:
 receivers:
   - name: phoenix-webhook
     webhook_configs:
-      # Slice 1.5 will stand up phoenix-api with this route.
-      # Until then, Alertmanager will retry delivery and log failures — that's fine,
-      # this slice only needs to prove pending -> firing works.
+      # phoenix-api (phoenix/api/main.py) receives this and creates the incident row
+      # the watcher investigates. If it is down, Alertmanager retries delivery and
+      # logs the failure.
       - url: "http://phoenix-api:8000/webhooks/alertmanager"
         send_resolved: true

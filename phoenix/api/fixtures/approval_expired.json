@@ -1,0 +1,246 @@
+{
+  "_provenance": "Shaped from the Gate 0 run dumps, not exported from a database. Row shapes follow phoenix/db/init/001-008 and the detail objects follow the graph's record_audit calls. Reasoning text is copied from real runs where a run had it; evidence rows, hypothesis rows and detail objects were composed to match the code because the dumps do not hold them.",
+  "incident": {
+    "id": 40,
+    "service_name": "payment-service",
+    "alertname": "HighErrorRate",
+    "severity": "critical",
+    "status": "active",
+    "first_seen_at": "2026-10-30T19:20:00+00:00",
+    "last_seen_at": "2026-10-30T19:23:00+00:00",
+    "alert_count": 1
+  },
+  "evidence": [
+    {
+      "id": 4001,
+      "incident_id": 40,
+      "source": "query_prometheus",
+      "iteration": 1,
+      "collected_at": "2026-10-30T19:20:24+00:00",
+      "summary": "payment-service 5xx ratio 52%",
+      "raw_data": {
+        "status": "ok",
+        "service": "payment-service",
+        "error_ratio": 0.52
+      }
+    },
+    {
+      "id": 4002,
+      "incident_id": 40,
+      "source": "get_recent_deployments",
+      "iteration": 1,
+      "collected_at": "2026-10-30T19:20:48+00:00",
+      "summary": "payment-service v9 deployed 3 minutes before the alert",
+      "raw_data": {
+        "status": "ok",
+        "deployments": [
+          {
+            "version": "v9",
+            "at": "2026-10-30T19:17:00+00:00"
+          },
+          {
+            "version": "v8",
+            "at": "2026-10-24T09:00:00+00:00"
+          }
+        ]
+      }
+    }
+  ],
+  "hypotheses": [
+    {
+      "id": 4001,
+      "incident_id": 40,
+      "iteration": 1,
+      "created_at": "2026-10-30T19:21:36+00:00",
+      "description": "payment-service v9 introduced the failures.",
+      "score": 0.75,
+      "score_breakdown": {
+        "has_prometheus_signal": 1,
+        "has_loki_signal": 0,
+        "has_docker_signal": 0,
+        "has_health_signal": 0,
+        "has_deploy_signal": 1,
+        "sources_supporting": 2,
+        "agreement_bonus": 0.2,
+        "contradiction_penalty": 0.0,
+        "weights": {
+          "prometheus": 0.4,
+          "loki": 0.3,
+          "docker": 0.3,
+          "health": 0.15,
+          "deploy": 0.15
+        }
+      }
+    }
+  ],
+  "audit": [
+    {
+      "id": 4001,
+      "incident_id": 40,
+      "created_at": "2026-10-30T19:21:12+00:00",
+      "node": "observer",
+      "event_type": "observer_pass",
+      "detail": {
+        "iteration": 1,
+        "requested_tools": [
+          "query_prometheus",
+          "get_recent_deployments"
+        ],
+        "dispatched_tools": [
+          "query_prometheus",
+          "get_recent_deployments"
+        ],
+        "failed_tools": [],
+        "skipped_duplicates": [],
+        "observation_exhausted": false,
+        "evidence_collected": 2,
+        "tokens_spent": 1700
+      },
+      "reasoning_text": null
+    },
+    {
+      "id": 4002,
+      "incident_id": 40,
+      "created_at": "2026-10-30T19:22:00+00:00",
+      "node": "diagnoser",
+      "event_type": "diagnosis",
+      "detail": {
+        "iteration": 1,
+        "confidence": 0.75,
+        "confidence_threshold": 0.75,
+        "tokens_spent": 2800,
+        "progress": {
+          "progressed": true,
+          "reasons": [
+            "leader score changed"
+          ],
+          "stagnant_passes": 0,
+          "failed_reads_last_pass": 0,
+          "signature": [
+            "deploy",
+            0.75
+          ]
+        },
+        "hypotheses": [
+          {
+            "description": "payment-service v9 introduced the failures.",
+            "category": "deploy",
+            "score": 0.75
+          }
+        ]
+      },
+      "reasoning_text": "deploy scores 0.75: payment-service v9 introduced the failures."
+    },
+    {
+      "id": 4003,
+      "incident_id": 40,
+      "created_at": "2026-10-30T19:22:24+00:00",
+      "node": "router",
+      "event_type": "threshold_reached",
+      "detail": {
+        "iteration": 1,
+        "max_iterations": 5,
+        "confidence": 0.75,
+        "confidence_threshold": 0.75,
+        "tokens_spent": 2800,
+        "token_budget": 60000,
+        "destination": "remediator",
+        "escalation_reason": null
+      },
+      "reasoning_text": "confidence threshold met (0.75 >= 0.75)"
+    },
+    {
+      "id": 4004,
+      "incident_id": 40,
+      "created_at": "2026-10-30T19:22:48+00:00",
+      "node": "remediator",
+      "event_type": "approval_requested",
+      "detail": {
+        "approval_id": 16,
+        "action": "rollback_deployment",
+        "container": "payment-service",
+        "args": [
+          "v8"
+        ],
+        "tier": 2,
+        "policy_mode": "guarded",
+        "expires_at": "2026-10-30T19:27:24+00:00"
+      },
+      "reasoning_text": "rollback_deployment on payment-service is held for approval"
+    },
+    {
+      "id": 4005,
+      "incident_id": 40,
+      "created_at": "2026-10-30T19:29:12+00:00",
+      "node": "watcher",
+      "event_type": "approval_expired",
+      "detail": {
+        "approval_id": 16,
+        "action": "rollback_deployment",
+        "container": "payment-service"
+      },
+      "reasoning_text": "no one answered in time, so this is an escalation, not an approval"
+    },
+    {
+      "id": 4006,
+      "incident_id": 40,
+      "created_at": "2026-10-30T19:29:36+00:00",
+      "node": "remediator",
+      "event_type": "approval_not_granted",
+      "detail": {
+        "iteration": 1,
+        "remediation_attempts": 0,
+        "max_remediation_attempts": 2,
+        "policy_mode": "guarded",
+        "reason": "approval 16 expired unanswered"
+      },
+      "reasoning_text": "approval 16 expired unanswered, so rollback_deployment on payment-service was not run"
+    }
+  ],
+  "approvals": [
+    {
+      "id": 16,
+      "incident_id": 40,
+      "request_key": "inc40-rollback_deployment-payment-service",
+      "action": "rollback_deployment",
+      "container": "payment-service",
+      "args": [
+        "v8"
+      ],
+      "tier": 2,
+      "incident_summary": "HighErrorRate on payment-service after v9",
+      "plan_reasoning": "top hypothesis is deploy, which maps to rollback_deployment",
+      "evidence": [],
+      "status": "expired",
+      "requested_at": "2026-10-30T19:22:24+00:00",
+      "expires_at": "2026-10-30T19:27:24+00:00",
+      "decided_at": "2026-10-30T19:29:36+00:00",
+      "decided_by": null,
+      "decision_channel": null
+    }
+  ],
+  "memory": {
+    "incident_id": 40,
+    "service_name": "payment-service",
+    "root_cause_category": "deploy",
+    "status": "escalated",
+    "record": {
+      "incident_id": 40,
+      "service": "payment-service",
+      "status": "escalated",
+      "symptoms": [
+        "payment-service 5xx ratio 52%"
+      ],
+      "root_cause": {
+        "category": "deploy",
+        "description": "v9",
+        "score": 0.75
+      },
+      "tier_used": null,
+      "fix": null,
+      "verification": null,
+      "escalation_reason": "approval 16 expired unanswered"
+    },
+    "created_at": "2026-10-30T19:30:36+00:00"
+  }
+}

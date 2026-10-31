@@ -149,6 +149,12 @@ def should_continue(state: AgentState) -> Command:
     the same audit table the observer and the diagnoser append to, so a run's
     end reads as one trail in order rather than a state field nobody queried.
     """
+    # First, before any threshold or cap: a run whose model could not be reached has
+    # nothing to route on, and its status is the answer. The node that hit the
+    # outage has already written the audit row.
+    if state.status in ("llm_unavailable", "escalated"):
+        print(f"[router] the LLM call failed -> end ({state.status})")
+        return Command(goto=END, update={"status": state.status})
     if state.confidence >= state.confidence_threshold:
         print(f"[router] confidence threshold met ({state.confidence:.2f} >= {state.confidence_threshold}) -> remediator")
         _record_route(

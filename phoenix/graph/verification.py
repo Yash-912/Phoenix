@@ -46,6 +46,7 @@ from phoenix.tools.health_tool import inspect_health
 from phoenix.tools.prometheus_tool import query_prometheus
 
 import math
+import os
 import time
 from datetime import datetime, timezone
 
@@ -61,10 +62,44 @@ OUTCOME_PASS = "pass"
 OUTCOME_FAIL = "fail"
 OUTCOME_INCONCLUSIVE = "inconclusive"
 
-# After a restart the working set must sit below this fraction of what it was
-# before. Half is chosen to be a change no amount of ordinary traffic produces in
-# the settling window, so a "pass" cannot be ordinary variance.
+# What counts as "the restart released memory". There are two ways to show it, and
+# a restart is credited with either, never with neither.
+#
+# A strong drop: the working set is under this fraction of what it was before. Half
+# is a change no amount of ordinary traffic produces in the settling window, so
+# this alone is enough whatever the service's size.
 MEMORY_DROP_RATIO = 0.5
+
+# A drop to a fresh process: a restarted process starts from its own baseline, not
+# from zero, so a worker that leaked from ~52 MB to 82-93 MB comes back at ~52 MB,
+# which is 56-63% of before and fails the strict-half rule above although the
+# restart did exactly what it should. That is credited too when the working set is
+# (a) at or under the fresh-process ceiling below, which says "this is where a new
+# process of this service sits", and (b) still meaningfully under before -- under
+# this fraction -- so a process that was already at baseline, or that a restart did
+# not touch, cannot pass just by being small.
+MEMORY_MIN_DROP_RATIO = 0.8
+
+# The fresh-process ceiling: baseline plus headroom, an absolute number rather than
+# a ratio so it does not move with how far the leak had got. 64 MiB is the 52 MB
+# fresh worker plus ~20% headroom. Services whose fresh process sits above it
+# simply fall back to the strict-half rule; set the env var to give such a service
+# its own ceiling. An unreadable or non-positive value falls back to the default
+# rather than disabling the check.
+MEMORY_CEILING_ENV = "PHOENIX_VERIFY_MEMORY_CEILING_BYTES"
+DEFAULT_MEMORY_CEILING_BYTES = 64 * 1024 * 1024
+
+
+def memory_ceiling_bytes() -> float:
+    raw = os.environ.get(MEMORY_CEILING_ENV, "").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_MEMORY_CEILING_BYTES
+    if not math.isfinite(value) or value <= 0:
+        return DEFAULT_MEMORY_CEILING_BYTES
+    return value
+
 
 # Short window, unlike the alert's 30m: this is not deciding whether to page
 # someone, it is asking whether the memory freed by the restart is staying freed.
@@ -559,11 +594,17 @@ def _check_overload(signal: dict, before: dict) -> tuple[str, dict]:
             ),
         }
 
-    if signal["bytes"] >= before_bytes * MEMORY_DROP_RATIO:
+    after_bytes = signal["bytes"]
+    strong_drop = after_bytes < before_bytes * MEMORY_DROP_RATIO
+    fresh_process_drop = (
+        after_bytes <= memory_ceiling_bytes()
+        and after_bytes < before_bytes * MEMORY_MIN_DROP_RATIO
+    )
+    if not (strong_drop or fresh_process_drop):
         return OUTCOME_FAIL, {
             **detail,
             "reason": (
-                f"working set is {int(signal['bytes'])} against a pre-action "
+                f"working set is {int(after_bytes)} against a pre-action "
                 f"{int(before_bytes)}, which is not the drop a restart should "
                 f"produce"
             ),

@@ -94,3 +94,72 @@ def test_without_a_window_the_paging_threshold_still_applies():
     outcome, _detail = verification._check_overload(signal, {"bytes": 138_000_000.0})
 
     assert outcome == verification.OUTCOME_FAIL
+
+
+# ---- a good restart lands at the fresh-process level, not below half of before ----
+
+MIB = 1024 * 1024
+FRESH = 52_000_000.0
+
+
+def test_a_restart_to_the_fresh_process_level_passes_when_before_was_only_moderately_elevated():
+    # 52 MB is 56-63% of 82-93 MB, so the old strict-half rule graded this a fail.
+    for before in (82_000_000.0, 88_000_000.0, 93_000_000.0):
+        outcome, detail = verification._check_overload(
+            {"bytes": FRESH, "slope": 0.0, "window_seconds": 90}, {"bytes": before}
+        )
+
+        assert outcome == verification.OUTCOME_PASS, (before, detail["reason"])
+
+
+def test_a_restart_that_released_nothing_still_fails_even_at_a_low_level():
+    outcome, _detail = verification._check_overload(
+        {"bytes": FRESH, "slope": 0.0, "window_seconds": 90}, {"bytes": 55_000_000.0}
+    )
+
+    assert outcome == verification.OUTCOME_FAIL
+
+
+def test_a_small_drop_that_is_not_the_fresh_level_still_fails():
+    outcome, _detail = verification._check_overload(
+        {"bytes": 90_000_000.0, "slope": 0.0, "window_seconds": 90}, {"bytes": 100_000_000.0}
+    )
+
+    assert outcome == verification.OUTCOME_FAIL
+
+
+def test_the_fresh_level_rule_still_requires_the_slope_to_be_flat():
+    outcome, detail = verification._check_overload(
+        {"bytes": FRESH, "slope": 40_000.0, "window_seconds": 90}, {"bytes": 90_000_000.0}
+    )
+
+    assert outcome == verification.OUTCOME_FAIL
+    assert "restart bought time" in detail["reason"]
+
+
+def test_a_service_whose_fresh_level_is_above_the_ceiling_keeps_the_strict_half_rule():
+    big = {"bytes": 300 * MIB, "slope": 0.0, "window_seconds": 90}
+
+    assert verification._check_overload(big, {"bytes": 700 * MIB})[0] == verification.OUTCOME_PASS
+    assert verification._check_overload(big, {"bytes": 400 * MIB})[0] == verification.OUTCOME_FAIL
+
+
+def test_the_ceiling_can_be_set_by_env(monkeypatch):
+    signal = {"bytes": 70 * MIB, "slope": 0.0, "window_seconds": 90}
+    before = {"bytes": 100 * MIB}
+
+    assert verification._check_overload(signal, before)[0] == verification.OUTCOME_FAIL
+
+    monkeypatch.setenv(verification.MEMORY_CEILING_ENV, str(80 * MIB))
+
+    assert verification._check_overload(signal, before)[0] == verification.OUTCOME_PASS
+
+
+def test_an_unreadable_ceiling_env_falls_back_to_the_default(monkeypatch):
+    monkeypatch.setenv(verification.MEMORY_CEILING_ENV, "not-a-number")
+
+    assert verification.memory_ceiling_bytes() == verification.DEFAULT_MEMORY_CEILING_BYTES
+
+    monkeypatch.setenv(verification.MEMORY_CEILING_ENV, "-5")
+
+    assert verification.memory_ceiling_bytes() == verification.DEFAULT_MEMORY_CEILING_BYTES

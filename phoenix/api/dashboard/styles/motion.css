@@ -1,0 +1,130 @@
+/*
+  Motion. Reads tokens.css only; holds no colour or timing of its own.
+
+  Everything that starts hidden is gated on the `js` class on <html>, so a browser with
+  no scripting shows the whole page. Everything here is switched off under
+  prefers-reduced-motion at the bottom, and by the `no-anim` class the page sets on a
+  background refresh so a live update never replays the entrance.
+*/
+
+/* --- reveal on entry ------------------------------------------------------------- */
+.js [data-reveal] {
+  opacity: 0;
+  transform: translateY(var(--reveal-distance));
+  transition: opacity var(--dur-slow) var(--ease-out), transform var(--dur-slow) var(--ease-out);
+  transition-delay: calc(var(--i, 0) * var(--stagger));
+}
+.js [data-reveal].is-in { opacity: 1; transform: none; }
+.js .no-anim [data-reveal] { opacity: 1; transform: none; transition: none; }
+
+/* --- page chrome ------------------------------------------------------------------ */
+.topbar { transition: box-shadow var(--dur-med) var(--ease-out), background var(--dur-med) var(--ease-out); }
+.topbar.is-scrolled { box-shadow: 0 1px 0 var(--rule); }
+.progress { position: fixed; top: 0; left: 0; right: 0; height: 2px; z-index: 70; background: var(--brand); transform: scaleX(0); transform-origin: left; pointer-events: none; }
+.brand__mark { transition: transform var(--dur-med) var(--ease-pop); }
+.brand:hover .brand__mark { transform: rotate(90deg); }
+.nav a { position: relative; border-bottom: 0 !important; }
+.nav a::after { content: ""; position: absolute; left: 0; right: 0; bottom: -2px; height: 1px; background: var(--brand); transform: scaleX(0); transform-origin: left; transition: transform var(--dur-med) var(--ease-out); }
+.nav a:hover::after, .nav a[aria-current="page"]::after { transform: scaleX(1); }
+.badge { animation: pop var(--dur-med) var(--ease-pop) both; }
+
+.live { display: inline-flex; align-items: center; gap: var(--space-2); font-family: var(--font-mono); text-transform: var(--label-transform); font-size: var(--size-label); color: var(--ink-muted); font-variant-numeric: tabular-nums; }
+.live::before { content: ""; width: 0.45rem; height: 0.45rem; background: var(--tone-good); border-radius: 50%; animation: pulse 2.4s var(--ease-out) infinite; }
+.live[data-state="stale"]::before { background: var(--tone-warn); animation: none; }
+
+.is-loading { opacity: 0.35; transition: opacity var(--dur-fast) linear; }
+#app { transition: opacity var(--dur-med) var(--ease-out); }
+
+/* --- loading ----------------------------------------------------------------------- */
+.skeleton { height: 1rem; background: linear-gradient(90deg, var(--paper-sunk) 25%, var(--paper-raised) 50%, var(--paper-sunk) 75%); background-size: 200% 100%; animation: shimmer 1.4s linear infinite; }
+.skeleton--title { height: 3rem; width: min(24rem, 70%); margin-top: var(--space-7); }
+.skeleton--row { height: 3.2rem; margin-top: var(--space-4); }
+
+/* --- buttons and chips -------------------------------------------------------------- */
+.btn { transition: background var(--transition), color var(--transition), transform var(--dur-fast) var(--ease-out), border-color var(--transition); }
+.btn:active:not(:disabled) { transform: translateY(1px) scale(0.98); }
+.filter { transition: background var(--dur-fast) var(--ease-out), color var(--dur-fast) var(--ease-out), border-color var(--dur-fast) var(--ease-out), transform var(--dur-fast) var(--ease-out); }
+.filter:active { transform: scale(0.97); }
+.chip--attention::before { animation: pulse 1.8s var(--ease-out) infinite; }
+
+/* --- list rows ----------------------------------------------------------------------- */
+.row { position: relative; }
+.row::before { content: ""; position: absolute; left: 0; top: 18%; bottom: 18%; width: 2px; background: var(--brand); transform: scaleY(0); transition: transform var(--dur-med) var(--ease-out); }
+.row:hover::before, .row:focus-visible::before { transform: scaleY(1); }
+.rows--head .row::before { display: none; }
+.row__title { transition: transform var(--dur-med) var(--ease-out); display: inline-block; }
+.row:hover .row__title, .row:focus-visible .row__title { transform: translateX(6px); }
+.row__arrow { transition: opacity var(--dur-med) var(--ease-out), transform var(--dur-med) var(--ease-out); }
+.row:hover .row__arrow { transform: translateX(4px); }
+
+/* --- hero blueprint ----------------------------------------------------------------------- */
+.hero { position: relative; }
+.hero__art { position: absolute; right: 0; bottom: var(--space-3); width: min(46%, 31rem); height: auto; stroke: var(--ink); fill: none; stroke-width: 1; pointer-events: none; }
+.hero__art path { stroke-dasharray: 1; stroke-dashoffset: 1; animation: draw var(--dur-draw) var(--ease-out) 150ms forwards; }
+.hero__art path:nth-child(2) { animation-delay: 600ms; stroke: var(--ink-muted); }
+.hero__art path:nth-child(3) { animation-delay: 1100ms; stroke: var(--rule-strong); }
+.hero__art text { fill: var(--ink-muted); stroke: none; font-family: var(--font-mono); font-size: 6.5px; letter-spacing: 0.08em; opacity: 0; animation: fade-in var(--dur-med) var(--ease-out) 1.7s forwards; }
+.hero__art .mark { fill: var(--brand); stroke: none; transform-box: fill-box; transform-origin: center; animation: pop var(--dur-med) var(--ease-pop) 2.1s both; }
+@media (max-width: 860px) { .hero__art { display: none; } }
+
+/* --- first visit: an orange line sweeps the frame while the page counts up to 100% ------------- */
+.intro { position: fixed; inset: 0; z-index: 100; background: var(--paper); pointer-events: none; transition: opacity 520ms var(--ease-out); }
+.intro.is-done { opacity: 0; }
+.intro__line { position: absolute; left: var(--frame-inset); right: var(--frame-inset); top: 50%; height: 1px; background: var(--brand); transform: scaleX(0); transform-origin: left; }
+.intro__pct { position: absolute; left: var(--space-5); top: calc(50% - 1.6rem); font-family: var(--font-mono); font-size: var(--size-label); letter-spacing: var(--tracking-label); color: var(--brand-ink); font-variant-numeric: tabular-nums; }
+
+/* --- section jump bar ------------------------------------------------------------------- */
+.jump { position: sticky; top: var(--topbar-h); z-index: 9; display: flex; gap: var(--space-2); overflow-x: auto; padding: var(--space-2) 0; margin-bottom: var(--space-2); background: color-mix(in srgb, var(--paper) 94%, transparent); backdrop-filter: blur(6px); border-bottom: var(--hairline); scrollbar-width: none; }
+.jump::-webkit-scrollbar { display: none; }
+.jump button { flex: none; font: inherit; font-family: var(--font-mono); font-size: var(--size-label); text-transform: var(--label-transform); letter-spacing: var(--tracking-label); cursor: pointer; color: var(--ink-muted); background: transparent; border: 0; padding: 0.35rem 0.7rem; position: relative; transition: color var(--dur-fast) var(--ease-out); }
+.jump button::after { content: ""; position: absolute; left: 0.7rem; right: 0.7rem; bottom: 0; height: 1px; background: var(--brand); transform: scaleX(0); transform-origin: left; transition: transform var(--dur-med) var(--ease-out); }
+.jump button:hover { color: var(--ink); }
+.jump button[aria-current="true"] { color: var(--ink); }
+.jump button[aria-current="true"]::after { transform: scaleX(1); }
+
+/* --- hypotheses ---------------------------------------------------------------------------- */
+.js .bar > i { transform: scaleX(0); transform-origin: left; }
+.js .is-in .bar > i, .js .no-anim .bar > i { transform: scaleX(1); transition: transform 1100ms var(--ease-out) 250ms; }
+.js .no-anim .bar > i { transition: none; }
+.js .bar > b { opacity: 0; }
+.js .is-in .bar > b, .js .no-anim .bar > b { opacity: 1; transition: opacity var(--dur-med) var(--ease-out) 1s; }
+.hyp__score { transition: transform var(--dur-med) var(--ease-out); transform-origin: right bottom; }
+.hyp:hover .hyp__score { transform: scale(1.04); }
+
+/* --- timeline --------------------------------------------------------------------------------- */
+.js .step::before { transform: scaleY(0); transform-origin: top; }
+.js .step.is-in::before, .js .no-anim .step::before { transform: scaleY(1); transition: transform 800ms var(--ease-out) calc(var(--i, 0) * var(--stagger) + 200ms); }
+.js .no-anim .step::before { transition: none; }
+.js .step .step__dot { transform: scale(0); }
+.js .step.is-in .step__dot, .js .no-anim .step .step__dot { transform: scale(1); transition: transform var(--dur-med) var(--ease-pop) calc(var(--i, 0) * var(--stagger) + 120ms); }
+.js .no-anim .step .step__dot { transition: none; }
+.step__title { transition: transform var(--dur-med) var(--ease-out); display: inline-block; }
+.step:hover .step__title { transform: translateX(4px); }
+
+/* --- records, tables, disclosures ----------------------------------------------------------------- */
+.record__row { transition: background var(--dur-fast) var(--ease-out); }
+.record__row:hover { background: var(--paper-sunk); }
+.table tbody tr { transition: background var(--dur-fast) var(--ease-out); }
+.table tbody tr:hover { background: var(--paper-sunk); }
+details[open] > :not(summary) { animation: fade-in var(--dur-med) var(--ease-out); }
+details > summary::before { transition: transform var(--dur-med) var(--ease-pop); display: inline-block; }
+details[open] > summary::before { transform: rotate(180deg); }
+.callout { animation: fade-in var(--dur-slow) var(--ease-out); }
+.notice { animation: fade-in var(--dur-med) var(--ease-out); }
+
+/* --- keyframes ------------------------------------------------------------------------------------ */
+@keyframes fade-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+@keyframes pop { from { transform: scale(0.4); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+@keyframes pulse { 0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--tone, var(--ink)) 45%, transparent); } 70%, 100% { box-shadow: 0 0 0 0.5rem transparent; } }
+@keyframes shimmer { to { background-position: -200% 0; } }
+@keyframes draw { to { stroke-dashoffset: 0; } }
+
+/* --- reduced motion: everything above is decoration, so all of it goes ------------------------------ */
+@media (prefers-reduced-motion: reduce) {
+  .js [data-reveal], .js .step .step__dot, .js .bar > i, .js .bar > b { opacity: 1; transform: none; }
+  .js .step::before { transform: none; }
+  .hero__art path { stroke-dashoffset: 0; animation: none; }
+  .hero__art text, .hero__art .mark { opacity: 1; }
+  .intro { display: none; }
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+}

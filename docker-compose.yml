@@ -228,6 +228,10 @@ services:
     container_name: phoenix-api
     environment:
       DATABASE_URL: postgresql://phoenix_app:${PHOENIX_APP_PASSWORD}@postgres:5432/phoenix
+      # Read by phoenix/api/main.py. An unset token makes the approval endpoint
+      # refuse every decision (503), so the empty default keeps it closed.
+      PHOENIX_APPROVAL_TOKEN: ${PHOENIX_APPROVAL_TOKEN:-}
+      PHOENIX_APPROVERS: ${PHOENIX_APPROVERS:-}
     ports:
       - "5000:8000"
     networks:

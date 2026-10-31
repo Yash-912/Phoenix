@@ -160,6 +160,8 @@ def chaos_leak_stop():
 
 @app.post("/chaos/pause")
 def chaos_pause():
+    if not CHAOS_ENABLED:
+        return {"error": "chaos disabled"}
     global PAUSED
     PAUSED = True
     return {"paused": True}

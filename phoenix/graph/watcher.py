@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import os
 import time
+from dataclasses import dataclass
 
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import Command
@@ -50,6 +51,51 @@ from phoenix.graph.persist import close_persistence, list_unhandled_incidents, m
 from phoenix.graph.state import AgentState
 
 POLL_INTERVAL_SECONDS = int(os.environ.get("PHOENIX_WATCH_INTERVAL_SECONDS", "10"))
+
+# A run that fails is tried again a bounded number of times, each after a longer wait,
+# and then marked failed. Without a bound, an incident whose run keeps failing (the LLM
+# provider down, a rate limit, a bug in one node) is started again on every poll for
+# ever: it never reaches a terminal state, spends a call per poll on a provider that is
+# already refusing, and its first failure is buried under the repeats.
+DEFAULT_MAX_FAILURES = 3
+DEFAULT_BACKOFF_BASE_SECONDS = 30.0
+BACKOFF_CAP_SECONDS = 600.0
+
+
+def _max_failures_from_env() -> int:
+    try:
+        value = int(os.environ.get("PHOENIX_WATCH_MAX_FAILURES", ""))
+    except ValueError:
+        return DEFAULT_MAX_FAILURES
+    return value if value >= 1 else DEFAULT_MAX_FAILURES
+
+
+def _backoff_base_from_env() -> float:
+    try:
+        value = float(os.environ.get("PHOENIX_WATCH_BACKOFF_SECONDS", ""))
+    except ValueError:
+        return DEFAULT_BACKOFF_BASE_SECONDS
+    return value if value > 0 else DEFAULT_BACKOFF_BASE_SECONDS
+
+
+MAX_FAILURES = _max_failures_from_env()
+BACKOFF_BASE_SECONDS = _backoff_base_from_env()
+
+_now = time.monotonic
+
+
+@dataclass
+class _Failure:
+    service_name: str
+    count: int = 0
+    next_at: float = 0.0
+    gave_up: bool = False
+
+
+# incident id -> its failures so far. In-process, like _paused: the durable record of
+# giving up is the investigation_failed audit row, which takes the incident out of
+# list_unhandled_incidents for good, so a restarted watcher does not start over.
+_failures: dict[int, _Failure] = {}
 
 # approval id -> (incident id, the compiled app, its thread config). A run that
 # asked for an approval is held here, in this process, until the decision lands.
@@ -76,12 +122,28 @@ def poll_once(after_id: int = 0) -> list[int]:
     # Read once per pass. A bad configuration raises here, so the watcher stops
     # rather than starting investigations under a policy nobody checked.
     policy_mode = safety_policy.load_config().execution_policy
-    for incident_id, service_name in list_unhandled_incidents(after_id):
-        print(f"[watcher] incident {incident_id} ({service_name}) has no investigation yet -- starting one")
+    todo = list(list_unhandled_incidents(after_id))
+    # An outage run has audit rows, so the query above no longer returns it; the
+    # failure record is what brings it back for its next attempt.
+    listed = {incident_id for incident_id, _ in todo}
+    todo += [
+        (incident_id, record.service_name)
+        for incident_id, record in sorted(_failures.items())
+        if incident_id not in listed
+    ]
+    for incident_id, service_name in todo:
+        record = _failures.get(incident_id)
+        if record is not None and (record.gave_up or _now() < record.next_at):
+            continue
+        if record is None:
+            print(f"[watcher] incident {incident_id} ({service_name}) has no investigation yet -- starting one")
+        else:
+            print(f"[watcher] incident {incident_id} ({service_name}) retrying after failure {record.count}")
         started.append(incident_id)
+        app = None
+        config = {"configurable": {"thread_id": str(incident_id)}}
         try:
             app = build_graph(checkpointer=MemorySaver())
-            config = {"configurable": {"thread_id": str(incident_id)}}
             result = app.invoke(
                 AgentState(incident_id=incident_id, service_name=service_name, policy_mode=policy_mode),
                 config,
@@ -89,7 +151,69 @@ def poll_once(after_id: int = 0) -> list[int]:
             _handle_result(incident_id, app, config, result)
         except Exception as exc:
             print(f"[watcher] incident {incident_id} raised {type(exc).__name__}: {exc}")
+            _note_failure(incident_id, service_name, f"{type(exc).__name__}: {exc}", _retry_safe_after_exception(app, config))
     return started
+
+
+def _has_acted(values) -> bool:
+    """Whether a run's state shows it changed something: a remediation attempted, a
+    branch pushed or a PR opened. Running the investigation again would repeat it."""
+    get = values.get if isinstance(values, dict) else lambda key: getattr(values, key, None)
+    return bool(get("remediation_attempts") or get("worktree_branch") or get("pr_result"))
+
+
+def _retry_safe_after_exception(app, config: dict) -> bool:
+    """Whether a run that raised can be started again without repeating an action.
+
+    The answer is read from the run's own checkpoint, which holds the state as of the
+    last node that finished. No graph at all (build_graph raised) means nothing ran, so
+    it is safe. A checkpoint that cannot be read is not evidence of "nothing happened",
+    and a retry of a run that may have restarted a container is the worse error, so it
+    counts as possibly acted.
+    """
+    if app is None:
+        return True
+    try:
+        values = app.get_state(config).values
+    except Exception:  # noqa: BLE001 - an unreadable checkpoint is treated as "may have acted"
+        return False
+    return not _has_acted(values)
+
+
+def _backoff(failures: int) -> float:
+    """Seconds to wait after the `failures`-th failure: doubling, up to a cap."""
+    return min(BACKOFF_CAP_SECONDS, BACKOFF_BASE_SECONDS * 2 ** (failures - 1))
+
+
+def _note_failure(incident_id: int, service_name: str, error: str, retry_safe: bool = True) -> None:
+    """Count a failed run, schedule its next attempt, or give up and say so.
+
+    Giving up writes an investigation_failed audit row: that is the incident's
+    terminal outcome, it is what keeps list_unhandled_incidents from returning the
+    incident again, and it states how many attempts were made and what the last one
+    died of. A run that is not retry_safe has already acted on the system (a restart,
+    a pushed branch), and running the whole investigation again would repeat that
+    action, so it is given up on at once.
+    """
+    record = _failures.setdefault(incident_id, _Failure(service_name))
+    record.count += 1
+    if retry_safe and record.count < MAX_FAILURES:
+        wait = _backoff(record.count)
+        record.next_at = _now() + wait
+        print(f"[watcher] incident {incident_id} failed ({record.count}/{MAX_FAILURES}): {error} -- retrying in {wait:.0f}s")
+        return
+    record.gave_up = True
+    reason = (
+        f"the investigation failed {record.count} time(s), last with: {error}"
+        if retry_safe
+        else f"the investigation failed after it had already acted, so it was not run again: {error}"
+    )
+    print(f"[watcher] incident {incident_id} marked failed: {reason}")
+    record_audit(
+        incident_id, "watcher", "investigation_failed",
+        {"attempts": record.count, "max_failures": MAX_FAILURES, "error": error, "retry_safe": retry_safe},
+        reason,
+    )
 
 
 def _handle_result(incident_id: int, app, config: dict, result) -> None:
@@ -98,10 +222,19 @@ def _handle_result(incident_id: int, app, config: dict, result) -> None:
     if interrupts:
         approval_id = interrupts[0].value["approval_id"]
         _paused[approval_id] = (incident_id, app, config)
+        _failures.pop(incident_id, None)
         print(f"[watcher] incident {incident_id} paused, waiting on approval {approval_id}")
         return
-    remember_run(result)
     status = result.get("status") if isinstance(result, dict) else getattr(result, "status", None)
+    if status == "llm_unavailable":
+        get = result.get if isinstance(result, dict) else lambda key: getattr(result, key, None)
+        # Safe to run again only if the run changed nothing: no remediation attempted
+        # and no branch pushed. An outage after either is a stop, not a retry.
+        retry_safe = not _has_acted(result)
+        _note_failure(incident_id, get("service_name") or "", get("escalation_reason") or "the LLM was unavailable", retry_safe)
+        return
+    _failures.pop(incident_id, None)
+    remember_run(result)
     print(f"[watcher] incident {incident_id} finished: status={status}")
     if status in ("escalated", "insufficient_evidence"):
         get = result.get if isinstance(result, dict) else lambda key: getattr(result, key, None)

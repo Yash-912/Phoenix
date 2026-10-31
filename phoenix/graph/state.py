@@ -80,6 +80,11 @@ class AgentState(BaseModel):
         # because it is a correct outcome, not a failure or a spent budget: the
         # right response to an underdetermined incident is to stop and report.
         "insufficient_evidence",
+        # Terminal. The model could not be reached (after the SDK's retries), so the
+        # evidence was never weighed. Not a finding and not an escalation of a
+        # finding: it is the absence of an answer, kept apart from both so the audit
+        # trail, and the watcher's retry, can tell an outage from "nothing there".
+        "llm_unavailable",
     ] = "investigating"
     escalation_reason: Optional[str] = None
     evidence_report: Optional[dict] = Field(

@@ -1,0 +1,7 @@
+# Tests, fixtures and the fixture dev server stay out of the image.
+dashboard/test
+fixtures
+test_*.py
+dev_server.py
+fixture_store.py
+__pycache__

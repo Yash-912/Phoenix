@@ -17,13 +17,24 @@ import sys
 from langgraph.graph import END
 from langgraph.types import Command
 
-from phoenix.graph.llm_client import decide_code_investigation_calls, decide_defect, decide_patch
+from phoenix.graph.llm_client import (
+    LLMCallError,
+    LLMUnavailableError,
+    decide_code_investigation_calls,
+    decide_defect,
+    decide_patch,
+)
 from phoenix.graph import safety_policy
 from phoenix.graph.persist import record_audit
 from phoenix.graph.schemas import PatchTarget
 from phoenix.graph.state import AgentState
 from phoenix.tools import git_tool, patch_tool, repo_tool, test_runner_tool, worktree_tool
-from phoenix.tools.github_tool import comment_on_pull_request, find_open_duplicate, open_pull_request
+from phoenix.tools.github_tool import (
+    comment_on_pull_request,
+    find_open_duplicate,
+    has_open_pull_request_for,
+    open_pull_request,
+)
 
 TIER3_DESTINATIONS: tuple[str, ...] = ("patch_generator", "patch_validator", "pr_opener", END)
 
@@ -64,6 +75,26 @@ def _escalate(state: AgentState, node: str, event_type: str, reason: str, extra:
     return Command(goto=END, update={"status": "escalated", "escalation_reason": reason, **(extra or {})})
 
 
+def _llm_unavailable(state: AgentState, node: str, exc: LLMCallError, extra: dict | None = None) -> Command:
+    """Stop the Tier 3 run because the model call failed, recorded as what it was.
+
+    Not _escalate for an outage: that files the run as a failed finding, and an outage
+    is not one. Not no_defect_found or patch_rejected either, which would say the model
+    looked and failed. An outage ends as llm_unavailable; a request the provider
+    rejected (which will be rejected again) ends as an escalation with its own event.
+    """
+    unavailable = isinstance(exc, LLMUnavailableError)
+    status = "llm_unavailable" if unavailable else "escalated"
+    reason = str(exc)
+    _say(f"[{node}] {reason} -> end ({status})")
+    record_audit(
+        state.incident_id, node, "llm_unavailable" if unavailable else "llm_request_rejected",
+        {"iteration": state.tier3_iteration, "operation": exc.operation, "error": reason},
+        reason,
+    )
+    return Command(goto=END, update={"status": status, "escalation_reason": reason, **(extra or {})})
+
+
 def code_investigator_node(state: AgentState) -> Command:
     """LLM proposes which repo/git tool to call next; this code executes
     exactly that and nothing else -- the same discipline observer_node uses
@@ -98,7 +129,13 @@ def code_investigator_node(state: AgentState) -> Command:
 
     while iteration < state.max_tier3_iterations:
         iteration += 1
-        decision = decide_code_investigation_calls(state.service_name, hypothesis_description, evidence, repo_context)
+        try:
+            decision = decide_code_investigation_calls(state.service_name, hypothesis_description, evidence, repo_context)
+        except LLMCallError as exc:
+            return _llm_unavailable(
+                state, "code_investigator", exc,
+                {"tier3_evidence": evidence, "tokens_spent": tokens_spent, "tier3_iteration": iteration},
+            )
         tokens_spent += decision.tokens
 
         if not decision.calls:
@@ -124,7 +161,13 @@ def code_investigator_node(state: AgentState) -> Command:
             None,
         )
 
-    defect_decision = decide_defect(state.service_name, hypothesis_description, evidence)
+    try:
+        defect_decision = decide_defect(state.service_name, hypothesis_description, evidence)
+    except LLMCallError as exc:
+        return _llm_unavailable(
+            state, "code_investigator", exc,
+            {"tier3_evidence": evidence, "tokens_spent": tokens_spent, "tier3_iteration": iteration},
+        )
     tokens_spent += defect_decision.tokens
     defect = defect_decision.output
     defect_dict = defect.model_dump()
@@ -223,7 +266,10 @@ def patch_generator_node(state: AgentState) -> Command:
     feedback = None
     tokens_spent = state.tokens_spent
     for attempt in range(1, MAX_PATCH_ATTEMPTS + 1):
-        patch_decision = decide_patch(current["content"], target, feedback)
+        try:
+            patch_decision = decide_patch(current["content"], target, feedback)
+        except LLMCallError as exc:
+            return _llm_unavailable(state, "patch_generator", exc, {"tokens_spent": tokens_spent})
         tokens_spent += patch_decision.tokens
         if patch_decision.output is None:
             return _escalate(
@@ -413,6 +459,10 @@ def patch_validator_node(state: AgentState) -> Command:
             {"tier3_status": "validation_failed", "patch_validation": patch_validation},
         )
 
+    # Written the moment the push succeeds, before anything else can fail, so a run that
+    # dies from here on leaves a record of the remote branch it created.
+    record_audit(state.incident_id, "patch_validator", "branch_pushed", {"branch": branch}, f"pushed {branch} to origin")
+
     _say(f"[patch_validator] patch to {file_path} validated (tests and lint both pass) -> pr_opener")
     return Command(
         goto="pr_opener",
@@ -425,15 +475,59 @@ def patch_validator_node(state: AgentState) -> Command:
     )
 
 
+def _retire_unused_branch(state: AgentState, why: str, keep: str | None = None) -> None:
+    """Delete the remote branch this run pushed when the run ends without a PR.
+
+    discard_worktree only removes the local branch, so a pushed branch that never
+    became a PR (a duplicate, a failed `gh pr create`, an error) would sit on origin
+    for good. Three guards decide whether it is deleted, and every one fails towards
+    keeping it: it is the branch this run recorded pushing (state.worktree_branch is
+    only set after a successful push), it is not `keep` (the branch of the existing PR
+    a duplicate points at), and GitHub says no open PR uses it. An unreadable answer
+    is not a "no". Never raises: cleanup must not mask the outcome that triggered it.
+    """
+    branch = state.worktree_branch
+    if not branch or branch == keep:
+        return
+    try:
+        lookup = has_open_pull_request_for(branch)
+        if lookup.get("status") != "ok" or lookup.get("open"):
+            reason = (
+                "an open pull request uses this branch" if lookup.get("status") == "ok"
+                else f"could not confirm no open pull request uses it: {lookup.get('error')}"
+            )
+            record_audit(state.incident_id, "pr_opener", "remote_branch_kept", {"branch": branch, "reason": reason}, f"kept {branch} on origin: {reason}")
+            return
+        deleted = worktree_tool.delete_remote_branch(branch)
+        if deleted.get("status") == "ok":
+            record_audit(state.incident_id, "pr_opener", "remote_branch_deleted", {"branch": branch, "why": why}, f"deleted unused {branch} from origin ({why})")
+        else:
+            record_audit(state.incident_id, "pr_opener", "remote_branch_delete_failed", {"branch": branch, "error": deleted.get("error")}, f"could not delete {branch} from origin")
+    except Exception as exc:  # noqa: BLE001 - cleanup must not replace the outcome it follows
+        _say(f"[pr_opener] could not clean up remote branch {branch}: {type(exc).__name__}: {exc}")
+
+
 def pr_opener_node(state: AgentState) -> Command:
     """No LLM call. Opens a real PR through the authenticated `gh` CLI only
     when every validation flag the PRD names is true, and the diff attached
     to the PR is the real committed diff -- never the candidate's.
+
+    The branch the validator pushed is removed from origin on every path that ends
+    without a PR, including an exception, so a run cannot leave an orphan behind.
     """
+    try:
+        return _open_pull_request(state)
+    except Exception:
+        _retire_unused_branch(state, "the run failed before a pull request existed")
+        raise
+
+
+def _open_pull_request(state: AgentState) -> Command:
     validation = state.patch_validation or {}
     required = ("scope_ok", "applied", "tests_passed", "lint_passed", "diff_valid")
     if not all(validation.get(flag) for flag in required):
         missing = [flag for flag in required if not validation.get(flag)]
+        _retire_unused_branch(state, "validation flags were not all true")
         return _escalate(
             state, "pr_opener", "pr_blocked",
             f"refusing to open a PR: validation flags not all true (missing: {missing})",
@@ -492,6 +586,7 @@ def pr_opener_node(state: AgentState) -> Command:
         )
         if state.worktree_path:
             worktree_tool.discard_worktree(state.worktree_path, state.worktree_branch)
+        _retire_unused_branch(state, "an open PR already carries this change", keep=existing.get("branch"))
         _say(f"[pr_opener] {existing['url']} already carries this change -> no new PR, STOP for human review")
         return Command(
             goto=END,
@@ -510,6 +605,7 @@ def pr_opener_node(state: AgentState) -> Command:
         worktree_tool.discard_worktree(state.worktree_path, state.worktree_branch)
 
     if result.get("status") != "ok":
+        _retire_unused_branch(state, "gh pr create failed")
         return _escalate(
             state, "pr_opener", "pr_failed", f"gh pr create failed: {result.get('error')}",
             {"tier3_status": "pr_failed", "pr_result": result},

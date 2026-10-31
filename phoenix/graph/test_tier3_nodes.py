@@ -403,6 +403,12 @@ def _no_open_duplicate_by_default(monkeypatch):
     """The lookup shells out to gh; no test here may reach the real repo."""
     monkeypatch.setattr(tier3_nodes, "find_open_duplicate", lambda *a, **k: {"status": "ok", "duplicate": None})
     monkeypatch.setattr(tier3_nodes, "comment_on_pull_request", lambda *a, **k: {"status": "ok"})
+    # Branch cleanup would otherwise reach gh and origin. Unreadable means "keep the branch".
+    monkeypatch.setattr(tier3_nodes, "has_open_pull_request_for", lambda branch: {"status": "error", "error": "not looked up in tests"})
+    monkeypatch.setattr(
+        tier3_nodes.worktree_tool, "delete_remote_branch",
+        lambda branch: (_ for _ in ()).throw(AssertionError("a test reached the real remote delete")),
+    )
 
 
 EXISTING = {"number": 25, "url": "https://github.com/Yash-912/Phoenix/pull/25", "branch": "phoenix/older"}
@@ -776,3 +782,155 @@ def test_the_validator_fails_closed_when_the_candidate_carries_no_target(monkeyp
     assert "fails scope validation" in update["escalation_reason"]
     assert "no target function" in update["escalation_reason"]
     assert discarded
+
+
+# --- the remote branch this run pushed is not left behind without a PR ------------------
+
+BRANCH = "phoenix/test-x"
+
+
+def _cleanup_wiring(monkeypatch, open_for_branch=None, delete_result=None, open_pr_result=None):
+    rows, deleted, looked_up = [], [], []
+    monkeypatch.setattr(tier3_nodes, "record_audit", lambda incident, node, event, detail, text: rows.append((event, detail)))
+    monkeypatch.setattr(tier3_nodes.worktree_tool, "discard_worktree", lambda p, b: None)
+    monkeypatch.setattr(
+        tier3_nodes, "has_open_pull_request_for",
+        lambda branch: (looked_up.append(branch), open_for_branch or {"status": "ok", "open": False})[1],
+    )
+    monkeypatch.setattr(
+        tier3_nodes.worktree_tool, "delete_remote_branch",
+        lambda branch: (deleted.append(branch), delete_result or {"status": "ok", "branch": branch})[1],
+    )
+    monkeypatch.setattr(
+        tier3_nodes, "open_pull_request",
+        lambda *a, **k: open_pr_result or {"status": "ok", "url": "https://github.com/x/y/pull/99", "branch": a[0], "base": "main"},
+    )
+    return rows, deleted, looked_up
+
+
+def test_a_duplicate_run_deletes_the_branch_it_pushed(monkeypatch):
+    rows, deleted, looked_up = _cleanup_wiring(monkeypatch)
+    monkeypatch.setattr(tier3_nodes, "find_open_duplicate", lambda *a, **k: {"status": "ok", "duplicate": EXISTING})
+
+    command = tier3_nodes.pr_opener_node(_opener_state())
+
+    assert _update(command)["status"] == "pr_exists"
+    assert looked_up == [BRANCH]
+    assert deleted == [BRANCH]
+    assert dict(rows)["remote_branch_deleted"]["branch"] == BRANCH
+
+
+def test_the_existing_prs_own_branch_is_never_the_one_deleted(monkeypatch):
+    rows, deleted, _ = _cleanup_wiring(monkeypatch)
+    monkeypatch.setattr(tier3_nodes, "find_open_duplicate", lambda *a, **k: {"status": "ok", "duplicate": EXISTING})
+    state = _opener_state()
+    state.worktree_branch = EXISTING["branch"]
+
+    tier3_nodes.pr_opener_node(state)
+
+    assert deleted == []
+
+
+def test_a_branch_with_an_open_pr_is_kept(monkeypatch):
+    rows, deleted, _ = _cleanup_wiring(monkeypatch, open_for_branch={"status": "ok", "open": True})
+    monkeypatch.setattr(tier3_nodes, "find_open_duplicate", lambda *a, **k: {"status": "ok", "duplicate": EXISTING})
+
+    tier3_nodes.pr_opener_node(_opener_state())
+
+    assert deleted == []
+    assert dict(rows)["remote_branch_kept"]["reason"] == "an open pull request uses this branch"
+
+
+def test_a_branch_whose_pr_status_cannot_be_read_is_kept(monkeypatch):
+    rows, deleted, _ = _cleanup_wiring(monkeypatch, open_for_branch={"status": "error", "error": "gh down"})
+    monkeypatch.setattr(tier3_nodes, "find_open_duplicate", lambda *a, **k: {"status": "ok", "duplicate": EXISTING})
+
+    tier3_nodes.pr_opener_node(_opener_state())
+
+    assert deleted == []
+    assert "gh down" in dict(rows)["remote_branch_kept"]["reason"]
+
+
+def test_a_failed_pr_creation_deletes_the_branch_when_no_pr_exists_for_it(monkeypatch):
+    rows, deleted, looked_up = _cleanup_wiring(monkeypatch, open_pr_result={"status": "error", "error": "rate limited"})
+
+    command = tier3_nodes.pr_opener_node(_opener_state())
+
+    assert _update(command)["tier3_status"] == "pr_failed"
+    assert deleted == [BRANCH]
+
+
+def test_a_failed_pr_creation_that_actually_created_the_pr_keeps_the_branch(monkeypatch):
+    rows, deleted, _ = _cleanup_wiring(
+        monkeypatch, open_for_branch={"status": "ok", "open": True}, open_pr_result={"status": "error", "error": "timed out after create"},
+    )
+
+    tier3_nodes.pr_opener_node(_opener_state())
+
+    assert deleted == []
+
+
+def test_a_successful_pr_keeps_its_branch_and_never_looks_it_up(monkeypatch):
+    rows, deleted, looked_up = _cleanup_wiring(monkeypatch)
+
+    assert _update(tier3_nodes.pr_opener_node(_opener_state()))["status"] == "pr_opened"
+
+    assert deleted == [] and looked_up == []
+
+
+def test_an_exception_after_the_push_still_cleans_up_and_is_not_swallowed(monkeypatch):
+    rows, deleted, _ = _cleanup_wiring(monkeypatch)
+
+    def boom(*a, **k):
+        raise RuntimeError("gh exploded")
+
+    monkeypatch.setattr(tier3_nodes, "find_open_duplicate", boom)
+
+    with pytest.raises(RuntimeError, match="gh exploded"):
+        tier3_nodes.pr_opener_node(_opener_state())
+
+    assert deleted == [BRANCH]
+
+
+def test_a_run_that_pushed_nothing_deletes_nothing(monkeypatch):
+    rows, deleted, looked_up = _cleanup_wiring(monkeypatch)
+    monkeypatch.setattr(tier3_nodes, "find_open_duplicate", lambda *a, **k: {"status": "ok", "duplicate": EXISTING})
+    state = _opener_state()
+    state.worktree_branch = None
+
+    tier3_nodes.pr_opener_node(state)
+
+    assert deleted == [] and looked_up == []
+
+
+def test_a_failed_remote_delete_is_audited_and_does_not_change_the_outcome(monkeypatch):
+    rows, deleted, _ = _cleanup_wiring(monkeypatch, delete_result={"status": "error", "error": "no network"})
+    monkeypatch.setattr(tier3_nodes, "find_open_duplicate", lambda *a, **k: {"status": "ok", "duplicate": EXISTING})
+
+    command = tier3_nodes.pr_opener_node(_opener_state())
+
+    assert _update(command)["status"] == "pr_exists"
+    assert dict(rows)["remote_branch_delete_failed"]["error"] == "no network"
+
+
+def test_the_pushed_branch_is_audited_at_the_moment_of_the_push(monkeypatch):
+    rows = []
+    monkeypatch.setattr(tier3_nodes, "record_audit", lambda incident, node, event, detail, text: rows.append((event, detail)))
+    monkeypatch.setattr(tier3_nodes.worktree_tool, "new_branch_name", lambda *a: BRANCH)
+    monkeypatch.setattr(tier3_nodes.worktree_tool, "create_worktree", lambda b: {"status": "ok", "path": "/fake/path", "branch": b})
+    monkeypatch.setattr(tier3_nodes.worktree_tool, "write_file_in_worktree", lambda *a: {"status": "ok"})
+    monkeypatch.setattr(tier3_nodes.worktree_tool, "commit_patch", lambda *a: {"status": "ok", "commit_sha": "a" * 40})
+    monkeypatch.setattr(
+        tier3_nodes.worktree_tool, "diff_against_base",
+        lambda *a, **k: {"status": "ok", "diff": "@@ -1 +1 @@\n-a\n+b\n", "changed_files": ["services/payment-service/app.py"]},
+    )
+    monkeypatch.setattr(tier3_nodes.patch_tool, "validate_patch_scope", lambda *a, **k: (True, "ok"))
+    monkeypatch.setattr(tier3_nodes.test_runner_tool, "discover_tests_for", lambda *a: [])
+    monkeypatch.setattr(tier3_nodes.test_runner_tool, "run_tests", lambda *a: {"status": "ok", "returncode": 0})
+    monkeypatch.setattr(tier3_nodes.test_runner_tool, "run_linter", lambda *a: {"status": "ok", "returncode": 0})
+    monkeypatch.setattr(tier3_nodes.worktree_tool, "push_branch", lambda p, b: {"status": "ok", "branch": b})
+
+    command = tier3_nodes.patch_validator_node(_candidate_state())
+
+    assert command.goto == "pr_opener"
+    assert dict(rows)["branch_pushed"] == {"branch": BRANCH}

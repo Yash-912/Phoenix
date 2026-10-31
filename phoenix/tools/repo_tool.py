@@ -30,6 +30,17 @@ EXCLUDED_DIR_NAMES = {
     ".phoenix_worktrees", "venv", ".venv", "dist", "build", ".mypy_cache",
 }
 
+# Files that hold credentials or the repository's own bookkeeping. EXCLUDED_DIR_NAMES
+# already keeps .git out of search results, but read_file is given a path and opens
+# it, so nothing stopped it reading .env, .git/config (which can embed a remote
+# URL with a token) or a private key. Both tools now share this one rule, applied
+# to where the path actually lands after resolution, so a symlink or a ".." segment
+# is judged by its target and not by how it was spelled. Matching is case-insensitive:
+# the repo is also checked out on Windows, where ".ENV" is the same file as ".env".
+SECRET_NAME_PREFIXES = (".env", "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa")
+SECRET_SUFFIXES = (".pem", ".key", ".p12", ".pfx")
+SECRET_DIR_NAMES = {".git"}
+
 MAX_READ_LINES = 400
 MAX_SEARCH_RESULTS = 30
 MAX_MATCHES_PER_FILE = 5
@@ -63,11 +74,39 @@ def _resolve_in_repo(rel_path: str) -> Path | None:
     return candidate
 
 
+def is_secret_path(path: Path) -> bool:
+    """True if `path` is a credential file or lies inside version-control internals.
+
+    `path` may be absolute under REPO_ROOT or relative to it; a symlink is judged
+    by what it points at as well as by its own name.
+    """
+    candidates = [path]
+    try:
+        if path.is_symlink():
+            candidates.append(path.resolve())
+    except OSError:
+        return True
+    for candidate in candidates:
+        try:
+            parts = candidate.relative_to(REPO_ROOT).parts if candidate.is_absolute() else candidate.parts
+        except ValueError:
+            parts = candidate.parts
+        lowered = [part.lower() for part in parts]
+        if any(part in SECRET_DIR_NAMES for part in lowered):
+            return True
+        name = lowered[-1] if lowered else ""
+        if name.startswith(SECRET_NAME_PREFIXES) or name.endswith(SECRET_SUFFIXES):
+            return True
+    return False
+
+
 def _iter_source_files(start: Path):
     for path in start.rglob("*"):
         if not path.is_file():
             continue
         if any(part in EXCLUDED_DIR_NAMES for part in path.relative_to(REPO_ROOT).parts):
+            continue
+        if is_secret_path(path):
             continue
         if path.suffix.lower() in SKIPPED_EXTENSIONS:
             continue
@@ -227,7 +266,10 @@ def search_repository(query: str, path: str | None = None, max_results: int = MA
 
     needle = query.lower()
     matches: list[dict] = []
-    files = [start] if start.is_file() else _iter_source_files(start)
+    if start.is_file():
+        files = [] if is_secret_path(start) else [start]
+    else:
+        files = _iter_source_files(start)
 
     for file_path in files:
         if len(matches) >= max_results:
@@ -261,6 +303,10 @@ def read_file(path: str, start_line: int | None = None, end_line: int | None = N
     resolved = _resolve_in_repo(path)
     if resolved is None:
         return {"status": "error", "error": f"path '{path}' is outside the repository"}
+    # Before the existence check, so a protected path gets the same answer whether
+    # or not the file is there.
+    if is_secret_path(resolved) or is_secret_path(Path(path)):
+        return {"status": "error", "error": f"'{path}' is a protected file (credentials or git internals) and is not readable"}
     if not resolved.exists():
         return {"status": "error", "error": f"'{path}' does not exist in the repository.{_did_you_mean(path)}"}
     if not resolved.is_file():
