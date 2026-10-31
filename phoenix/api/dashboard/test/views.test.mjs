@@ -214,3 +214,9 @@ test("a long CamelCase alert name becomes words so the title can wrap", opts, ()
   const out = toString(renderDetail({ trace: { ...load("trace_33.json"), incident: { ...load("trace_33.json").incident, alertname: "WorkerServiceMemoryGrowth" } }, ui: ui(), config: { approvals_enabled: true }, now: NOW }));
   assert.match(out, /Worker Service Memory Growth on /);
 });
+
+test("the record card names a repeated action once with a count", opts, () => {
+  const base = load("trace_33.json");
+  const out = toString(renderDetail({ trace: { ...base, actions: [base.actions[0], base.actions[0], base.actions[0]] }, ui: ui(), config: { approvals_enabled: true }, now: NOW }));
+  assert.match(out, /rollback_deployment ×3/);
+});

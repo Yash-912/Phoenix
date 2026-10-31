@@ -39,7 +39,7 @@ function incidentRecord(trace) {
   const pr = trace.tier3 && trace.tier3.pr;
   const fix = pr && pr.url
     ? (safeUrl(pr.url) ? html`<a href="${safeUrl(pr.url)}" rel="noopener noreferrer" target="_blank">PR ${pr.number ? `#${pr.number}` : ""} (${pr.status})</a>` : `PR ${pr.status}`)
-    : trace.actions.length ? trace.actions.map((a) => a.action).join(", ") : null;
+    : trace.actions.length ? actionSummary(trace.actions) : null;
   return record(
     "Incident record",
     `#${i.id} · ${fullTime(i.first_seen_at)}`,
@@ -124,6 +124,13 @@ function verificationBlock(v) {
     <p class="muted" style="margin-top: var(--space-2); max-width: 62ch">${v.reason}</p>
     <div style="margin-top: var(--space-3)">${record("Verification", fullTime(v.at), [["check", v.check], ["after action", v.action], ["verdict", v.outcome, true]])}</div>
     ${rawJson("What the check measured", v.detail)}</div>`;
+}
+
+// A run that retried names each action once, with how many times: "restart_service ×3, rollback_config".
+function actionSummary(actions) {
+  const counts = new Map();
+  for (const a of actions) counts.set(a.action, (counts.get(a.action) || 0) + 1);
+  return [...counts].map(([name, n]) => (n > 1 ? `${name} ×${n}` : name)).join(", ");
 }
 
 function tier3Block(t) {
