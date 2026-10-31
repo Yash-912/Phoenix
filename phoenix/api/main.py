@@ -135,7 +135,7 @@ def decide_approval(
         raise HTTPException(status_code=403, detail="that identity is not on the approver list")
 
     status = "approved" if body.decision == "approve" else "denied"
-    outcome, detail = db.decide_approval(approval_id, status, body.approver, "api")
+    outcome, detail = db.decide_approval(approval_id, status, body.approver, body.channel)
     if outcome == "decided":
         return {"approval_id": approval_id, "status": status, "decided_by": body.approver, "result": "recorded"}
     if outcome == "not_found":

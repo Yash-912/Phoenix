@@ -117,5 +117,38 @@ def test_a_decision_outside_approve_or_deny_is_rejected_before_the_database(clie
     assert client.calls == []
 
 
+@pytest.mark.parametrize("channel", ["slack", "dashboard", "api"])
+def test_the_channel_the_caller_names_is_the_one_recorded(client, channel):
+    response = _post(client, body={"decision": "approve", "approver": APPROVER, "channel": channel})
+
+    assert response.status_code == 200
+    assert client.calls == [(7, "approved", APPROVER, channel)]
+
+
+def test_a_denial_from_slack_is_recorded_as_a_slack_denial(client):
+    client.outcome["value"] = ("decided", {"id": 7, "status": "denied", "decided_by": APPROVER})
+
+    response = _post(client, body={"decision": "deny", "approver": APPROVER, "channel": "slack"})
+
+    assert response.status_code == 200
+    assert client.calls == [(7, "denied", APPROVER, "slack")]
+
+
+@pytest.mark.parametrize("channel", ["email", "SLACK", "", "slack ", None, 7, ["slack"]])
+def test_a_channel_outside_the_known_three_is_rejected_before_the_database(client, channel):
+    response = _post(client, body={"decision": "approve", "approver": APPROVER, "channel": channel})
+
+    assert response.status_code == 422
+    assert client.calls == []
+
+
+def test_naming_a_channel_does_not_skip_the_token_or_the_approver_checks(client):
+    body = {"decision": "approve", "approver": "mallory@example.com", "channel": "slack"}
+
+    assert _post(client, body=body).status_code == 403
+    assert _post(client, body={**body, "approver": APPROVER}, token="guessed").status_code == 401
+    assert client.calls == []
+
+
 def test_the_decision_statement_only_moves_a_pending_unexpired_row():
     assert "WHERE id = %(id)s AND status = 'pending' AND expires_at > now()" in db.DECIDE_APPROVAL

@@ -5,10 +5,16 @@ from pydantic import BaseModel, Field, field_validator
 
 
 class ApprovalDecision(BaseModel):
-    """An answer to one approval request. approver must be on the configured list."""
+    """An answer to one approval request. approver must be on the configured list.
+
+    channel says which route the answer came through and is recorded as given. The caller
+    already holds the approval token, so this is an assertion by a trusted caller, the same
+    as the approver name. An older client that sends no channel is recorded as "api".
+    """
 
     decision: Literal["approve", "deny"]
     approver: str = Field(min_length=1, max_length=200)
+    channel: Literal["api", "dashboard", "slack"] = "api"
 
 
 class AlertmanagerAlert(BaseModel):
