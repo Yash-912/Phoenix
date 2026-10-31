@@ -153,6 +153,21 @@ def decide_approval(
 
 # The page is plain files, served from the same origin as the API. Mounted last so it
 # can never shadow a route above. Absent in a checkout that has no dashboard directory.
+class _RevalidatedFiles(StaticFiles):
+    """Static files the browser must re-check on every load.
+
+    The page is a set of ES modules. With no Cache-Control a browser caches each one by
+    its own age, so right after a deploy it can pair a new module with an old one it
+    imports from, and the page stays on its loading skeleton. no-cache still lets the
+    ETag answer 304, so a repeat visit costs a header, not a download.
+    """
+
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
 _DASHBOARD_DIR = Path(__file__).parent / "dashboard"
 if _DASHBOARD_DIR.is_dir():
-    app.mount("/dashboard", StaticFiles(directory=_DASHBOARD_DIR, html=True), name="dashboard")
+    app.mount("/dashboard", _RevalidatedFiles(directory=_DASHBOARD_DIR, html=True), name="dashboard")

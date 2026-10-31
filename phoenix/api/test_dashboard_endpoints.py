@@ -187,3 +187,11 @@ def test_the_page_is_served_from_the_same_app_without_shadowing_the_api(client):
     assert page.status_code == 200 and "<title>Phoenix</title>" in page.text
     assert client.get("/dashboard/js/main.js").status_code == 200
     assert client.get("/incidents/overview").status_code == 200
+
+
+def test_the_page_files_are_revalidated_so_a_deploy_never_pairs_new_and_old_modules(client):
+    for path in ("/dashboard/", "/dashboard/js/main.js", "/dashboard/styles/tokens.css"):
+        response = client.get(path)
+        assert response.status_code == 200
+        assert response.headers["cache-control"] == "no-cache"
+    assert client.get("/dashboard/js/main.js", headers={"if-none-match": client.get("/dashboard/js/main.js").headers["etag"]}).status_code == 304
