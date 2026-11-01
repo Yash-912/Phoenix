@@ -1,0 +1,8 @@
+# The Slack bridge builds with this folder as its context (docker-compose.yml, slack-bridge).
+# Only the bridge package goes into the image; the graph, the API and the tools stay out.
+*
+!__init__.py
+!slack
+# Tests and caches stay out of the image.
+slack/test_*.py
+**/__pycache__

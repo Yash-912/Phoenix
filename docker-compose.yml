@@ -210,6 +210,9 @@ services:
       POSTGRES_DB: phoenix
       PHOENIX_APP_PASSWORD: ${PHOENIX_APP_PASSWORD}
       PAYMENT_APP_PASSWORD: ${PAYMENT_APP_PASSWORD}
+      # Read by 010_create_slack_bridge_role.sh on a fresh volume. Empty makes the role
+      # unable to log in, which is what a lab with no Slack bridge wants.
+      SLACK_BRIDGE_PASSWORD: ${SLACK_BRIDGE_PASSWORD:-}
     ports:
       - "5432:5432"
     volumes:
@@ -239,6 +242,40 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+
+  # Posts held approvals to Slack and takes the Approve and Deny clicks. Opt-in: it only
+  # starts with `docker compose --profile slack up -d slack-bridge`, so a checkout with no
+  # Slack app configured never runs it. Socket Mode is outbound only, so it publishes no
+  # port. It reads approvals through phoenix-api and writes decisions through it, and its
+  # own database role can touch one table (see 010_create_slack_bridge_role.sh).
+  slack-bridge:
+    build:
+      context: ./phoenix
+      dockerfile: slack/Dockerfile
+    container_name: slack-bridge
+    profiles: ["slack"]
+    # A bad setting makes it exit at once with a clear message. A few retries cover a
+    # database that is still starting, and no more, so a typo does not loop forever.
+    restart: on-failure:5
+    environment:
+      SLACK_APP_TOKEN: ${SLACK_APP_TOKEN:-}
+      SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN:-}
+      PHOENIX_SLACK_CHANNEL: ${PHOENIX_SLACK_CHANNEL:-}
+      PHOENIX_SLACK_APPROVERS: ${PHOENIX_SLACK_APPROVERS:-}
+      PHOENIX_APPROVAL_TOKEN: ${PHOENIX_APPROVAL_TOKEN:-}
+      PHOENIX_DASHBOARD_URL: ${PHOENIX_DASHBOARD_URL:-}
+      PHOENIX_API_URL: http://phoenix-api:8000
+      # The password is not in the URL: a password with a character such as @ or / would
+      # break it. libpq reads PGPASSWORD when the URL has none.
+      DATABASE_URL: postgresql://slack_bridge@postgres:5432/phoenix
+      PGPASSWORD: ${SLACK_BRIDGE_PASSWORD:-}
+    networks:
+      - phoenix-net
+    depends_on:
+      postgres:
+        condition: service_healthy
+      phoenix-api:
+        condition: service_started
 
 networks:
   phoenix-net:
