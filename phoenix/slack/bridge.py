@@ -298,7 +298,7 @@ def main() -> None:
         config = load_config()
         pool = ConnectionPool(config.database_url, min_size=1, max_size=3, open=False, timeout=5)
         pool.open()
-        store = NotificationStore(pool)
+        store = NotificationStore(pool, database_url=config.database_url)
         # Checked before the connection opens, so a missing migration stops the process
         # before it can receive a click it could not settle.
         store.check_ready()

@@ -12,10 +12,20 @@ posting a message it cannot record would post it again on the next one.
 from dataclasses import dataclass
 
 import psycopg
+from psycopg_pool import PoolTimeout
 
 NOT_READY_HELP = (
     "apply migrations 009_approval_notifications.sql and 010_create_slack_bridge_role.sh "
     "to this database (see the README, 'Slack approvals')"
+)
+
+# A database made before the bridge existed has no slack_bridge role. Postgres answers a login as
+# a role that does not exist with the same "authentication failed" as a wrong password, so the
+# message has to cover both.
+AUTH_HELP = (
+    " (a database created before the Slack bridge existed has no slack_bridge role yet: "
+    "apply migrations 009_approval_notifications.sql and 010_create_slack_bridge_role.sh, see the "
+    "README, 'Slack approvals'; otherwise check SLACK_BRIDGE_PASSWORD)"
 )
 
 CHECK_READY = "SELECT approval_id FROM approval_notifications LIMIT 1"
@@ -58,9 +68,18 @@ class Notification:
     message_ts: str
 
 
+def _first_line(exc: Exception) -> str:
+    """Postgres and libpq append detail lines and excerpts to an error; the first line says it all."""
+    text = str(exc)
+    return text.splitlines()[0] if text else type(exc).__name__
+
+
 class NotificationStore:
-    def __init__(self, pool) -> None:
+    def __init__(self, pool, *, database_url: str | None = None) -> None:
         self._pool = pool
+        # Only used to find out why the pool could not connect. The pool reports a timeout and
+        # keeps the real reason (a wrong password, a missing role, a refused connection) in its log.
+        self._database_url = database_url
 
     def check_ready(self) -> None:
         """Fail at startup, with the fix in the message, if the migrations are missing."""
@@ -68,11 +87,25 @@ class NotificationStore:
             with self._pool.connection() as conn:
                 conn.execute(CHECK_READY).fetchone()
         except (psycopg.errors.UndefinedTable, psycopg.errors.InsufficientPrivilege) as exc:
-            # Postgres appends a LINE/caret excerpt to these errors; the first line says it all.
-            reason = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
-            raise StoreNotReady(f"the notification table is not usable ({reason}); {NOT_READY_HELP}") from exc
+            raise StoreNotReady(f"the notification table is not usable ({_first_line(exc)}); {NOT_READY_HELP}") from exc
+        except PoolTimeout as exc:
+            raise self._why_unreachable(exc) from exc
         except psycopg.Error as exc:
             raise StoreError(f"the database could not be reached: {exc}") from exc
+
+    def _why_unreachable(self, timeout: PoolTimeout) -> StoreError:
+        if not self._database_url:
+            return StoreError(f"the database could not be reached: {timeout}")
+        try:
+            psycopg.connect(self._database_url, connect_timeout=5).close()
+        except psycopg.Error as direct:
+            reason = _first_line(direct)
+            hint = AUTH_HELP if "authentication failed" in reason.lower() else ""
+            return StoreError(f"the database could not be reached: {reason}{hint}")
+        return StoreError(
+            f"the database could not be reached: the connection pool timed out ({timeout}), "
+            "although a direct connection works; try again"
+        )
 
     def notified_ids(self, approval_ids: list[int]) -> set[int]:
         """Which of these approvals already have a message."""
