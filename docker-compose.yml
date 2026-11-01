@@ -264,6 +264,7 @@ services:
       PHOENIX_SLACK_APPROVERS: ${PHOENIX_SLACK_APPROVERS:-}
       PHOENIX_APPROVAL_TOKEN: ${PHOENIX_APPROVAL_TOKEN:-}
       PHOENIX_DASHBOARD_URL: ${PHOENIX_DASHBOARD_URL:-}
+      PHOENIX_SLACK_POLL_SECONDS: ${PHOENIX_SLACK_POLL_SECONDS:-5}
       PHOENIX_API_URL: http://phoenix-api:8000
       # The password is not in the URL: a password with a character such as @ or / would
       # break it. libpq reads PGPASSWORD when the URL has none.

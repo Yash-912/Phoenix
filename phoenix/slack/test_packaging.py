@@ -167,3 +167,23 @@ def test_the_build_context_holds_the_bridge_and_nothing_else_and_no_tests():
     assert "!__init__.py" in rules and "!slack" in rules
     assert any(rule.startswith("slack/test_") or rule == "**/test_*.py" for rule in rules)
     assert any("__pycache__" in rule for rule in rules)
+
+
+def test_the_poll_interval_can_be_set_from_the_host_and_defaults_to_five_seconds():
+    block = "\n".join(_service("slack-bridge"))
+
+    assert re.search(r"^\s+PHOENIX_SLACK_POLL_SECONDS: \$\{PHOENIX_SLACK_POLL_SECONDS:-5\}$", block, re.MULTILINE)
+
+
+def test_every_setting_the_readme_tells_you_to_put_in_env_reaches_the_container():
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    section = readme.split("### Set it up", 1)[1].split("### What a click does", 1)[0]
+    documented = set(re.findall(r"^\s+\| `([A-Z_]+)` \|", section, re.MULTILINE))
+    block = "\n".join(_service("slack-bridge"))
+    reaches_the_container = set(re.findall(r"^\s+([A-Z_]+): ", block, re.MULTILINE))
+    # SLACK_BRIDGE_PASSWORD reaches the container as PGPASSWORD, and PHOENIX_APPROVAL_TOKEN and
+    # PHOENIX_APPROVERS are documented elsewhere; everything else in the table must be passed through.
+    reaches_the_container.add("SLACK_BRIDGE_PASSWORD") if "PGPASSWORD" in reaches_the_container else None
+
+    assert documented, "the setup table was not found"
+    assert documented <= reaches_the_container, sorted(documented - reaches_the_container)
