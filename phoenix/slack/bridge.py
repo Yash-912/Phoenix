@@ -2,7 +2,8 @@
 
 Usage: python -m phoenix.slack.bridge
 
-Two things happen here. A loop posts each open request to the channel and records it. And a
+Three things happen here. A loop posts each open request to the channel and records it. The same
+loop closes any posted message whose request has since been answered elsewhere or has expired. And a
 Socket Mode connection (outbound only, no port) receives the Approve and Deny clicks, acks
 them, and sends the decision to the API under the clicker's approver name.
 
@@ -177,13 +178,119 @@ def build_app(config: SlackConfig, api, store, **app_options) -> App:
     return app
 
 
+@dataclass(frozen=True)
+class SettleResult:
+    """settled: messages edited and marked settled this pass. wait: seconds Slack asked us to hold off."""
+
+    settled: int = 0
+    wait: float = 0.0
+
+
+# Slack answers that mean this message can never be edited: it was deleted, or the channel
+# is gone. Retrying would never end, so the row is marked settled and the reason is logged.
+UNEDITABLE = frozenset({"message_not_found", "channel_not_found", "cant_update_message"})
+
+
+def _moment(value) -> datetime:
+    """A timestamp from the API, or now if it is missing or unreadable."""
+    try:
+        return datetime.fromisoformat(str(value))
+    except ValueError:
+        return datetime.now(timezone.utc)
+
+
+def _closing_message(config: SlackConfig, approval: dict) -> dict | None:
+    """What a posted message should now say, or None while its request is still open."""
+    status = approval.get("status")
+    if status == "pending" and not approval.get("overdue"):
+        return None
+    blocks = messages.pending_message(approval, config.dashboard_url)["blocks"]
+    if status in ("approved", "denied"):
+        return messages.settled_message(
+            blocks, status, approval.get("decided_by") or "unknown", approval.get("decision_channel") or "unknown",
+            _moment(approval.get("decided_at")),
+        )
+    if status == "expired" or status == "pending":
+        # A pending request past its deadline is as good as expired: the API refuses an answer
+        # to it, and the watcher is about to mark it.
+        return messages.expired_message(blocks, _moment(approval.get("expires_at")))
+    return None
+
+
+def settle_pass(config: SlackConfig, api, store, slack) -> SettleResult:
+    """Close every posted message whose request is no longer open, whichever channel closed it.
+
+    A click edits its own message, but an answer from the dashboard or the API, and an expiry,
+    leave the buttons up. Each unsettled message is checked against the API and edited once its
+    request has been decided or has run out of time. The row is marked settled only after the
+    edit lands, so a failure anywhere leaves it to be tried again on the next pass.
+    """
+    try:
+        waiting = store.unsettled()
+    except StoreError as exc:
+        _say(f"[slack-bridge] no settling this pass, the notification table is not usable: {exc}")
+        return SettleResult()
+
+    settled = 0
+    for notification in sorted(waiting, key=lambda row: row.approval_id):
+        approval_id = notification.approval_id
+        try:
+            approval = api.get_approval(approval_id)
+        except ApiError as exc:
+            # If the API is down it is down for every message, so the pass stops here.
+            _say(f"[slack-bridge] no more settling this pass, the API is not usable: {exc}")
+            return SettleResult(settled)
+        if approval is None:
+            _say(f"[slack-bridge] approval {approval_id} is not known to the API, leaving its message alone")
+            continue
+        try:
+            message = _closing_message(config, approval)
+        except Exception as exc:  # noqa: BLE001 - one odd row must not stop the others
+            _say(f"[slack-bridge] approval {approval_id} could not be turned into a closing message: {type(exc).__name__}: {exc}")
+            continue
+        if message is None:
+            continue
+        try:
+            slack.chat_update(channel=notification.channel_id, ts=notification.message_ts, text=message["text"], blocks=message["blocks"])
+        except SlackApiError as exc:
+            wait = _retry_after(exc)
+            if wait is not None:
+                _say(f"[slack-bridge] Slack rate-limited the edit of approval {approval_id}; holding off {wait:.0f}s")
+                return SettleResult(settled, wait)
+            code = exc.response.get("error") if exc.response is not None else None
+            if code in UNEDITABLE:
+                _say(f"[slack-bridge] the message for approval {approval_id} can no longer be edited ({code}), so it is closed in the table")
+                _mark_settled(store, approval_id)
+            else:
+                _say(f"[slack-bridge] the message for approval {approval_id} was not edited, will retry next pass: {exc}")
+            continue
+        except Exception as exc:  # noqa: BLE001 - leave the row open and try again next pass
+            _say(f"[slack-bridge] the message for approval {approval_id} was not edited, will retry next pass: {type(exc).__name__}: {exc}")
+            continue
+        if _mark_settled(store, approval_id):
+            settled += 1
+            _say(f"[slack-bridge] closed the message for approval {approval_id} ({approval.get('status')})")
+    return SettleResult(settled)
+
+
+def _mark_settled(store, approval_id: int) -> bool:
+    try:
+        store.settle(approval_id)
+    except StoreError as exc:
+        # The message is already closed. The next pass edits it again to the same text.
+        _say(f"[slack-bridge] approval {approval_id} was edited but could not be marked settled: {exc}")
+        return False
+    return True
+
+
 def run_forever(config: SlackConfig, api, store, slack, *, sleep=time.sleep, should_stop=lambda: False) -> None:
-    """Check the table, then post on every poll. Raises if the migrations are missing."""
+    """Check the table, then post and settle on every poll. Raises if the migrations are missing."""
     store.check_ready()
     _say(f"[slack-bridge] posting pending approvals to {config.channel_id} every {config.poll_seconds:g}s")
     while not should_stop():
-        result = post_pass(config, api, store, slack)
-        sleep(max(config.poll_seconds, result.wait))
+        posted = post_pass(config, api, store, slack)
+        settled = settle_pass(config, api, store, slack)
+        sleep(max(config.poll_seconds, posted.wait, settled.wait))
 
 
 def main() -> None:

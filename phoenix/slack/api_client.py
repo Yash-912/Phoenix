@@ -64,6 +64,22 @@ class ApiClient:
             raise ApiError("GET /approvals sent an unexpected body") from exc
         return approvals
 
+    def get_approval(self, approval_id: int) -> dict | None:
+        """One approval in any status, as the dashboard sees it. None when there is no such request."""
+        try:
+            response = self._client.get(f"/approvals/{approval_id}")
+        except httpx.HTTPError as exc:
+            raise ApiError(f"GET /approvals/{approval_id} failed: {type(exc).__name__}") from exc
+        if response.status_code == 404:
+            return None
+        if response.status_code != 200:
+            raise ApiError(f"GET /approvals/{approval_id} answered {response.status_code}")
+        body = _json(response)
+        approval = body.get("approval") if isinstance(body, dict) else None
+        if not isinstance(approval, dict) or "id" not in approval or "status" not in approval:
+            raise ApiError(f"GET /approvals/{approval_id} sent an unexpected body")
+        return approval
+
     def decide(self, approval_id: int, decision: str, approver: str) -> DecisionResult:
         """Send one answer. decision is "approve" or "deny"; approver is the mapped name."""
         if not self._token:

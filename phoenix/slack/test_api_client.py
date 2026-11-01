@@ -168,3 +168,49 @@ def test_the_token_is_in_no_result_and_no_error_text():
     assert TOKEN not in repr(result)
     for response in (httpx.Response(401, json={"detail": TOKEN}), httpx.Response(500, text=TOKEN)):
         assert TOKEN not in repr(_decide(lambda request, r=response: r))
+
+
+# --- reading one approval ------------------------------------------------------
+
+DECIDED = {"approval": {"id": 7, "status": "approved", "decided_by": "alice", "decision_channel": "dashboard",
+                        "decided_at": "2026-11-01T12:05:00+00:00", "can_decide": False, "overdue": False}}
+
+
+def test_one_approval_is_read_from_its_own_endpoint():
+    seen = []
+
+    def handler(request):
+        seen.append((request.method, request.url.path, request.headers.get("authorization")))
+        return httpx.Response(200, json=DECIDED)
+
+    approval = _client(handler).get_approval(7)
+
+    assert approval == DECIDED["approval"]
+    assert seen == [("GET", "/approvals/7", None)]
+
+
+def test_an_unknown_approval_is_none_not_an_error():
+    assert _client(lambda request: httpx.Response(404, json={"detail": "no approval 7"})).get_approval(7) is None
+
+
+@pytest.mark.parametrize("response", [
+    httpx.Response(500, text="boom"),
+    httpx.Response(503, json={"detail": "database unavailable"}),
+    httpx.Response(422, json={"detail": []}),
+    httpx.Response(200, text="<html>not json</html>"),
+    httpx.Response(200, json={"unexpected": True}),
+    httpx.Response(200, json={"approval": "nope"}),
+    httpx.Response(200, json={"approval": {"no_id_or_status": True}}),
+])
+def test_anything_else_when_reading_one_approval_is_an_api_error(response):
+    with pytest.raises(ApiError):
+        _client(lambda request: response).get_approval(7)
+
+
+@pytest.mark.parametrize("error", [httpx.ConnectError("refused"), httpx.ReadTimeout("slow")])
+def test_failing_to_reach_the_api_when_reading_one_approval_is_an_api_error(error):
+    def handler(request):
+        raise error
+
+    with pytest.raises(ApiError, match=type(error).__name__):
+        _client(handler).get_approval(7)

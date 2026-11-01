@@ -47,6 +47,9 @@ class FakeApi:
             raise self.error
         return list(self.approvals)
 
+    def get_approval(self, approval_id):
+        return None
+
 
 class FakeStore:
     def __init__(self, *, notified=(), read_error=None, record_error=None):
@@ -59,6 +62,9 @@ class FakeStore:
         self.ready_checks += 1
         if self.read_error:
             raise self.read_error
+
+    def unsettled(self):
+        return []
 
     def notified_ids(self, ids):
         if self.read_error:

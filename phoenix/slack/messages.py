@@ -152,6 +152,13 @@ def pending_message(approval: dict, dashboard_url: str) -> dict:
     }
 
 
+def _closed(blocks: list[dict], text: str, fallback: str) -> dict:
+    """The message with its buttons and any earlier outcome line removed, and one outcome line added."""
+    kept = [block for block in blocks if block.get("type") != "actions" and block.get("block_id") != OUTCOME_BLOCK_ID]
+    kept.append({"type": "section", "block_id": OUTCOME_BLOCK_ID, "text": {"type": "mrkdwn", "text": text}})
+    return {"text": fallback, "blocks": kept}
+
+
 def settled_message(blocks: list[dict], decision: str, approver: str, channel: str, decided_at: datetime) -> dict:
     """The same message once it has been answered: no buttons, and a line saying who and how.
 
@@ -159,12 +166,16 @@ def settled_message(blocks: list[dict], decision: str, approver: str, channel: s
     replaced, so settling a message twice leaves exactly one.
     """
     word = "Approved" if decision == "approved" else "Denied"
-    kept = [block for block in blocks if block.get("type") != "actions" and block.get("block_id") != OUTCOME_BLOCK_ID]
     who = _fit(approver, 100)
     via = _fit(channel, 30)
-    kept.append({
-        "type": "section",
-        "block_id": OUTCOME_BLOCK_ID,
-        "text": {"type": "mrkdwn", "text": f"*{word}* by {who} via {via} at {_date_token(decided_at)}"},
-    })
-    return {"text": f"{word} by {who} via {via}", "blocks": kept}
+    return _closed(blocks, f"*{word}* by {who} via {via} at {_date_token(decided_at)}", f"{word} by {who} via {via}")
+
+
+def expired_message(blocks: list[dict], deadline: datetime) -> dict:
+    """The same message once its time ran out with no answer. Expiry escalates and is never an approval."""
+    return _closed(
+        blocks,
+        f"*Expired*: no one answered by {_date_token(deadline)}. Phoenix escalated this and took no action. "
+        f"Expiry is never an approval.",
+        "Expired: no one answered, escalated, no action taken",
+    )

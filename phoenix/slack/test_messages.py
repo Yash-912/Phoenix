@@ -252,6 +252,40 @@ def test_an_approver_name_with_markup_is_escaped_in_the_settled_text():
     assert "&lt;!channel&gt;" in _text_of(settled)
 
 
+DEADLINE = datetime(2026, 11, 1, 12, 15, 0, tzinfo=timezone.utc)
+
+
+def test_an_expired_message_says_no_one_answered_and_that_expiry_is_never_an_approval():
+    original = messages.pending_message(APPROVAL, DASHBOARD)["blocks"]
+
+    expired = messages.expired_message(original, DEADLINE)
+
+    assert _blocks(expired, "actions") == []
+    outcome = expired["blocks"][-1]["text"]["text"]
+    assert "Expired" in outcome and "no one answered" in outcome
+    assert "never an approval" in outcome
+    assert "<!date^1793535300^" in outcome and "|2026-11-01T12:15:00+00:00>" in outcome
+    assert expired["text"].startswith("Expired")
+
+
+def test_an_expired_message_keeps_what_the_person_would_have_decided_on():
+    original = messages.pending_message(APPROVAL, DASHBOARD)["blocks"]
+
+    expired = messages.expired_message(original, DEADLINE)
+
+    kept = [block for block in original if block["type"] != "actions"]
+    assert expired["blocks"][: len(kept)] == kept
+
+
+def test_expiring_twice_or_after_an_answer_leaves_exactly_one_outcome_line():
+    answered = _settled()
+
+    expired = messages.expired_message(answered["blocks"], DEADLINE)
+
+    outcomes = [b for b in expired["blocks"] if b.get("block_id") == messages.OUTCOME_BLOCK_ID]
+    assert len(outcomes) == 1 and "Expired" in outcomes[0]["text"]["text"]
+
+
 def test_settling_a_message_that_has_no_buttons_adds_nothing_twice():
     once = _settled()
 
