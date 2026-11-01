@@ -78,7 +78,7 @@ Every dynamic string is escaped for Slack (`&`, `<`, `>`) and truncated to Slack
 | API answer | What the clicker sees |
 |---|---|
 | 200 recorded | Message updated to the settled text |
-| 409, first answer already won | "Already approved by alice via dashboard" (ephemeral) |
+| 409, first answer already won | "Already approved. The first answer wins, so your click changed nothing." (ephemeral). The 409 names the winning status but not who or which channel, so who and when appear on the message when the settle pass edits it |
 | 409, expired | "The deadline passed. This escalates and is never an approval." (ephemeral) |
 | 403, name not on the API's approver list | "Your Slack ID maps to a name that is not on the approver list. Ask the owner." (ephemeral) |
 | 401 or 503 | "Approvals are not configured on the server. Use the dashboard." (ephemeral) |

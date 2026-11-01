@@ -21,6 +21,8 @@ CONFIRM_TEXT_LIMIT = 300
 EVIDENCE_LINES = 3
 EVIDENCE_LINE_LIMIT = 300
 
+OUTCOME_BLOCK_ID = "outcome"
+
 APPROVE_ACTION = "phoenix_approve"
 DENY_ACTION = "phoenix_deny"
 
@@ -63,15 +65,19 @@ def _field(title: str, body) -> dict:
     return {"type": "mrkdwn", "text": prefix + _fit(body, FIELD_LIMIT - len(prefix))}
 
 
+def _date_token(moment: datetime) -> str:
+    """A Slack date, shown in the reader's own time zone, with a fallback for clients that cannot."""
+    # The text after | is shown by clients that cannot render a date token.
+    fallback = _fit(moment.isoformat(), 200).replace("|", "/")
+    return f"<!date^{int(moment.timestamp())}^{{date_short_pretty}} {{time}}|{fallback}>"
+
+
 def _expiry(expires_at) -> str:
     raw = "" if expires_at is None else str(expires_at)
     try:
-        epoch = int(datetime.fromisoformat(raw).timestamp())
+        return _date_token(datetime.fromisoformat(raw))
     except ValueError:
         return _fit(raw, 200)
-    # The text after | is shown by clients that cannot render a date token.
-    fallback = _fit(raw, 200).replace("|", "/")
-    return f"<!date^{epoch}^{{date_short_pretty}} {{time}}|{fallback}>"
 
 
 def _evidence_lines(evidence) -> list[str]:
@@ -144,3 +150,21 @@ def pending_message(approval: dict, dashboard_url: str) -> dict:
         "text": _fit(f"Approval needed: {action} on {container} (incident #{incident_id})", FALLBACK_LIMIT),
         "blocks": blocks,
     }
+
+
+def settled_message(blocks: list[dict], decision: str, approver: str, channel: str, decided_at: datetime) -> dict:
+    """The same message once it has been answered: no buttons, and a line saying who and how.
+
+    decision is "approved" or "denied". Whatever outcome line an earlier edit added is
+    replaced, so settling a message twice leaves exactly one.
+    """
+    word = "Approved" if decision == "approved" else "Denied"
+    kept = [block for block in blocks if block.get("type") != "actions" and block.get("block_id") != OUTCOME_BLOCK_ID]
+    who = _fit(approver, 100)
+    via = _fit(channel, 30)
+    kept.append({
+        "type": "section",
+        "block_id": OUTCOME_BLOCK_ID,
+        "text": {"type": "mrkdwn", "text": f"*{word}* by {who} via {via} at {_date_token(decided_at)}"},
+    })
+    return {"text": f"{word} by {who} via {via}", "blocks": kept}

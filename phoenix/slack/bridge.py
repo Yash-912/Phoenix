@@ -2,6 +2,10 @@
 
 Usage: python -m phoenix.slack.bridge
 
+Two things happen here. A loop posts each open request to the channel and records it. And a
+Socket Mode connection (outbound only, no port) receives the Approve and Deny clicks, acks
+them, and sends the decision to the API under the clicker's approver name.
+
 This is a second host-side process, run the way the watcher is: it never calls the graph
 and the graph never calls it. The graph writes a pending approval and pauses; this asks
 the API for pending approvals, posts the ones it has not posted, and records each post in
@@ -19,14 +23,17 @@ from __future__ import annotations
 import re
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from psycopg_pool import ConnectionPool
-from slack_sdk import WebClient
+from slack_bolt import App
+from slack_bolt.adapter.socket_mode import SocketModeHandler
 from slack_sdk.errors import SlackApiError
 
 from phoenix.slack import messages
-from phoenix.slack.api_client import ApiClient, ApiError
+from phoenix.slack.api_client import SLACK_CHANNEL, ApiClient, ApiError
 from phoenix.slack.config import SlackConfig, SlackConfigError, load_config
+from phoenix.slack.handlers import handle_click
 from phoenix.slack.store import NotificationStore, StoreError
 
 # Anything that looks like a Slack token is masked before it is printed. The bridge never
@@ -110,6 +117,66 @@ def post_pass(config: SlackConfig, api, store, slack) -> PassResult:
     return PassResult(posted)
 
 
+def make_click_listener(config: SlackConfig, api, store, *, now=lambda: datetime.now(timezone.utc)):
+    """The function Bolt calls for a click on Approve or Deny.
+
+    ack() comes first, before the payload is even read, because Slack gives three seconds.
+    The rest happens after it: the decision goes to the API, and a recorded decision edits
+    the message and marks its row settled. A failure at any step after the decision is
+    logged and, where the clicker needs to know, told to them alone.
+    """
+
+    def on_click(ack, body, respond, client):
+        ack()
+        try:
+            action = body["actions"][0]
+            user_id = body["user"]["id"]
+            channel_id = (body.get("channel") or {}).get("id", "")
+            action_id, value = action.get("action_id"), action.get("value")
+        except (KeyError, IndexError, TypeError, AttributeError):
+            _say("[slack-bridge] a click payload was malformed and was dropped")
+            return
+
+        outcome = handle_click(config, api, user_id=user_id, action_id=action_id, channel_id=channel_id, value=value)
+        if outcome.ignored:
+            _say(f"[slack-bridge] ignored a click on {action_id!r} that is not one of ours")
+            return
+        if outcome.reply:
+            _reply(respond, outcome.reply)
+            return
+
+        settle = outcome.settle
+        _say(f"[slack-bridge] {settle.approver} {settle.decision} approval {settle.approval_id} from Slack")
+        try:
+            message = messages.settled_message(body["message"]["blocks"], settle.decision, settle.approver, SLACK_CHANNEL, now())
+            client.chat_update(channel=channel_id, ts=body["message"]["ts"], text=message["text"], blocks=message["blocks"])
+        except Exception as exc:  # noqa: BLE001 - the decision is already recorded, so a failed edit must not undo it
+            _say(f"[slack-bridge] approval {settle.approval_id} was {settle.decision} but its message could not be edited: {type(exc).__name__}: {exc}")
+            _reply(respond, "Your answer was recorded, but I could not update the message. The dashboard shows the outcome.")
+            return
+        try:
+            store.settle(settle.approval_id)
+        except StoreError as exc:
+            _say(f"[slack-bridge] approval {settle.approval_id} was edited but could not be marked settled: {exc}")
+
+    return on_click
+
+
+def _reply(respond, text: str) -> None:
+    """A note only the clicker sees. If it cannot be sent, that is logged and nothing else happens."""
+    try:
+        respond(text=text, response_type="ephemeral", replace_original=False)
+    except Exception as exc:  # noqa: BLE001 - the click is already acked and handled
+        _say(f"[slack-bridge] could not send a reply to the clicker: {type(exc).__name__}: {exc}")
+
+
+def build_app(config: SlackConfig, api, store, **app_options) -> App:
+    """The Bolt app with the two buttons wired to the listener. Nothing else is handled."""
+    app = App(token=config.bot_token, **app_options)
+    app.action(re.compile(r"^(" + messages.APPROVE_ACTION + "|" + messages.DENY_ACTION + r")$"))(make_click_listener(config, api, store))
+    return app
+
+
 def run_forever(config: SlackConfig, api, store, slack, *, sleep=time.sleep, should_stop=lambda: False) -> None:
     """Check the table, then post on every poll. Raises if the migrations are missing."""
     store.check_ready()
@@ -124,9 +191,21 @@ def main() -> None:
         config = load_config()
         pool = ConnectionPool(config.database_url, min_size=1, max_size=3, open=False, timeout=5)
         pool.open()
-        run_forever(config, ApiClient(config.api_url), NotificationStore(pool), WebClient(token=config.bot_token))
+        store = NotificationStore(pool)
+        # Checked before the connection opens, so a missing migration stops the process
+        # before it can receive a click it could not settle.
+        store.check_ready()
+        api = ApiClient(config.api_url, token=config.approval_token)
+        app = build_app(config, api, store)
+        handler = SocketModeHandler(app, config.app_token)
+        handler.connect()
+        _say("[slack-bridge] connected to Slack over Socket Mode, listening for Approve and Deny")
+        run_forever(config, api, store, app.client)
     except (SlackConfigError, StoreError) as exc:
         _say(f"[slack-bridge] cannot start: {exc}")
+        raise SystemExit(1) from exc
+    except SlackApiError as exc:
+        _say(f"[slack-bridge] cannot start: Slack refused the connection: {exc}")
         raise SystemExit(1) from exc
     except KeyboardInterrupt:
         _say("[slack-bridge] stopped")

@@ -189,3 +189,72 @@ def test_the_message_holds_no_token_shaped_text_of_its_own():
 
     for prefix in ("xoxb-", "xapp-", "Bearer "):
         assert prefix not in flat
+
+
+# --- the message after someone has answered -----------------------------------
+
+from datetime import datetime, timezone
+
+ANSWERED_AT = datetime(2026, 11, 1, 12, 5, 0, tzinfo=timezone.utc)
+
+
+def _settled(decision="approved", approver="alice", channel="slack", blocks=None):
+    original = blocks if blocks is not None else messages.pending_message(APPROVAL, DASHBOARD)["blocks"]
+    return messages.settled_message(original, decision, approver, channel, ANSWERED_AT)
+
+
+def test_a_settled_message_has_no_buttons_so_it_cannot_be_answered_twice():
+    settled = _settled()
+
+    assert _blocks(settled, "actions") == []
+
+
+def test_a_settled_message_keeps_what_the_person_decided_on():
+    original = messages.pending_message(APPROVAL, DASHBOARD)["blocks"]
+
+    settled = _settled(blocks=original)
+
+    kept = [block for block in original if block["type"] != "actions"]
+    assert settled["blocks"][: len(kept)] == kept
+    body = _text_of(settled)
+    assert "bad_deploy: checkout-service v18" in body
+    assert "<https://phoenix.example.com/dashboard/#/incidents/12|" in body
+
+
+def test_an_approval_names_who_which_channel_and_when():
+    body = _text_of(_settled("approved", "alice", "slack"))
+
+    assert "Approved" in body
+    assert "alice" in body
+    assert "via slack" in body
+    assert "<!date^1793534700^" in body
+    assert "|2026-11-01T12:05:00+00:00>" in body
+
+
+def test_a_denial_says_denied():
+    body = _text_of(_settled("denied", "bob", "dashboard"))
+
+    assert "Denied" in body and "bob" in body and "via dashboard" in body
+    assert "Approved" not in body
+
+
+def test_the_settled_text_is_the_last_block_and_the_fallback_names_the_outcome():
+    settled = _settled()
+
+    assert "Approved" in settled["blocks"][-1]["text"]["text"]
+    assert settled["text"].startswith("Approved by alice")
+
+
+def test_an_approver_name_with_markup_is_escaped_in_the_settled_text():
+    settled = _settled(approver="<!channel>")
+
+    assert "<!channel>" not in _flat(settled)
+    assert "&lt;!channel&gt;" in _text_of(settled)
+
+
+def test_settling_a_message_that_has_no_buttons_adds_nothing_twice():
+    once = _settled()
+
+    twice = messages.settled_message(once["blocks"], "approved", "alice", "slack", ANSWERED_AT)
+
+    assert len([b for b in twice["blocks"] if "Approved" in b.get("text", {}).get("text", "")]) == 1
