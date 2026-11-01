@@ -143,6 +143,9 @@ def make_click_listener(config: SlackConfig, api, store, *, now=lambda: datetime
             _say(f"[slack-bridge] ignored a click on {action_id!r} that is not one of ours")
             return
         if outcome.reply:
+            # Logged so the owner can see who tried to answer and what they were told, including a
+            # refusal that changed nothing and so leaves no other trace.
+            _say(f"[slack-bridge] Slack user {user_id} clicked {action_id} on approval {value} and was told privately: {outcome.reply}")
             _reply(respond, outcome.reply)
             return
 

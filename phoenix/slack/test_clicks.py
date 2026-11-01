@@ -218,3 +218,30 @@ def test_bolt_routes_both_buttons_to_the_listener_and_ignores_other_buttons(monk
     assert approve.status == 200 and deny.status == 200
     assert [call[1] for call in api.calls] == ["approve", "deny"]
     assert [update["ts"] for update in updates] == ["1730000001.000100", "1730000002.000100"]
+
+
+def test_a_refused_click_is_logged_with_who_clicked_and_on_what(capsys):
+    _click(payload=_payload(user="U999ZZZZZZ"))
+
+    out = capsys.readouterr().out
+    assert "U999ZZZZZZ" in out and "approval 7" in out
+    assert "not on the approver list" in out
+
+
+@pytest.mark.parametrize("result, expected", [
+    (DecisionResult("already_decided", "approved"), "Already approved"),
+    (DecisionResult("expired", "expired"), "deadline passed"),
+    (DecisionResult("unreachable"), "Could not reach Phoenix"),
+])
+def test_every_private_reply_is_logged_with_what_it_said(capsys, result, expected):
+    _click(result)
+
+    out = capsys.readouterr().out
+    assert "U012ABCDEF" in out and "approval 7" in out and expected in out
+
+
+def test_a_click_that_is_recorded_is_not_logged_as_a_refusal(capsys):
+    _click()
+
+    out = capsys.readouterr().out
+    assert "replied privately" not in out
