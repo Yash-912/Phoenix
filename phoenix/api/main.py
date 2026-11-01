@@ -6,7 +6,7 @@ from typing import Literal
 
 # pyrefly: ignore [missing-import]
 import psycopg
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Path as PathParam
 from fastapi.staticfiles import StaticFiles
 
 import db
@@ -20,6 +20,10 @@ async def lifespan(app: FastAPI):
     yield
     db.pool.close()
 
+
+# The largest id the approvals table can hold (BIGSERIAL). A path id above it can never match
+# a row, so it is refused as a bad request and not reported as "database unavailable".
+MAX_BIGINT = 2**63 - 1
 
 app = FastAPI(title="Phoenix API", lifespan=lifespan)
 
@@ -99,6 +103,19 @@ def incident_audit_view(incident_id: int):
 @app.get("/approvals")
 def list_approvals(status: Literal["pending"] = "pending"):
     return {"approvals": incident_trace.approval_queue(_read(db.pending_approvals))}
+
+
+@app.get("/approvals/{approval_id}")
+def get_approval(approval_id: int = PathParam(ge=1, le=MAX_BIGINT)):
+    """One approval in any status, redacted like the list. A read, open like the others.
+
+    The Slack bridge asks this to learn whether a request it posted has been decided, from
+    any channel, or has expired, so it can close the message that still shows buttons.
+    """
+    row = _read(db.approval_by_id, approval_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"no approval {approval_id}")
+    return {"approval": incident_trace.approval_queue([row])[0]}
 
 
 def _approver_list() -> frozenset[str]:

@@ -120,6 +120,18 @@ ORDER BY p.requested_at DESC;
 """
 
 
+# One approval whatever its status, for the Slack bridge to ask whether a request it posted
+# has since been answered or has expired. The same columns as PENDING_APPROVALS, so the API
+# can return both in one shape.
+APPROVAL_BY_ID = """
+SELECT p.id, p.incident_id, i.service_name, p.action, p.container, p.args, p.tier, p.status,
+       p.incident_summary, p.plan_reasoning, p.evidence, p.requested_at, p.expires_at,
+       p.decided_at, p.decided_by, p.decision_channel
+FROM approvals p JOIN incidents i ON i.id = p.incident_id
+WHERE p.id = %(id)s;
+"""
+
+
 def _rows(conn, sql: str, params: dict | None = None) -> list[dict]:
     cursor = conn.execute(sql, params or {})
     names = [column.name for column in cursor.description]
@@ -152,6 +164,13 @@ def incident_rows(incident_id: int) -> dict | None:
 def pending_approvals() -> list[dict]:
     with pool.connection() as conn:
         return _rows(conn, PENDING_APPROVALS)
+
+
+def approval_by_id(approval_id: int) -> dict | None:
+    """One approval in any status, or None when there is no such request."""
+    with pool.connection() as conn:
+        rows = _rows(conn, APPROVAL_BY_ID, {"id": approval_id})
+    return rows[0] if rows else None
 
 
 # The first answer wins because this UPDATE only matches a row still pending and
